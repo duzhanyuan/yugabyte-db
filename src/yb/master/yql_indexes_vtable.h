@@ -20,11 +20,23 @@ namespace yb {
 namespace master {
 
 // VTable implementation of system_schema.indexes.
-class YQLIndexesVTable : public YQLEmptyVTable {
+class YQLIndexesVTable : public YQLVirtualTable {
  public:
   explicit YQLIndexesVTable(const Master* const master);
+  Result<std::shared_ptr<QLRowBlock>> RetrieveData(const QLReadRequestPB& request) const override;
+
  protected:
   Schema CreateSchema() const;
+ private:
+  static constexpr const char* const kKeyspaceName = "keyspace_name";
+  static constexpr const char* const kTableName = "table_name";
+  static constexpr const char* const kIndexName = "index_name";
+  static constexpr const char* const kKind = "kind";
+  static constexpr const char* const kOptions = "options";
+  static constexpr const char* const kTableId = "table_id";
+  static constexpr const char* const kIndexId = "index_id";
+  static constexpr const char* const kTransactions = "transactions";
+  static constexpr const char* const kIsUnique = "is_unique";
 };
 
 }  // namespace master

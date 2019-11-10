@@ -47,14 +47,18 @@
 #include "yb/rpc/reactor.h"
 #include "yb/rpc/growable_buffer.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/rpc_metrics.h"
 
 #include "yb/util/trace.h"
+#include "yb/util/string_util.h"
 
+using namespace std::literals;
+using namespace std::placeholders;
 using std::shared_ptr;
 using std::vector;
 using strings::Substitute;
 
-DEFINE_uint64(rpc_initial_buffer_size, 4096, "Initial buffer size used for RPC calls");
+DEFINE_uint64(rpc_connection_timeout_ms, 15000, "Timeout for RPC connection operations");
 
 METRIC_DEFINE_histogram(
     server, handler_latency_outbound_transfer, "Time taken to transfer the response ",
@@ -68,114 +72,52 @@ namespace rpc {
 /// Connection
 ///
 Connection::Connection(Reactor* reactor,
-                       const Endpoint& remote,
-                       int socket,
+                       std::unique_ptr<Stream> stream,
                        Direction direction,
-                       Connected connected,
+                       RpcMetrics* rpc_metrics,
                        std::unique_ptr<ConnectionContext> context)
     : reactor_(reactor),
-      socket_(socket),
-      remote_(remote),
+      stream_(std::move(stream)),
       direction_(direction),
-      connected_(connected),
-      last_activity_time_(MonoTime::Now(MonoTime::FINE)),
-      read_buffer_(FLAGS_rpc_initial_buffer_size, context->BufferLimit()),
+      last_activity_time_(CoarseMonoClock::Now()),
+      rpc_metrics_(rpc_metrics),
       context_(std::move(context)) {
-  auto status = socket_.GetSocketAddress(&local_);
-  if (!status.ok()) {
-    LOG(WARNING) << "Failed to get local address for: " << socket;
-  }
   const auto metric_entity = reactor->messenger()->metric_entity();
   handler_latency_outbound_transfer_ = metric_entity ?
       METRIC_handler_latency_outbound_transfer.Instantiate(metric_entity) : nullptr;
-}
-
-ConnectionPtr Connection::New(const ConnectionContextFactory& factory,
-                              Reactor* reactor,
-                              const Endpoint& remote,
-                              int socket,
-                              Connection::Direction direction,
-                              Connected connected) {
-  auto context = factory();
-  auto* context_ptr = context.get();
-  auto result = std::make_shared<Connection>(
-      reactor, remote, socket, direction, connected, std::move(context));
-  context_ptr->AssignConnection(result);
-  if (connected) {
-    context_ptr->Connected(result);
-  }
-  return result;
+  IncrementCounter(rpc_metrics_->connections_created);
+  IncrementGauge(rpc_metrics_->connections_alive);
 }
 
 Connection::~Connection() {
-  // Must clear the outbound_transfers_ list before deleting.
-  CHECK(sending_.empty());
-
-  // It's crucial that the connection is Shutdown first -- otherwise
-  // our destructor will end up calling read_io_.stop() and write_io_.stop()
-  // from a possibly non-reactor thread context. This can then make all
-  // hell break loose with libev.
-  CHECK(!is_epoll_registered_);
+  DecrementGauge(rpc_metrics_->connections_alive);
 }
 
-Status Connection::SetNonBlocking(bool enabled) {
-  return socket_.SetNonBlocking(enabled);
+void UpdateIdleReason(const char* message, bool* result, std::string* reason) {
+  *result = false;
+  if (reason) {
+    AppendWithSeparator(message, reason);
+  }
 }
 
-void Connection::EpollRegister(ev::loop_ref& loop) {  // NOLINT
+bool Connection::Idle(std::string* reason_not_idle) const {
   DCHECK(reactor_->IsCurrentThread());
-  DVLOG(4) << "Registering connection for epoll: " << ToString();
-  io_.set(loop);
-  io_.set<Connection, &Connection::Handler>(this);
-  int events;
-  if (connected_) {
-    events = ev::READ;
-    if (direction_ == Direction::CLIENT) {
-      events |= ev::WRITE;
-    }
-  } else {
-    events = ev::WRITE;
-  }
-  io_.start(socket_.GetFd(), events);
 
-  timer_.set(loop);
-  timer_.set<Connection, &Connection::HandleTimeout>(this); // NOLINT
+  bool result = stream_->Idle(reason_not_idle);
 
-  is_epoll_registered_ = true;
-}
-
-bool Connection::Idle() const {
-  DCHECK(reactor_->IsCurrentThread());
-  // check if we're in the middle of receiving something
-  if (!read_buffer_.empty()) {
-    return false;
-  }
-  // check if we still need to send something
-  if (!sending_.empty()) {
-    return false;
-  }
-  // can't kill a connection if calls are waiting response
+  // Connection is not idle if calls are waiting for a response.
   if (!awaiting_response_.empty()) {
-    return false;
+    UpdateIdleReason("awaiting response", &result, reason_not_idle);
   }
 
-  // Check upstream logic (i.e. processing calls etc.)
-  if (!context_->Idle()) {
-    return false;
-  }
-
-  return true;
+  // Check upstream logic (i.e. processing calls, etc.)
+  return context_->Idle(reason_not_idle) && result;
 }
 
-void Connection::ClearSending(const Status& status) {
-  // Clear any outbound transfers.
-  for (auto& call : sending_outbound_datas_) {
-    if (call) {
-      call->Transferred(status, this);
-    }
-  }
-  sending_outbound_datas_.clear();
-  sending_.clear();
+std::string Connection::ReasonNotIdle() const {
+  std::string reason;
+  Idle(&reason);
+  return reason;
 }
 
 void Connection::Shutdown(const Status& status) {
@@ -187,15 +129,6 @@ void Connection::Shutdown(const Status& status) {
     shutdown_status_ = status;
   }
 
-  if (!read_buffer_.empty()) {
-    double secs_since_active = reactor_->cur_time()
-        .GetDeltaSince(last_activity_time_).ToSeconds();
-    LOG(WARNING) << "Shutting down connection " << ToString() << " with pending inbound data ("
-                 << read_buffer_ << ", last active "
-                 << HumanReadableElapsedTime::ToShortString(secs_since_active)
-                 << " ago, status=" << status.ToString() << ")";
-  }
-
   // Clear any calls which have been sent and were awaiting a response.
   for (auto& v : awaiting_response_) {
     if (v.second) {
@@ -204,32 +137,28 @@ void Connection::Shutdown(const Status& status) {
   }
   awaiting_response_.clear();
 
-  ClearSending(status);
-
   for (auto& call : outbound_data_being_processed_) {
     call->Transferred(status, this);
   }
   outbound_data_being_processed_.clear();
 
-  io_.stop();
-  is_epoll_registered_ = false;
-  WARN_NOT_OK(socket_.Close(), "Error closing socket");
+  context_->Shutdown(status);
+
+  stream_->Shutdown(status);
+  timer_.Shutdown();
 }
 
 void Connection::OutboundQueued() {
   DCHECK(reactor_->IsCurrentThread());
 
-  if (connected_ && !waiting_write_ready_) {
-    // If we weren't waiting write to be ready, we could try to write data to socket.
-    auto status = DoWrite();
-    if (!status.ok()) {
-      reactor_->ScheduleReactorTask(
-        MakeFunctorReactorTask(std::bind(&Reactor::DestroyConnection,
-                                         reactor_,
-                                         this,
-                                         status),
-                               shared_from_this()));
-    }
+  auto status = stream_->TryWrite();
+  if (!status.ok()) {
+    VLOG_WITH_PREFIX(1) << "Write failed: " << status;
+    auto scheduled = reactor_->ScheduleReactorTask(
+        MakeFunctorReactorTask(
+            std::bind(&Reactor::DestroyConnection, reactor_, this, status),
+            shared_from_this(), SOURCE_LOCATION()));
+    LOG_IF_WITH_PREFIX(WARNING, !scheduled) << "Failed to schedule destroy";
   }
 }
 
@@ -237,161 +166,128 @@ void Connection::HandleTimeout(ev::timer& watcher, int revents) {  // NOLINT
   DCHECK(reactor_->IsCurrentThread());
 
   if (EV_ERROR & revents) {
-    LOG(WARNING) << "Connection " << ToString() << " got an error in handle timeout";
+    LOG_WITH_PREFIX(WARNING) << "Got an error in handle timeout";
     return;
   }
 
-  auto now = MonoTime::FineNow();
-  while (!expiration_queue_.empty() && expiration_queue_.top().first <= now) {
-    auto call = expiration_queue_.top().second.lock();
+  auto now = CoarseMonoClock::Now();
+
+  CoarseTimePoint deadline = CoarseTimePoint::max();
+  if (!stream_->IsConnected()) {
+    const MonoDelta timeout = FLAGS_rpc_connection_timeout_ms * 1ms;
+    deadline = last_activity_time_ + timeout;
+    if (now > deadline) {
+      auto passed = reactor_->cur_time() - last_activity_time_;
+      reactor_->DestroyConnection(
+          this,
+          STATUS_FORMAT(NetworkError, "Connect timeout, passed: $0, timeout: $1", passed, timeout));
+      return;
+    }
+  }
+
+  while (!expiration_queue_.empty() && expiration_queue_.top().time <= now) {
+    auto& top = expiration_queue_.top();
+    auto call = top.call.lock();
+    auto handle = top.handle;
     expiration_queue_.pop();
     if (call && !call->IsFinished()) {
       call->SetTimedOut();
+      if (handle != std::numeric_limits<size_t>::max()) {
+        stream_->Cancelled(handle);
+      }
       auto i = awaiting_response_.find(call->call_id());
       if (i != awaiting_response_.end()) {
         i->second.reset();
-      } else {
-        LOG(ERROR) << "Timeout of non awaiting call: " << call->call_id();
-        DCHECK(i != awaiting_response_.end());
       }
     }
   }
+
   if (!expiration_queue_.empty()) {
-    auto left = expiration_queue_.top().first - now;
-    timer_.start(left.ToSeconds(), 0);
+    deadline = std::min(deadline, expiration_queue_.top().time);
+  }
+
+  if (deadline != CoarseTimePoint::max()) {
+    timer_.Start(deadline - now);
   }
 }
 
 void Connection::QueueOutboundCall(const OutboundCallPtr& call) {
   DCHECK(call);
   DCHECK_EQ(direction_, Direction::CLIENT);
-  DCHECK(reactor_->IsCurrentThread());
 
-  if (PREDICT_FALSE(!shutdown_status_.ok())) {
-    // Already shutdown
-    call->SetFailed(shutdown_status_);
-    return;
+  auto handle = DoQueueOutboundData(call, true);
+
+  // Set up the timeout timer.
+  const MonoDelta& timeout = call->controller()->timeout();
+  if (timeout.Initialized()) {
+    auto expires_at = CoarseMonoClock::Now() + timeout.ToSteadyDuration();
+    auto reschedule = expiration_queue_.empty() || expiration_queue_.top().time > expires_at;
+    expiration_queue_.push({expires_at, call, handle});
+    if (reschedule && (stream_->IsConnected() ||
+                       expires_at < last_activity_time_ + FLAGS_rpc_connection_timeout_ms * 1ms)) {
+      timer_.Start(timeout.ToSteadyDuration());
+    }
   }
 
-  // Serialize the actual bytes to be put on the wire.
-  call->Serialize(&sending_);
-
-  sending_outbound_datas_.resize(sending_.size());
-  sending_outbound_datas_.back() = call;
   call->SetQueued();
 }
 
-void Connection::Handler(ev::io& watcher, int revents) {  // NOLINT
+size_t Connection::DoQueueOutboundData(OutboundDataPtr outbound_data, bool batch) {
   DCHECK(reactor_->IsCurrentThread());
 
-  DVLOG(3) << ToString() << " Handler(revents=" << revents << ")";
-  auto status = Status::OK();
-  if (revents & EV_ERROR) {
-    status = STATUS(NetworkError, ToString() + ": Handler encountered an error");
+  if (!shutdown_status_.ok()) {
+    outbound_data->Transferred(shutdown_status_, this);
+    return std::numeric_limits<size_t>::max();
   }
 
-  if (status.ok() && (revents & EV_READ)) {
-    status = ReadHandler();
+  // If the connection is torn down, then the QueueOutbound() call that
+  // eventually runs in the reactor thread will take care of calling
+  // ResponseTransferCallbacks::NotifyTransferAborted.
+
+  // Check before and after calling Send. Before to reset state, if we
+  // were over the limit; but are now back in good standing. After, to
+  // check if we are now over the limit.
+  Status s = context_->ReportPendingWriteBytes(stream_->GetPendingWriteBytes());
+  if (!s.ok()) {
+    Shutdown(s);
+    return std::numeric_limits<size_t>::max();
+  }
+  auto result = stream_->Send(std::move(outbound_data));
+  s = context_->ReportPendingWriteBytes(stream_->GetPendingWriteBytes());
+  if (!s.ok()) {
+    Shutdown(s);
+    return std::numeric_limits<size_t>::max();
   }
 
-  if (status.ok() && (revents & EV_WRITE)) {
-    if (!connected_) {
-      connected_ = Connected::kTrue;
-      context_->Connected(shared_from_this());
-    }
-    status = WriteHandler();
+  if (!batch) {
+    OutboundQueued();
   }
 
-  if (status.ok()) {
-    int events = ev::READ;
-    waiting_write_ready_ = !sending_.empty();
-    if (waiting_write_ready_) {
-      events |= ev::WRITE;
-    }
-    io_.set(events);
-  } else {
-    reactor_->DestroyConnection(this, status);
-  }
+  return result;
 }
 
-Status Connection::ReadHandler() {
-  DCHECK(reactor_->IsCurrentThread());
-  last_activity_time_ = reactor_->cur_time();
-
-  for (;;) {
-    auto received = Receive();
-    if (PREDICT_FALSE(!received.ok())) {
-      if (received.status().posix_code() == ESHUTDOWN) {
-        VLOG(1) << ToString() << " shut down by remote end.";
-      } else {
-        LOG(WARNING) << ToString() << " recv error: " << received;
-      }
-      return received.status();
-    }
-    // Exit the loop if we did not receive anything.
-    if (!received.get()) {
-      return Status::OK();
-    }
-    // If we were not able to process next call exit loop.
-    // If status is ok, it means that we just do not have enough data to process yet.
-    auto continue_receiving = TryProcessCalls();
-    if (!continue_receiving.ok()) {
-      return continue_receiving.status();
-    }
-    if (!continue_receiving.get()) {
-      return Status::OK();
-    }
-  }
+void Connection::ParseReceived() {
+  stream_->ParseReceived();
 }
 
-Result<bool> Connection::Receive() {
-  RETURN_NOT_OK(read_buffer_.PrepareRead());
-
-  size_t max_receive = context_->MaxReceive(Slice(read_buffer_.begin(), read_buffer_.size()));
-  DCHECK_GT(max_receive, read_buffer_.size());
-  // This should not happen, but at least avoid crash if something went wrong.
-  if (PREDICT_FALSE(max_receive <= read_buffer_.size())) {
-    LOG(ERROR) << "Max receive: " << max_receive << ", less existing data: " << read_buffer_.size();
-    max_receive = std::numeric_limits<size_t>::max();
-  } else {
-    max_receive -= read_buffer_.size();
-  }
-  max_receive = std::min(max_receive, static_cast<size_t>(std::numeric_limits<int32_t>::max()));
-  max_receive = std::min(max_receive, read_buffer_.capacity_left());
-
-  const int32_t remaining_buf_capacity = static_cast<int32_t>(max_receive);
-  int32_t nread = 0;
-  auto status = socket_.Recv(read_buffer_.write_position(), remaining_buf_capacity, &nread);
-  if (!status.ok()) {
-    if (Socket::IsTemporarySocketError(status)) {
-      return false;
-    }
-    return status;
-  }
-
-  read_buffer_.DataAppended(nread);
-  return nread != 0;
-}
-
-Result<bool> Connection::TryProcessCalls() {
-  DCHECK(reactor_->IsCurrentThread());
-
-  if (read_buffer_.empty()) {
-    return false;
-  }
-
-  Slice bytes_to_process(read_buffer_.begin(), read_buffer_.size());
-  size_t consumed = 0;
-  auto result = context_->ProcessCalls(shared_from_this(), bytes_to_process, &consumed);
+Result<ProcessDataResult> Connection::ProcessReceived(
+    const IoVecs& data, ReadBufferFull read_buffer_full) {
+  auto result = context_->ProcessCalls(shared_from_this(), data, read_buffer_full);
   if (PREDICT_FALSE(!result.ok())) {
-    LOG(WARNING) << ToString() << " command sequence failure: " << result.ToString();
+    LOG_WITH_PREFIX(WARNING) << "Command sequence failure: " << result.status();
     return result;
   }
-  read_buffer_.Consume(consumed);
-  return true;
+
+  if (!result->consumed && read_buffer_full && context_->Idle()) {
+    return STATUS_FORMAT(
+        InvalidArgument, "Command is greater than read buffer, exist data: $0",
+        IoVecsFullSize(data));
+  }
+
+  return result;
 }
 
-Status Connection::HandleCallResponse(Slice call_data) {
+Status Connection::HandleCallResponse(CallData* call_data) {
   DCHECK(reactor_->IsCurrentThread());
   CallResponse resp;
   RETURN_NOT_OK(resp.ParseFrom(call_data));
@@ -399,9 +295,8 @@ Status Connection::HandleCallResponse(Slice call_data) {
   ++responded_call_count_;
   auto awaiting = awaiting_response_.find(resp.call_id());
   if (awaiting == awaiting_response_.end()) {
-    LOG(ERROR) << ToString() << ": Got a response for call id " << resp.call_id() << " which "
-               << "was not pending! Ignoring.";
-    DCHECK(awaiting != awaiting_response_.end());
+    LOG_WITH_PREFIX(DFATAL) << "Got a response for call id " << resp.call_id() << " which "
+                            << "was not pending! Ignoring.";
     return Status::OK();
   }
   auto call = awaiting->second;
@@ -409,7 +304,8 @@ Status Connection::HandleCallResponse(Slice call_data) {
 
   if (PREDICT_FALSE(!call)) {
     // The call already failed due to a timeout.
-    VLOG(1) << "Got response to call id " << resp.call_id() << " after client already timed out";
+    VLOG_WITH_PREFIX(1) << "Got response to call id " << resp.call_id()
+                        << " after client already timed out";
     return Status::OK();
   }
 
@@ -418,79 +314,10 @@ Status Connection::HandleCallResponse(Slice call_data) {
   return Status::OK();
 }
 
-Status Connection::WriteHandler() {
-  DCHECK(reactor_->IsCurrentThread());
-
-  if (sending_.empty()) {
-    LOG(WARNING) << ToString() << " got a ready-to-write callback, but there is "
-        "nothing to write.";
-    return Status::OK();
-  }
-
-  return DoWrite();
-}
-
-Status Connection::DoWrite() {
-  if (!is_epoll_registered_) {
-    return Status::OK();
-  }
-  while (!sending_.empty()) {
-    const size_t kMaxIov = 16;
-    iovec iov[kMaxIov];
-    const int iov_len = static_cast<int>(std::min(kMaxIov, sending_.size()));
-    size_t offset = send_position_;
-    for (auto i = 0; i != iov_len; ++i) {
-      iov[i].iov_base = sending_[i].data() + offset;
-      iov[i].iov_len = sending_[i].size() - offset;
-      offset = 0;
-    }
-
-    last_activity_time_ = reactor_->cur_time();
-    int32_t written = 0;
-
-    auto status = socket_.Writev(iov, iov_len, &written);
-    if (PREDICT_FALSE(!status.ok())) {
-      if (!Socket::IsTemporarySocketError(status)) {
-        LOG(WARNING) << ToString() << " send error: " << status.ToString();
-        return status;
-      } else {
-        waiting_write_ready_ = true;
-        io_.set(ev::READ|ev::WRITE);
-        return Status::OK();
-      }
-    }
-
-    send_position_ += written;
-    while (!sending_.empty() && send_position_ >= sending_.front().size()) {
-      auto call = sending_outbound_datas_.front();
-      send_position_ -= sending_.front().size();
-      sending_.pop_front();
-      sending_outbound_datas_.pop_front();
-      if (call) {
-        call->Transferred(Status::OK(), this);
-      }
-    }
-  }
-
-  return Status::OK();
-}
-
 void Connection::CallSent(OutboundCallPtr call) {
   DCHECK(reactor_->IsCurrentThread());
 
-  awaiting_response_.emplace(call->call_id(), call);
-
-  // Set up the timeout timer.
-  const MonoDelta& timeout = call->controller()->timeout();
-  if (timeout.Initialized()) {
-    auto expires_at = MonoTime::FineNow() + timeout;
-    auto reschedule = expiration_queue_.empty() || expiration_queue_.top().first > expires_at;
-    expiration_queue_.emplace(expires_at, call);
-    if (reschedule) {
-      timer_.set(timeout.ToSeconds(), 0);
-      timer_.start();
-    }
-  }
+  awaiting_response_.emplace(call->call_id(), !call->IsFinished() ? call : nullptr);
 }
 
 std::string Connection::ToString() const {
@@ -498,24 +325,18 @@ std::string Connection::ToString() const {
   // include anything in the output about the current state,
   // which might concurrently change from another thread.
   static const char* format = "Connection ($0) $1 $2 => $3";
+  const void* self = this;
   if (direction_ == Direction::SERVER) {
-    return strings::Substitute(format, this, "server", yb::ToString(remote_), yb::ToString(local_));
+    return Format(format, self, "server", remote(), local());
   } else {
-    return strings::Substitute(format, this, "client", yb::ToString(local_), yb::ToString(remote_));
+    return Format(format, self, "client", local(), remote());
   }
-}
-
-// Disable / reset socket timeouts.
-Status DisableSocketTimeouts(Connection *conn) {
-  RETURN_NOT_OK(conn->socket()->SetSendTimeout(MonoDelta::FromNanoseconds(0L)));
-  RETURN_NOT_OK(conn->socket()->SetRecvTimeout(MonoDelta::FromNanoseconds(0L)));
-  return Status::OK();
 }
 
 Status Connection::DumpPB(const DumpRunningRpcsRequestPB& req,
                           RpcConnectionPB* resp) {
   DCHECK(reactor_->IsCurrentThread());
-  resp->set_remote_ip(yb::ToString(remote_));
+  resp->set_remote_ip(yb::ToString(remote()));
   resp->set_state(context_->State());
 
   const uint64_t processed_call_count =
@@ -534,14 +355,10 @@ Status Connection::DumpPB(const DumpRunningRpcsRequestPB& req,
         call_in_flight = resp->add_calls_in_flight();
       }
     }
-    for (auto& call : sending_outbound_datas_) {
-      if (call && call->DumpPB(req, call_in_flight)) {
-        call_in_flight = resp->add_calls_in_flight();
-      }
-    }
     resp->mutable_calls_in_flight()->DeleteSubrange(resp->calls_in_flight_size() - 1, 1);
+    stream_->DumpPB(req, resp);
   } else if (direction_ != Direction::SERVER) {
-    LOG(FATAL) << "Invalid direction: " << util::to_underlying(direction_);
+    LOG(FATAL) << "Invalid direction: " << to_underlying(direction_);
   }
 
   return Status::OK();
@@ -558,38 +375,37 @@ void Connection::QueueOutboundDataBatch(const OutboundDataBatch& batch) {
 }
 
 void Connection::QueueOutboundData(OutboundDataPtr outbound_data) {
-  // This is usually called by the IPC worker thread when the response is set, but in some
-  // circumstances may also be called by the reactor thread (e.g. if the service has shut down).
-  // In addition to this, its also called for processing events generated by the server.
-
   if (reactor_->IsCurrentThread()) {
     DoQueueOutboundData(std::move(outbound_data), /* batch */ false);
     return;
   }
 
-  bool was_empty = false;
+  bool was_empty;
   {
     std::unique_lock<simple_spinlock> lock(outbound_data_queue_lock_);
     if (!shutdown_status_.ok()) {
-      auto task = MakeFunctorReactorTask(std::bind(&OutboundData::Transferred,
-                                                   outbound_data,
-                                                   shutdown_status_,
-                                                   nullptr));
+      auto task = MakeFunctorReactorTaskWithAbort(
+          std::bind(&OutboundData::Transferred, outbound_data, _2, /* conn */ nullptr),
+          SOURCE_LOCATION());
       lock.unlock();
-      reactor_->ScheduleReactorTask(task);
+      auto scheduled = reactor_->ScheduleReactorTask(task, true /* schedule_even_closing */);
+      LOG_IF_WITH_PREFIX(DFATAL, !scheduled) << "Failed to schedule OutboundData::Transferred";
       return;
     }
     was_empty = outbound_data_to_process_.empty();
     outbound_data_to_process_.push_back(std::move(outbound_data));
-    if (!process_response_queue_task_) {
+    if (was_empty && !process_response_queue_task_) {
       process_response_queue_task_ =
           MakeFunctorReactorTask(std::bind(&Connection::ProcessResponseQueue, this),
-                                 shared_from_this());
+                                 shared_from_this(), SOURCE_LOCATION());
     }
   }
 
   if (was_empty) {
-    reactor_->ScheduleReactorTask(process_response_queue_task_);
+    // TODO: what happens if the reactor is shutting down? Currently Abort is ignored.
+    auto scheduled = reactor_->ScheduleReactorTask(process_response_queue_task_);
+    LOG_IF_WITH_PREFIX(WARNING, !scheduled)
+        << "Failed to schedule Connection::ProcessResponseQueue";
   }
 }
 
@@ -610,26 +426,72 @@ void Connection::ProcessResponseQueue() {
   }
 }
 
-void Connection::DoQueueOutboundData(OutboundDataPtr outbound_data, bool batch) {
+Status Connection::Start(ev::loop_ref* loop) {
   DCHECK(reactor_->IsCurrentThread());
 
-  if (!shutdown_status_.ok()) {
-    outbound_data->Transferred(shutdown_status_, this);
-    return;
+  context_->SetEventLoop(loop);
+
+  RETURN_NOT_OK(stream_->Start(direction_ == Direction::CLIENT, loop, this));
+
+  timer_.Init(*loop);
+  timer_.SetCallback<Connection, &Connection::HandleTimeout>(this); // NOLINT
+
+  if (!stream_->IsConnected()) {
+    timer_.Start(FLAGS_rpc_connection_timeout_ms * 1ms);
   }
 
-  // If the connection is torn down, then the QueueOutbound() call that
-  // eventually runs in the reactor thread will take care of calling
-  // ResponseTransferCallbacks::NotifyTransferAborted.
+  auto self = shared_from_this();
+  context_->AssignConnection(self);
 
-  outbound_data->Serialize(&sending_);
+  return Status::OK();
+}
 
-  sending_outbound_datas_.resize(sending_.size());
-  sending_outbound_datas_.back() = outbound_data;
+void Connection::Connected() {
+  context_->Connected(shared_from_this());
+}
 
-  if (!batch) {
-    OutboundQueued();
-  }
+StreamReadBuffer& Connection::ReadBuffer() {
+  return context_->ReadBuffer();
+}
+
+const Endpoint& Connection::remote() const {
+  return stream_->Remote();
+}
+
+const Protocol* Connection::protocol() const {
+  return stream_->GetProtocol();
+}
+
+const Endpoint& Connection::local() const {
+  return stream_->Local();
+}
+
+void Connection::Close() {
+  stream_->Close();
+}
+
+void Connection::UpdateLastActivity() {
+  last_activity_time_ = reactor_->cur_time();
+}
+
+void Connection::UpdateLastRead() {
+  context_->UpdateLastRead(shared_from_this());
+}
+
+void Connection::UpdateLastWrite() {
+  context_->UpdateLastWrite(shared_from_this());
+}
+
+void Connection::Transferred(const OutboundDataPtr& data, const Status& status) {
+  data->Transferred(status, this);
+}
+
+void Connection::Destroy(const Status& status) {
+  reactor_->DestroyConnection(this, status);
+}
+
+std::string Connection::LogPrefix() const {
+  return ToString() + ": ";
 }
 
 }  // namespace rpc

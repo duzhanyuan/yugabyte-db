@@ -18,6 +18,7 @@
 
 #include "yb/common/hybrid_time.h"
 #include "yb/util/compare_util.h"
+#include "yb/util/result.h"
 
 namespace yb {
 
@@ -60,16 +61,11 @@ class DocHybridTime {
 
   DocHybridTime(HybridTime hybrid_time, IntraTxnWriteId write_id)
       : hybrid_time_(hybrid_time), write_id_(write_id) {
-    // Prevent creation of a technically "valid" DocHybridTime with an invalid HybridTime
-    // component (i.e. with a write_id other than the default).
-    DCHECK(hybrid_time.is_valid() || !is_valid());
   }
 
   DocHybridTime(
       MicrosTime micros, LogicalTimeComponent logical, IntraTxnWriteId write_id)
       : hybrid_time_(micros, logical), write_id_(write_id) {
-    // See the comment in a constructor above.
-    DCHECK(hybrid_time_.is_valid() || !is_valid());
   }
 
   HybridTime hybrid_time() const { return hybrid_time_; }
@@ -92,7 +88,10 @@ class DocHybridTime {
   CHECKED_STATUS DecodeFrom(Slice *slice);
 
   CHECKED_STATUS FullyDecodeFrom(const Slice& encoded);
-  CHECKED_STATUS DecodeFromEnd(const Slice& encoded_key_with_ht_at_end);
+  CHECKED_STATUS DecodeFromEnd(Slice encoded_key_with_ht);
+
+  // Decodes doc ht from end of slice, and removes corresponding bytes from provided slice.
+  static Result<DocHybridTime> DecodeFromEnd(Slice* encoded_key_with_ht);
 
   bool operator==(const DocHybridTime& other) const {
     return hybrid_time_ == other.hybrid_time_ && write_id_ == other.write_id_;
@@ -118,7 +117,7 @@ class DocHybridTime {
   // key in *encoded_ht_size, and verifies that it is within the allowed limits.
   static CHECKED_STATUS CheckAndGetEncodedSize(const Slice& encoded_key, int* encoded_ht_size);
 
-  bool is_valid() const { return *this != kInvalid; }
+  bool is_valid() const { return hybrid_time_.is_valid(); }
 
  private:
   HybridTime hybrid_time_;

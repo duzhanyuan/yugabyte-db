@@ -14,7 +14,12 @@
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/statistics.h"
 #include "yb/docdb/docdb_compaction_filter.h"
+#include "yb/docdb/doc_write_batch.h"
+
+#include "yb/rocksdb/memtablerep.h"
+
 #include "yb/rocksutil/yb_rocksdb.h"
+
 #include "yb/tools/bulk_load_docdb_util.h"
 #include "yb/util/env.h"
 #include "yb/util/path_util.h"
@@ -29,7 +34,9 @@ BulkLoadDocDBUtil::BulkLoadDocDBUtil(const std::string& tablet_id,
                                      const size_t memtable_size,
                                      int num_memtables,
                                      int max_background_flushes)
-    : DocDBRocksDBUtil(OpId()),
+    : // Using optional init markers here because bulk load is only supported for CQL as of
+      // 12/03/2017.
+      DocDBRocksDBUtil(docdb::InitMarkerBehavior::kOptional),
       tablet_id_(tablet_id),
       base_dir_(base_dir),
       memtable_size_(memtable_size),
@@ -51,6 +58,20 @@ Status BulkLoadDocDBUtil::InitRocksDBOptions() {
   rocksdb_options_.enable_write_thread_adaptive_yield = true;
   rocksdb_options_.max_background_flushes = max_background_flushes_;
   rocksdb_options_.env->SetBackgroundThreads(max_background_flushes_, rocksdb::Env::Priority::HIGH);
+  // We need to set level0_file_num_compaction_trigger even in case compaction is disabled, because
+  // RocksDB SanitizeOptions function is increasing level0_slowdown_writes_trigger to be greater
+  // or equal to level0_file_num_compaction_trigger.
+  rocksdb_options_.level0_file_num_compaction_trigger = -1;
+  rocksdb_options_.level0_slowdown_writes_trigger = -1;
+  rocksdb_options_.level0_stop_writes_trigger = std::numeric_limits<int>::max();
+  rocksdb_options_.delayed_write_rate = std::numeric_limits<int>::max();
+
+  rocksdb_options_.memtable_factory = std::make_shared<rocksdb::SkipListFactory>(
+      0 /* lookahead */, rocksdb::ConcurrentWrites::kTrue);
+
+  // TODO - we might consider also set disableDataSync to true and do manual sync after bulk load,
+  // see yb/rocksdb/options.h.
+
   return Status::OK();
 }
 

@@ -39,7 +39,7 @@
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
 #include "yb/rocksdb/util/perf_context_imp.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 
 namespace rocksdb {
 
@@ -740,7 +740,6 @@ void DBIter::FindParseableKey(ParsedInternalKey* ikey, Direction direction) {
 }
 
 void DBIter::Seek(const Slice& target) {
-  StopWatch sw(env_, statistics_, DB_SEEK);
   saved_key_.Clear();
   // now savved_key is used to store internal key.
   saved_key_.SetInternalKey(target, sequence_);

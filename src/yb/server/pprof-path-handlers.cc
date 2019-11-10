@@ -43,9 +43,11 @@
 
 #include "yb/server/pprof-path-handlers.h"
 
+#ifdef TCMALLOC_ENABLED
 #include <gperftools/heap-profiler.h>
 #include <gperftools/malloc_extension.h>
 #include <gperftools/profiler.h>
+#endif
 #include <sys/stat.h>
 
 #include <fstream>
@@ -233,8 +235,8 @@ static void PprofSymbolHandler(const Webserver::WebRequest& req, stringstream* o
   int invalid_addrs = 0;
 
   // Symbolization request.
-  vector<StringPiece> pieces = strings::Split(req.post_data, "+");
-  for (StringPiece p : pieces) {
+  vector<GStringPiece> pieces = strings::Split(req.post_data, "+");
+  for (GStringPiece p : pieces) {
     string hex_addr;
     if (!TryStripPrefixString(p, "0x", &hex_addr)) {
       invalid_addrs++;

@@ -40,6 +40,8 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client-test-util.h"
+#include "yb/client/table.h"
+#include "yb/client/table_creator.h"
 #include "yb/common/wire_protocol-test-util.h"
 #include "yb/integration-tests/external_mini_cluster-itest-base.h"
 #include "yb/util/metrics.h"
@@ -80,7 +82,8 @@ class CreateTableITest : public ExternalMiniClusterITestBase {
   }
 };
 
-TEST_F(CreateTableITest, TestCreateRedisTable) {
+// TODO(bogdan): disabled until ENG-2687
+TEST_F(CreateTableITest, DISABLED_TestCreateRedisTable) {
   const string cloud = "aws";
   const string region = "us-west-1";
   const string zone = "a";
@@ -105,7 +108,8 @@ TEST_F(CreateTableITest, TestCreateRedisTable) {
       CreateTableWithPlacement(replication_info, "success_base", YBTableType::REDIS_TABLE_TYPE));
 }
 
-TEST_F(CreateTableITest, TestCreateWithPlacement) {
+// TODO(bogdan): disabled until ENG-2687
+TEST_F(CreateTableITest, DISABLED_TestCreateWithPlacement) {
   const string cloud = "aws";
   const string region = "us-west-1";
   const string zone = "a";
@@ -161,6 +165,7 @@ TEST_F(CreateTableITest, TestCreateWithPlacement) {
 // be stuck forever with its minority never able to elect a leader.
 TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   const int kNumReplicas = 3;
+  const int kNumTablets = 1;
   vector<string> ts_flags;
   vector<string> master_flags;
   master_flags.push_back("--tablet_creation_timeout_ms=1000");
@@ -178,7 +183,7 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&client_schema)
-            .num_replicas(3)
+            .num_tablets(kNumTablets)
             .wait(false)
             .Create());
 
@@ -220,13 +225,13 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   // properly should get deleted.
   vector<string> tablets;
   int wait_iter = 0;
-  while (tablets.size() != 1 && wait_iter++ < 100) {
-    LOG(INFO) << "Waiting for only one tablet to be left on TS 0. Currently have: "
-              << tablets;
+  while (tablets.size() != kNumTablets && wait_iter++ < 100) {
+    LOG(INFO) << "Waiting for only " << kNumTablets << " tablet(s) to be left on TS 0. "
+              << "Currently have: " << tablets;
     SleepFor(MonoDelta::FromMilliseconds(100));
     tablets = inspect_->ListTabletsWithDataOnTS(0);
   }
-  ASSERT_EQ(1, tablets.size()) << "Tablets on TS0: " << tablets;
+  ASSERT_EQ(tablets.size(), kNumTablets) << "Tablets on TS0: " << tablets;
 }
 
 // Regression test for KUDU-1317. Ensure that, when a table is created,
@@ -246,8 +251,7 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
   client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&client_schema)
-            .num_replicas(3)
-            .add_hash_partitions({ "key" }, kNumTablets)
+            .num_tablets(kNumTablets)
             .Create());
 
   // Computing the standard deviation of the number of replicas per server.
@@ -311,4 +315,25 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
   ASSERT_GE(avg_num_peers, kNumServers / 2);
 }
 
+TEST_F(CreateTableITest, TestNoAllocBlacklist) {
+  const int kNumServers = 4;
+  const int kNumTablets = 24;
+  vector<string> ts_flags;
+  vector<string> master_flags;
+  ts_flags.push_back("--never_fsync");  // run faster on slow disks
+  master_flags.push_back("--enable_load_balancing=false");  // disable load balancing moves
+  ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumServers));
+  // add TServer to blacklist
+  ASSERT_OK(cluster_->AddTServerToBlacklist(cluster_->master(), cluster_->tablet_server(1)));
+  // create table
+  ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
+  gscoped_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
+  client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
+  ASSERT_OK(table_creator->table_name(kTableName)
+                .schema(&client_schema)
+                .num_tablets(kNumTablets)
+                .Create());
+  // check that no tablets have been allocated to blacklisted TServer
+  ASSERT_EQ(inspect_->ListTabletsOnTS(1).size(), 0);
+  }
 }  // namespace yb

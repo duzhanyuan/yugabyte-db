@@ -41,7 +41,6 @@
 #include <vector>
 
 #include "yb/gutil/macros.h"
-#include "yb/tablet/mvcc.h"
 #include "yb/tablet/tablet.pb.h"
 #include "yb/util/condition_variable.h"
 #include "yb/util/monotime.h"
@@ -117,7 +116,7 @@ class MaintenanceOpStats {
  private:
   void UpdateLastModified() {
     valid_ = true;
-    last_modified_ = MonoTime::Now(MonoTime::FINE);
+    last_modified_ = MonoTime::Now();
   }
 
   // True if these stats are valid.
@@ -194,8 +193,6 @@ class MaintenanceOp {
   IOUsage io_usage() const { return io_usage_; }
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(MaintenanceOp);
-
   // The name of the operation.  Op names must be unique.
   const std::string name_;
 
@@ -213,6 +210,8 @@ class MaintenanceOp {
   std::shared_ptr<MaintenanceManager> manager_;
 
   IOUsage io_usage_;
+
+  DISALLOW_COPY_AND_ASSIGN(MaintenanceOp);
 };
 
 struct MaintenanceOpComparator {
@@ -292,4 +291,4 @@ class MaintenanceManager : public std::enable_shared_from_this<MaintenanceManage
 
 } // namespace yb
 
-#endif
+#endif // YB_TABLET_MAINTENANCE_MANAGER_H

@@ -19,40 +19,18 @@ import org.yb.client.TestUtils;
 
 import java.net.InetAddress;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Map;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestUpdate extends BaseCQLTest {
-
-  @Test
-  public void testUpdateWithTimestamp() throws Exception {
-    String tableName = "test_update_with_timestamp";
-    createTable(tableName, "timestamp");
-    // this includes both string and int inputs
-    Map<String, Date> ts_values = generateTimestampMap();
-    for (String key : ts_values.keySet()) {
-      Date date_value = ts_values.get(key);
-      String ins_stmt = String.format(
-        "INSERT INTO %s(h1, h2, r1, r2, v1, v2) VALUES(%d, %s, %d, %s, %d, %s);",
-        tableName, 1, key, 2, key, 3, "0");
-      session.execute(ins_stmt);
-      String upd_stmt = String.format(
-        "UPDATE %s SET v2 = %s WHERE h1 = 1 AND h2 = %s" +
-          " AND r1 = 2 AND r2 = %s;", tableName, key , key, key);
-      session.execute(upd_stmt);
-      String sel_stmt = String.format("SELECT h1, h2, r1, r2, v1, v2 FROM %s"
-        + " WHERE h1 = 1 AND h2 = %s;", tableName, key);
-      Row row = runSelect(sel_stmt).next();
-      assertEquals(1, row.getInt(0));
-      assertEquals(2, row.getInt(2));
-      assertEquals(3, row.getInt(4));
-      assertEquals(date_value, row.getTimestamp(1));
-      assertEquals(date_value, row.getTimestamp(3));
-      assertEquals(date_value, row.getTimestamp(5));
-    }
-  }
 
   @Test
   public void testUpdateWithTTL() throws Exception {
@@ -110,37 +88,6 @@ public class TestUpdate extends BaseCQLTest {
     assertEquals("r4", row.getString(3));
     assertTrue(row.isNull(4));
     assertTrue(row.isNull(5));
-  }
-
-  private void runInvalidUpdateWithTimestamp(String tableName, String ts) {
-    // testing SET clause
-    String upd_stmt1 = String.format(
-      "UPDATE %s SET v2 = '%s' WHERE h1 = 1 AND h2 = %s" +
-        " AND r1 = 2 AND r2 = %s;", tableName, ts, "0", "0");
-    runInvalidStmt(upd_stmt1);
-
-    // testing WHERE clause
-    String upd_stmt2 = String.format(
-      "UPDATE %s SET v2 = %s WHERE h1 = 1 AND h2 = '%s'" +
-        " AND r1 = 2 AND r2 = %s;", tableName, "0", ts, "0");
-    runInvalidStmt(upd_stmt2);
-  }
-
-  @Test
-  public void testInvalidUpdateWithTimestamp() throws Exception {
-    String tableName = "test_update_with_invalid_timestamp";
-    createTable(tableName, "timestamp");
-    String ins_stmt = String.format(
-      "INSERT INTO %s(h1, h2, r1, r2, v1, v2) VALUES(%d, %s, %d, %s, %d, %s);",
-      tableName, 1, "0", 2, "0", 3, "0");
-    session.execute(ins_stmt);
-
-    runInvalidUpdateWithTimestamp(tableName, "plainstring");
-    runInvalidUpdateWithTimestamp(tableName, "1992:12:11");
-    runInvalidUpdateWithTimestamp(tableName, "1992-11");
-    runInvalidUpdateWithTimestamp(tableName, "1992-13-12");
-    runInvalidUpdateWithTimestamp(tableName, "1992-12-12 14:23:30:31");
-    runInvalidUpdateWithTimestamp(tableName, "1992-12-12 14:23:30.12.32");
   }
 
   private String getUpdateStmt(String tableName, long ttl_seconds) {
@@ -210,5 +157,30 @@ public class TestUpdate extends BaseCQLTest {
   @Test
   public void testUpdateSystemNamespace() throws Exception {
     runInvalidStmt("UPDATE system.peers SET h1 = 1, h2 = '1', r1 = 1, r2 = '1';");
+  }
+
+  @Test
+  public void testUpdateDuplicateColumns() throws Exception {
+    String tableName = "test_update_duplicate_column";
+    createTable(tableName);
+
+    // Insert a row.
+    String insert_stmt = String.format(
+        "INSERT INTO %s(h1, h2, r1, r2, v1, v2) VALUES(%d, 'h%d', %d, 'r%d', %d, 'v%d');",
+        tableName, 1, 2, 3, 4, 5, 6);
+    session.execute(insert_stmt);
+
+    runInvalidStmt(String.format("UPDATE %s SET v1 = 50, v1 = 500 WHERE h1 = 1 and h2 = 'h2' and " +
+        "r1 = 3 and r2 = 'r4'", tableName));
+    session.execute("create table foo(h int primary key, i int, m map<int,int>)");
+    runInvalidStmt("update foo set m[1] = 1, m[2] = 1, m = m - {1} where h = 1;");
+    runInvalidStmt("update foo set m[1] = 1, m[2] = 1, m = {1 : 2, 2 : 3} where h = 1;");
+    runInvalidStmt("update foo set m->'a'->'q'->'r' = '200', m[1] = 1 WHERE c1 = 1");
+    session.execute("update foo set m[1] = 1, m[2] = 1, m[1] = 3, m[2] = 4 where h = 1;");
+    Row row = session.execute("select * from foo").one();
+    Map expectedMap = new HashMap<>();
+    expectedMap.put(1, 3);
+    expectedMap.put(2, 4);
+    assertEquals(expectedMap, row.getMap("m", Integer.class, Integer.class));
   }
 }

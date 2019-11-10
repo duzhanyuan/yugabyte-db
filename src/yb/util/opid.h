@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <iosfwd>
+#include <vector>
 
 namespace yb {
 
@@ -28,6 +29,14 @@ struct OpId {
 
   OpId() noexcept : term(0), index(0) {}
   OpId(int64_t term_, int64_t index_) noexcept : term(term_), index(index_) {}
+
+  static OpId Invalid() {
+    return OpId(kUnknownTerm, -1);
+  }
+
+  bool valid() const {
+    return term >= 0 && index >= 0;
+  }
 
   bool empty() const {
     return term == 0 && index == 0;
@@ -41,7 +50,27 @@ struct OpId {
     return empty();
   }
 
-  void UpdateIfGreater(const OpId& rhs);
+  void MakeAtMost(const OpId& rhs);
+  void MakeAtLeast(const OpId& rhs);
+
+  template <class PB>
+  void ToPB(PB* out) const {
+    out->set_term(term);
+    out->set_index(index);
+  }
+
+  template <class PB>
+  PB ToPB() const {
+    PB out;
+    out.set_term(term);
+    out.set_index(index);
+    return out;
+  }
+
+  template <class PB>
+  static OpId FromPB(const PB& pb) {
+    return OpId(pb.term(), pb.index());
+  }
 };
 
 inline bool operator==(const OpId& lhs, const OpId& rhs) {
@@ -52,9 +81,33 @@ inline bool operator!=(const OpId& lhs, const OpId& rhs) {
   return !(lhs == rhs);
 }
 
-#define OP_ID_FORMAT "(%" PRIu64 ", %" PRIu64 ")"
+inline bool operator<(const OpId& lhs, const OpId& rhs) {
+  return (lhs.term < rhs.term) || (lhs.term == rhs.term && lhs.index < rhs.index);
+}
+
+inline bool operator<=(const OpId& lhs, const OpId& rhs) {
+  return !(rhs < lhs);
+}
+
+inline bool operator>(const OpId& lhs, const OpId& rhs) {
+  return rhs < lhs;
+}
+
+inline bool operator>=(const OpId& lhs, const OpId& rhs) {
+  return !(lhs < rhs);
+}
 
 std::ostream& operator<<(std::ostream& out, const OpId& op_id);
+
+size_t hash_value(const OpId& op_id) noexcept;
+
+struct OpIdHash {
+  size_t operator()(const OpId& v) const {
+    return hash_value(v);
+  }
+};
+
+typedef std::vector<OpId> OpIds;
 
 } // namespace yb
 

@@ -20,6 +20,10 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+
+#ifndef YB_ROCKSDB_DB_FLUSH_JOB_H
+#define YB_ROCKSDB_DB_FLUSH_JOB_H
+
 #pragma once
 
 #include <atomic>
@@ -52,15 +56,20 @@
 #include "yb/rocksdb/db/flush_scheduler.h"
 #include "yb/rocksdb/db/write_thread.h"
 #include "yb/rocksdb/db/job_context.h"
+#include "yb/util/result.h"
 
 namespace rocksdb {
 
+using yb::Result;
+
+class Arena;
+class FileNumbersHolder;
+class FileNumbersProvider;
 class MemTable;
 class TableCache;
 class Version;
 class VersionEdit;
 class VersionSet;
-class Arena;
 
 class FlushJob {
  public:
@@ -73,6 +82,8 @@ class FlushJob {
            InstrumentedMutex* db_mutex, std::atomic<bool>* shutting_down,
            std::vector<SequenceNumber> existing_snapshots,
            SequenceNumber earliest_write_conflict_snapshot,
+           MemTableFilter mem_table_flush_filter,
+           FileNumbersProvider* file_number_provider,
            JobContext* job_context, LogBuffer* log_buffer,
            Directory* db_directory, Directory* output_file_directory,
            CompressionType output_compression, Statistics* stats,
@@ -80,15 +91,15 @@ class FlushJob {
 
   ~FlushJob();
 
-  Status Run(FileMetaData* file_meta = nullptr);
+  Result<FileNumbersHolder> Run(FileMetaData* file_meta = nullptr);
   TableProperties GetTableProperties() const { return table_properties_; }
 
  private:
   void ReportStartedFlush();
   void ReportFlushInputSize(const autovector<MemTable*>& mems);
   void RecordFlushIOStats();
-  Status WriteLevel0Table(const autovector<MemTable*>& mems, VersionEdit* edit,
-                          FileMetaData* meta);
+  Result<FileNumbersHolder> WriteLevel0Table(
+      const autovector<MemTable*>& mems, VersionEdit* edit, FileMetaData* meta);
   const std::string& dbname_;
   ColumnFamilyData* cfd_;
   const DBOptions& db_options_;
@@ -99,6 +110,8 @@ class FlushJob {
   std::atomic<bool>* shutting_down_;
   std::vector<SequenceNumber> existing_snapshots_;
   SequenceNumber earliest_write_conflict_snapshot_;
+  MemTableFilter mem_table_flush_filter_;
+  FileNumbersProvider* file_numbers_provider_;
   JobContext* job_context_;
   LogBuffer* log_buffer_;
   Directory* db_directory_;
@@ -110,3 +123,5 @@ class FlushJob {
 };
 
 }  // namespace rocksdb
+
+#endif // YB_ROCKSDB_DB_FLUSH_JOB_H

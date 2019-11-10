@@ -40,6 +40,7 @@
 #include <gflags/gflags.h>
 #include "yb/gutil/strings/substitute.h"
 #include "yb/util/env.h"
+#include "yb/util/env_util.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/path_util.h"
 
@@ -88,26 +89,10 @@ TAG_FLAG(webserver_port, stable);
 
 namespace yb {
 
-// Returns YB_HOME if set, otherwise we won't serve any static files.
+// Returns $YB_HOME/www if set, else ROOT_DIR/www, where ROOT_DIR is computed based on executable
+// path.
 static string GetDefaultDocumentRoot() {
-  char* yb_home = getenv("YB_HOME");
-  if (yb_home) {
-    return strings::Substitute("$0/www", yb_home);
-  }
-
-  // If YB_HOME is not set, we use the path where the binary is located
-  // (e.g., /opt/yugabyte/tserver/bin/yb-tserver) to determine the doc root.
-  // We assume that the document root is the "www" directory at the same
-  // level as the "bin" directory. So, for our example, the doc root will
-  // be /opt/yugabyte/tserver/www.
-  string executable_path;
-  auto status = Env::Default()->GetExecutablePath(&executable_path);
-  if (!status.ok()) {
-    LOG(WARNING) << "Ignoring status error: " << status.ToString();
-    return "";
-  }
-  const string base_dir = DirName(DirName(executable_path));
-  return JoinPathSegments(base_dir, "www");
+  return JoinPathSegments(yb::env_util::GetRootDir("www"), "www");
 }
 
 WebserverOptions::WebserverOptions()

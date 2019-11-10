@@ -40,6 +40,12 @@
 #include <glog/logging.h>
 
 #include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
+
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
@@ -48,6 +54,8 @@
 #include "yb/util/logging.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
+
+using namespace std::literals;
 
 DEFINE_string(master_address, "localhost",
               "Comma separated list of master addresses to run against.");
@@ -61,7 +69,6 @@ using std::vector;
 using client::YBClient;
 using client::YBClientBuilder;
 using client::YBColumnSchema;
-using client::KuduInsert;
 using client::YBSchema;
 using client::YBSession;
 using client::YBTable;
@@ -89,29 +96,27 @@ static int WriteRandomDataToTable(int argc, char** argv) {
 
   // Set up client.
   LOG(INFO) << "Connecting to YB Master...";
-  shared_ptr<YBClient> client;
-  CHECK_OK(YBClientBuilder()
-           .master_server_addrs(addrs)
-           .Build(&client));
+  auto client = CHECK_RESULT(YBClientBuilder()
+      .master_server_addrs(addrs)
+      .Build());
 
   LOG(INFO) << "Opening table...";
-  shared_ptr<YBTable> table;
-  CHECK_OK(client->OpenTable(table_name, &table));
+  client::TableHandle table;
+  CHECK_OK(table.Open(table_name, client.get()));
   YBSchema schema = table->schema();
 
   shared_ptr<YBSession> session = client->NewSession();
-  session->SetTimeoutMillis(5000); // Time out after 5 seconds.
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  session->SetTimeout(5s); // Time out after 5 seconds.
 
   Random random(GetRandomSeed32());
 
   LOG(INFO) << "Inserting random rows...";
   for (uint64_t record_id = 0; true; ++record_id) {
-    shared_ptr<KuduInsert> insert(table->NewInsert());
-    YBPartialRow* row = insert->mutable_row();
-    GenerateDataForRow(schema, record_id, &random, row);
+    auto insert = table.NewInsertOp();
+    auto req = insert->mutable_request();
+    GenerateDataForRow(schema, record_id, &random, req);
 
-    LOG(INFO) << "Inserting record: " << row->ToString();
+    LOG(INFO) << "Inserting record: " << req->ShortDebugString();
     CHECK_OK(session->Apply(insert));
     Status s = session->Flush();
     if (PREDICT_FALSE(!s.ok())) {

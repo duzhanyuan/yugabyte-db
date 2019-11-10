@@ -34,22 +34,10 @@
     <yb.thirdparty.dir>${project.basedir}/../../thirdparty</yb.thirdparty.dir>
   </properties>
 
-  <distributionManagement>
-    <repository>
-      <id>s3.release</id>
-      <url>s3://releases.yugabyte.com</url>
-    </repository>
-    <snapshotRepository>
-      <id>s3.snapshot</id>
-      <url>s3://snapshots.yugabyte.com</url>
-    </snapshotRepository>
-  </distributionManagement>
-
   <dependencies>
     <dependency>
       <groupId>com.google.code.gson</groupId>
       <artifactId>gson</artifactId>
-      <version>2.8.0</version>
     </dependency>
     <dependency>
       <groupId>org.yb</groupId>
@@ -59,69 +47,65 @@
     <dependency>
       <groupId>com.google.protobuf</groupId>
       <artifactId>protobuf-java</artifactId>
-      <version>${protobuf.version}</version>
     </dependency>
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
-      <version>${guava.version}</version>
     </dependency>
     <dependency>
       <groupId>io.netty</groupId>
       <artifactId>netty</artifactId>
-      <version>${netty.version}</version>
     </dependency>
     <dependency>
       <groupId>log4j</groupId>
       <artifactId>log4j</artifactId>
-      <version>${log4j.version}</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.mockito</groupId>
       <artifactId>mockito-all</artifactId>
-      <version>${mockito-all.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
-      <groupId>junit</groupId>
+      <groupId>${junit.groupId}</groupId>
       <artifactId>junit</artifactId>
       <version>${junit.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
-      <!-- Not shaded or included in the client JAR because it's part
-           of the public API. -->
       <groupId>com.stumbleupon</groupId>
       <artifactId>async</artifactId>
-      <version>${async.version}</version>
     </dependency>
     <dependency>
       <groupId>com.sangupta</groupId>
       <artifactId>murmur</artifactId>
-      <version>${murmur.version}</version>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-log4j12</artifactId>
-      <version>${slf4j.version}</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
-      <version>${slf4j.version}</version>
     </dependency>
     <dependency>
       <groupId>commons-io</groupId>
       <artifactId>commons-io</artifactId>
-      <version>${commons-io.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>com.google.code.findbugs</groupId>
       <artifactId>jsr305</artifactId>
-      <version>${jsr305.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>jul-to-slf4j</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
@@ -130,14 +114,12 @@
       <extension>
         <groupId>org.kuali.maven.wagons</groupId>
         <artifactId>maven-s3-wagon</artifactId>
-        <version>1.1.9</version>
       </extension>
     </extensions>
     <plugins>
       <plugin>
         <groupId>org.xolstice.maven.plugins</groupId>
         <artifactId>protobuf-maven-plugin</artifactId>
-        <version>${protobuf-maven-plugin.version}</version>
         <configuration>
           <!-- Documented at:
                http://sergei-ivanov.github.io/maven-protoc-plugin/compile-mojo.html -->
@@ -145,15 +127,8 @@
           <protoSourceRoot>${project.basedir}/../../src</protoSourceRoot>
           <protocExecutable>${project.basedir}/dev-support/build-proto.sh</protocExecutable>
           <additionalProtoPathElements>
-            <!-- We list directories corresponding to both new and old thirdparty
-                 layout. Both of these directories have to exist. -->
             <additionalProtoPathElement>
               ${yb.thirdparty.dir}/installed/uninstrumented/include
-            </additionalProtoPathElement>
-            <!-- Old location, to be removed after fully migrating to new thirdparty
-                 directory layout. -->
-            <additionalProtoPathElement>
-              ${yb.thirdparty.dir}/installed-deps/include
             </additionalProtoPathElement>
           </additionalProtoPathElements>
           <excludes>
@@ -172,7 +147,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-clean-plugin</artifactId>
-        <version>2.5</version>
         <executions>
           <execution>
             <id>delete-test-protos</id>
@@ -198,11 +172,10 @@
         </executions>
       </plugin>
 
-      <!-- Attach source and javadoc to packaged jar -->
+      <!-- Attach source to packaged jar -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-source-plugin</artifactId>
-        <version>2.4</version>
         <executions>
           <execution>
             <id>attach-sources</id>
@@ -220,21 +193,7 @@
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-javadoc-plugin</artifactId>
-        <version>2.10.3</version>
-        <executions>
-          <execution>
-            <id>attach-javadocs</id>
-            <goals>
-              <goal>jar</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>2.6</version>
         <executions>
           <execution>
             <goals>

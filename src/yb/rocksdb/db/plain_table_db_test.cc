@@ -48,7 +48,7 @@
 #include "yb/rocksdb/util/hash.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/utilities/merge_operators.h"
@@ -62,7 +62,7 @@ TEST_F(PlainTableKeyDecoderTest, ReadNonMmap) {
   std::string tmp;
   Random rnd(301);
   const uint32_t kLength = 2222;
-  Slice contents = test::RandomString(&rnd, kLength, &tmp);
+  Slice contents = RandomString(&rnd, kLength, &tmp);
   test::StringSource* string_source =
       new test::StringSource(contents, 0, false);
 
@@ -173,7 +173,7 @@ class PlainTableDBTest : public testing::Test,
   }
 
   void DestroyAndReopen(Options* options = nullptr) {
-    //Destroy using last options
+    // Destroy using last options.
     Destroy(&last_options_);
     ASSERT_OK(TryReopen(options));
   }
@@ -270,7 +270,7 @@ extern const uint64_t kPlainTableMagicNumber;
 class TestPlainTableReader : public PlainTableReader {
  public:
   TestPlainTableReader(const EnvOptions& env_options,
-                       const InternalKeyComparator& icomparator,
+                       const InternalKeyComparatorPtr& icomparator,
                        EncodingType encoding_type, uint64_t file_size,
                        int bloom_bits_per_key, double hash_table_ratio,
                        size_t index_sparseness,
@@ -345,13 +345,14 @@ class TestPlainTableFactory : public PlainTableFactory {
       BlockHandle bloom_block_handle;
       s = FindMetaBlock(file.get(), file_size, kPlainTableMagicNumber,
                         table_reader_options.ioptions.env,
-                        BloomBlockBuilder::kBloomBlock, &bloom_block_handle);
+                        BloomBlockBuilder::kBloomBlock, nullptr /* mem_tracker */,
+                        &bloom_block_handle);
       EXPECT_TRUE(s.ok());
 
       BlockHandle index_block_handle;
       s = FindMetaBlock(file.get(), file_size, kPlainTableMagicNumber,
                         table_reader_options.ioptions.env,
-                        PlainTableIndexBuilder::kPlainTableIndexBlock,
+                        PlainTableIndexBuilder::kPlainTableIndexBlock, nullptr /* mem_tracker */,
                         &index_block_handle);
       EXPECT_TRUE(s.ok());
     }
@@ -1080,12 +1081,6 @@ static std::string Key(int i) {
   return std::string(buf);
 }
 
-static std::string RandomString(Random* rnd, int len) {
-  std::string r;
-  test::RandomString(rnd, len, &r);
-  return r;
-}
-
 TEST_P(PlainTableDBTest, CompactionTrigger) {
   Options options = CurrentOptions();
   options.write_buffer_size = 120 << 10;  // 100KB
@@ -1108,7 +1103,7 @@ TEST_P(PlainTableDBTest, CompactionTrigger) {
     ASSERT_EQ(NumTableFilesAtLevel(0), num + 1);
   }
 
-  //generate one more file in level-0, and should trigger level-0 compaction
+  // Generate one more file in level-0, and should trigger level-0 compaction.
   std::vector<std::string> values;
   for (int i = 0; i < 12; i++) {
     values.push_back(RandomString(&rnd, 10000));

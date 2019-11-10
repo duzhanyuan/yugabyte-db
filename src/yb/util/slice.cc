@@ -45,9 +45,13 @@ Status Slice::check_size(size_t expected_size) const {
   return Status::OK();
 }
 
+void Slice::CopyToBuffer(std::string* buffer) const {
+  buffer->assign(cdata(), size());
+}
+
 // Return a string that contains the copy of the referenced data.
 std::string Slice::ToBuffer() const {
-  return std::string(reinterpret_cast<const char *>(data_), size_);
+  return std::string(cdata(), size());
 }
 
 std::string Slice::ToString(bool hex) const {
@@ -57,15 +61,15 @@ std::string Slice::ToString(bool hex) const {
 std::string Slice::ToDebugHexString() const {
   std::string result;
   char buf[10];
-  for (size_t i = 0; i < size_; i++) {
-    snprintf(buf, sizeof(buf), "%02X", data_[i]);
+  for (auto i = begin_; i != end_; ++i) {
+    snprintf(buf, sizeof(buf), "%02X", *i);
     result += buf;
   }
   return result;
 }
 
 std::string Slice::ToDebugString(size_t max_len) const {
-  size_t bytes_to_print = size_;
+  size_t bytes_to_print = size();
   bool abbreviated = false;
   if (max_len != 0 && bytes_to_print > max_len) {
     bytes_to_print = max_len;
@@ -74,7 +78,7 @@ std::string Slice::ToDebugString(size_t max_len) const {
 
   int size = 0;
   for (int i = 0; i < bytes_to_print; i++) {
-    if (!isgraph(data_[i])) {
+    if (!isgraph(begin_[i])) {
       size += 4;
     } else {
       size++;
@@ -87,22 +91,23 @@ std::string Slice::ToDebugString(size_t max_len) const {
   std::string ret;
   ret.reserve(size);
   for (int i = 0; i < bytes_to_print; i++) {
-    if (!isgraph(data_[i])) {
-      if (data_[i] == '\r') {
+    auto ch = begin_[i];
+    if (!isgraph(ch)) {
+      if (ch == '\r') {
         ret += "\\r";
-      } else if (data_[i] == '\n') {
+      } else if (ch == '\n') {
         ret += "\\n";
-      } else if (data_[i] == ' ') {
+      } else if (ch == ' ') {
         ret += ' ';
       } else {
-        StringAppendF(&ret, "\\x%02x", data_[i] & 0xff);
+        StringAppendF(&ret, "\\x%02x", ch & 0xff);
       }
     } else {
-      ret.push_back(data_[i]);
+      ret.push_back(ch);
     }
   }
   if (abbreviated) {
-    StringAppendF(&ret, "...<%zd bytes total>", size_);
+    StringAppendF(&ret, "...<%zd bytes total>", this->size());
   }
   return ret;
 }
@@ -117,8 +122,17 @@ Slice::Slice(const SliceParts& parts, std::string* buf) {
   for (int i = 0; i < parts.num_parts; ++i) {
     buf->append(parts.parts[i].cdata(), parts.parts[i].size());
   }
-  data_ = reinterpret_cast<const uint8_t*>(buf->data());
-  size_ = buf->size();
+  *this = Slice(*buf);
+}
+
+Status Slice::consume_byte(char c) {
+  char consumed = consume_byte();
+  if (consumed != c) {
+    return STATUS_FORMAT(Corruption, "Wrong first byte, expected $0 but found $1",
+                         static_cast<int>(c), static_cast<int>(consumed));
+  }
+
+  return Status::OK();
 }
 
 }  // namespace yb

@@ -38,7 +38,7 @@
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/random.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/util/mock_env.h"
@@ -66,6 +66,10 @@ class DummyDB : public StackableDB {
 
   Env* GetEnv() const override {
     return options_.env;
+  }
+
+  Env* GetCheckpointEnv() const override {
+    return options_.checkpoint_env;
   }
 
   using DB::GetOptions;
@@ -161,7 +165,7 @@ class TestEnv : public EnvWrapper {
   class DummySequentialFile : public SequentialFile {
    public:
     DummySequentialFile() : SequentialFile(), rnd_(5) {}
-    Status Read(size_t n, Slice* result, char* scratch) override {
+    Status Read(size_t n, Slice* result, uint8_t* scratch) override {
       size_t read_size = (n > size_left) ? size_left : n;
       for (size_t i = 0; i < read_size; ++i) {
         scratch[i] = rnd_.Next() & 255;
@@ -175,6 +179,12 @@ class TestEnv : public EnvWrapper {
       size_left = (n > size_left) ? size_left - n : 0;
       return Status::OK();
     }
+
+    const std::string& filename() const override {
+      static const std::string kFilename = "DummySequentialFile";
+      return kFilename;
+    }
+
    private:
     size_t size_left = 200;
     Random rnd_;
@@ -348,7 +358,7 @@ class FileManager : public EnvWrapper {
 
     for (uint64_t i = 0; i < bytes_to_corrupt; ++i) {
       std::string tmp;
-      test::RandomString(&rnd_, 1, &tmp);
+      RandomString(&rnd_, 1, &tmp);
       file_contents[rnd_.Next() % file_contents.size()] = tmp[0];
     }
     return WriteToFile(fname, file_contents);

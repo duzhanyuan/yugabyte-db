@@ -35,23 +35,51 @@
 #include <stdint.h>
 
 #include <functional>
-#include <list>
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
+
+#ifdef TCMALLOC_ENABLED
+#include <gperftools/malloc_extension.h>
+#endif
+
+#include <boost/optional.hpp>
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/high_water_mark.h"
 #include "yb/util/locks.h"
 #include "yb/util/mutex.h"
 #include "yb/util/random.h"
-
-#include <gperftools/malloc_extension.h> // NOLINT
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 
 class Status;
 class MemTracker;
+typedef std::shared_ptr<MemTracker> MemTrackerPtr;
+
+// Garbage collector is used by MemTracker to free memory allocated by caches when reached
+// soft memory limit.
+class GarbageCollector {
+ public:
+  virtual void CollectGarbage(size_t required) = 0;
+
+ protected:
+  ~GarbageCollector() {}
+};
+
+YB_STRONGLY_TYPED_BOOL(MayExist);
+YB_STRONGLY_TYPED_BOOL(AddToParent);
+YB_STRONGLY_TYPED_BOOL(CreateMetrics);
+YB_STRONGLY_TYPED_BOOL(OnlyChildren);
+
+typedef std::function<int64_t()> ConsumptionFunctor;
+
+struct SoftLimitExceededResult {
+  bool exceeded;
+  double current_capacity_pct;
+};
 
 // A MemTracker tracks memory consumption; it contains an optional limit and is
 // arranged into a tree structure such that the consumption tracked by a
@@ -107,9 +135,15 @@ class MemTracker;
 // depending on how MemTracker ends up being used in YB.
 class MemTracker : public std::enable_shared_from_this<MemTracker> {
  public:
-
-  // Signature for function that can be called to free some memory after limit is reached.
-  typedef std::function<void()> GcFunction;
+  // byte_limit < 0 means no limit
+  // 'id' is the label for LogUsage() and web UI.
+  //
+  // add_to_parent could be set to false in cases when we want to track memory usage of
+  // some subsystem, but don't want this subsystem to take effect on parent mem tracker.
+  MemTracker(int64_t byte_limit, const std::string& id,
+             ConsumptionFunctor consumption_functor,
+             std::shared_ptr<MemTracker> parent,
+             AddToParent add_to_parent, CreateMetrics create_metrics);
 
   ~MemTracker();
 
@@ -118,6 +152,7 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
     size_t value;
     if (!MallocExtension::instance()->GetNumericProperty(prop, &value)) {
       LOG(DFATAL) << "Failed to get tcmalloc property " << prop;
+      value = 0;
     }
     return value;
   }
@@ -128,6 +163,11 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
 
   static int64_t GetTCMallocCurrentHeapSizeBytes() {
     return GetTCMallocProperty("generic.heap_size");
+  }
+
+  static int64_t GetTCMallocActualHeapSizeBytes() {
+    return GetTCMallocCurrentHeapSizeBytes() -
+           GetTCMallocProperty("tcmalloc.pageheap_unmapped_bytes");
   }
   #endif
 
@@ -146,14 +186,7 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // externally synchronized.
   void UnregisterFromParent();
 
-  // Removes this tracker from its parent's children if this tracker has no
-  // children. Useful when this tracker is only referenced by shared pointers
-  // stored in its children.". This case comes up in the LogCache memtrackers.
-  // The LogCache root MemTracker has no owners other than its children, which
-  // are associated with each LogCache. When all LogCaches are destroyed, there
-  // used to be a brief window where Unregister has not been called on the root
-  // while it is about to be destroyed. (Eng-298)
-  void UnregisterFromParentIfNoChildren();
+  void UnregisterChild(const std::string& id);
 
   // Creates and adds the tracker to the tree so that it can be retrieved with
   // FindTracker/FindOrCreateTracker.
@@ -164,15 +197,37 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   static std::shared_ptr<MemTracker> CreateTracker(
       int64_t byte_limit,
       const std::string& id,
-      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>());
+      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>(),
+      AddToParent add_to_parent = AddToParent::kTrue,
+      CreateMetrics create_metrics = CreateMetrics::kTrue) {
+    return CreateTracker(
+        byte_limit, id, ConsumptionFunctor(), parent, add_to_parent, create_metrics);
+  }
+
+  static std::shared_ptr<MemTracker> CreateTracker(
+      const std::string& id,
+      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>(),
+      AddToParent add_to_parent = AddToParent::kTrue,
+      CreateMetrics create_metrics = CreateMetrics::kTrue) {
+    return CreateTracker(-1 /* byte_limit */, id, parent, add_to_parent, create_metrics);
+  }
+
+  static std::shared_ptr<MemTracker> CreateTracker(
+      int64_t byte_limit,
+      const std::string& id,
+      ConsumptionFunctor consumption_functor,
+      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>(),
+      AddToParent add_to_parent = AddToParent::kTrue,
+      CreateMetrics create_metrics = CreateMetrics::kTrue);
 
   // If a tracker with the specified 'id' and 'parent' exists in the tree, sets
   // 'tracker' to reference that instance. Use the two-argument form if there
   // is no parent. Returns false if no such tracker exists.
-  static bool FindTracker(
+  static MemTrackerPtr FindTracker(
       const std::string& id,
-      std::shared_ptr<MemTracker>* tracker,
-      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>());
+      const MemTrackerPtr& parent = MemTrackerPtr());
+
+  MemTrackerPtr FindChild(const std::string& id);
 
   // If a tracker with the specified 'id' and 'parent' exists in the tree,
   // returns a shared_ptr to that instance. Otherwise, creates a new
@@ -181,17 +236,35 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   static std::shared_ptr<MemTracker> FindOrCreateTracker(
       int64_t byte_limit,
       const std::string& id,
-      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>());
+      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>(),
+      AddToParent add_to_parent = AddToParent::kTrue,
+      CreateMetrics create_metrics = CreateMetrics::kTrue);
+
+  static std::shared_ptr<MemTracker> FindOrCreateTracker(
+      const std::string& id,
+      const std::shared_ptr<MemTracker>& parent = std::shared_ptr<MemTracker>(),
+      AddToParent add_to_parent = AddToParent::kTrue,
+      CreateMetrics create_metrics = CreateMetrics::kTrue) {
+    return FindOrCreateTracker(-1 /* byte_limit */, id, parent, add_to_parent, create_metrics);
+  }
+
+  void ListDescendantTrackers(
+      std::vector<MemTrackerPtr>* trackers, OnlyChildren only_children = OnlyChildren::kFalse);
+
+  // Returns a list of all children of this tracker.
+  std::vector<MemTrackerPtr> ListChildren();
 
   // Returns a list of all the valid trackers.
-  static void ListTrackers(std::vector<std::shared_ptr<MemTracker> >* trackers);
+  static std::vector<MemTrackerPtr> ListTrackers();
 
   // Gets a shared_ptr to the "root" tracker, creating it if necessary.
-  static std::shared_ptr<MemTracker> GetRootTracker();
+  static MemTrackerPtr GetRootTracker();
 
-  // Updates consumption from the consumption function specified in the constructor.
-  // NOTE: this method will crash if 'consumption_func_' is not set.
-  void UpdateConsumption();
+  // Tries to update consumption from external source.
+  // Returns true if consumption was updated, false otherwise.
+  //
+  // Currently it uses totally allocated bytes by tcmalloc for root mem tracker when available.
+  bool UpdateConsumption(bool force = false);
 
   // Increases consumption of this tracker and its ancestors by 'bytes'.
   void Consume(int64_t bytes);
@@ -206,7 +279,9 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // they can all consume 'bytes'. If this brings any of them over, none of them
   // are updated.
   // Returns true if the try succeeded.
-  bool TryConsume(int64_t bytes);
+  // In case of failure mem tracker that prevented consumption will be stored to
+  // blocking_mem_tracker.
+  bool TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker = nullptr);
 
   // Decreases consumption of this tracker and its ancestors by 'bytes'.
   void Release(int64_t bytes);
@@ -222,17 +297,15 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
 
   // Like LimitExceeded() but may also return true if the soft memory limit is exceeded.
   // The greater the excess, the higher the chance that it returns true.
-  //
-  // If the soft limit is exceeded and 'current_capacity_pct' is not NULL, the percentage
-  // of the hard limit consumed is written to it.
-  bool SoftLimitExceeded(double* current_capacity_pct);
+  // If score is not 0, then it is used to determine positive result.
+  SoftLimitExceededResult SoftLimitExceeded(double score);
 
   // Combines the semantics of AnyLimitExceeded() and SoftLimitExceeded().
   //
   // Note: if there's more than one soft limit defined, the probability of it being
   // exceeded in at least one tracker is much higher (as each soft limit check is an
   // independent event).
-  bool AnySoftLimitExceeded(double* current_capacity_pct);
+  SoftLimitExceededResult AnySoftLimitExceeded(double score);
 
   // Returns the maximum consumption that can be made without exceeding the limit on
   // this tracker or any of its parents. Returns int64_t::max() if there are no
@@ -249,6 +322,11 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
     return consumption_.current_value();
   }
 
+  int64_t GetUpdatedConsumption(bool force = false) {
+    UpdateConsumption(force);
+    return consumption();
+  }
+
   // Note that if consumption_ is based on consumption_func_, this
   // will be the max value we've recorded in consumption(), not
   // necessarily the highest value consumption_func_ has ever
@@ -261,8 +339,9 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // Add a function 'f' to be called if the limit is reached.
   // 'f' does not need to be thread-safe as long as it is added to only one MemTracker.
   // Note that 'f' must be valid for the lifetime of this MemTracker.
-  void AddGcFunction(GcFunction f) {
-    gc_functions_.push_back(f);
+  void AddGarbageCollector(const std::shared_ptr<GarbageCollector>& gc) {
+    std::lock_guard<simple_spinlock> lock(gc_mutex_);
+    gcs_.push_back(gc);
   }
 
   // Logs the usage of this tracker and all of its children (recursively).
@@ -277,20 +356,15 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // globally unique.
   std::string ToString() const;
 
+  void SetMetricEntity(const scoped_refptr<MetricEntity>& metric_entity,
+                       const std::string& name_suffix = std::string());
+  scoped_refptr<MetricEntity> metric_entity() const;
+
+  bool add_to_parent() const {
+    return add_to_parent_;
+  }
+
  private:
-  // Function signatures for gauge-style memory trackers (where consumption is
-  // periodically observed rather than explicitly tracked).
-  //
-  // Currently only used by the root tracker.
-  typedef std::function<uint64_t()> ConsumptionFunction;
-
-  // If consumption_func is not empty, uses it as the consumption value.
-  // Consume()/Release() can still be called.
-  // byte_limit < 0 means no limit
-  // 'id' is the label for LogUsage() and web UI.
-  MemTracker(ConsumptionFunction consumption_func, int64_t byte_limit,
-             const std::string& id, std::shared_ptr<MemTracker> parent);
-
   bool CheckLimitExceeded() const {
     return limit_ >= 0 && limit_ < consumption();
   }
@@ -306,35 +380,24 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // can cause us to go way over mem limits.
   void GcTcmalloc();
 
-  // Further initializes the tracker.
-  void Init();
-
-  // Adds tracker to child_trackers_.
-  //
-  // child_trackers_lock_ must be held.
-  void AddChildTrackerUnlocked(MemTracker* tracker);
-
   // Logs the stack of the current consume/release. Used for debugging only.
   void LogUpdate(bool is_consume, int64_t bytes) const;
-
-  static std::string LogUsage(const std::string& prefix,
-      const std::list<MemTracker*>& trackers);
 
   // Variant of CreateTracker() that:
   // 1. Must be called with a non-NULL parent, and
   // 2. Must be called with parent->child_trackers_lock_ held.
-  static std::shared_ptr<MemTracker> CreateTrackerUnlocked(
+  std::shared_ptr<MemTracker> CreateChild(
       int64_t byte_limit,
       const std::string& id,
-      const std::shared_ptr<MemTracker>& parent);
+      ConsumptionFunctor consumption_functor,
+      MayExist may_exist,
+      AddToParent add_to_parent,
+      CreateMetrics create_metrics);
 
   // Variant of FindTracker() that:
   // 1. Must be called with a non-NULL parent, and
   // 2. Must be called with parent->child_trackers_lock_ held.
-  static bool FindTrackerUnlocked(
-      const std::string& id,
-      std::shared_ptr<MemTracker>* tracker,
-      const std::shared_ptr<MemTracker>& parent);
+  MemTrackerPtr FindChildUnlocked(const std::string& id);
 
   // Creates the root tracker.
   static void CreateRootTracker();
@@ -346,17 +409,18 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // TODO: this is a stopgap.
   static const int64_t GC_RELEASE_SIZE = 128 * 1024L * 1024L;
 
-  simple_spinlock gc_lock_;
-
-  int64_t limit_;
-  int64_t soft_limit_;
+  const int64_t limit_;
+  const int64_t soft_limit_;
   const std::string id_;
+  const ConsumptionFunctor consumption_functor_;
   const std::string descr_;
   std::shared_ptr<MemTracker> parent_;
+  CoarseMonoClock::time_point last_consumption_update_ = CoarseMonoClock::time_point::min();
 
-  HighWaterMark consumption_;
+  class TrackerMetrics;
+  std::unique_ptr<TrackerMetrics> metrics_;
 
-  ConsumptionFunction consumption_func_;
+  HighWaterMark consumption_{0};
 
   // this tracker plus all of its ancestors
   std::vector<MemTracker*> all_trackers_;
@@ -368,15 +432,13 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
   // update that of its children).
   // Note: This lock must never be taken on a parent before on a child.
   // It is taken in the opposite order during UnregisterFromParentIfNoChildren()
-  mutable Mutex child_trackers_lock_;
-  std::list<MemTracker*> child_trackers_;
+  mutable std::mutex child_trackers_mutex_;
+  std::unordered_map<std::string, std::weak_ptr<MemTracker>> child_trackers_;
 
-  // Iterator into parent_->child_trackers_ for this object. Stored to have O(1)
-  // remove.
-  std::list<MemTracker*>::iterator child_tracker_it_;
+  simple_spinlock gc_mutex_;
 
   // Functions to call after the limit is reached to free memory.
-  std::vector<GcFunction> gc_functions_;
+  std::vector<std::weak_ptr<GarbageCollector>> gcs_;
 
   ThreadSafeRandom rand_;
 
@@ -385,6 +447,8 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
 
   // If true, log the stack as well.
   bool log_stack_;
+
+  AddToParent add_to_parent_;
 };
 
 // An std::allocator that manipulates a MemTracker during allocation
@@ -434,15 +498,42 @@ class MemTrackerAllocator : public Alloc {
   std::shared_ptr<MemTracker> mem_tracker_;
 };
 
+YB_STRONGLY_TYPED_BOOL(AlreadyConsumed);
+
 // Convenience class that adds memory consumption to a tracker when declared,
 // releasing it when the end of scope is reached.
 class ScopedTrackedConsumption {
  public:
-  ScopedTrackedConsumption(std::shared_ptr<MemTracker> tracker,
-                           int64_t to_consume)
+  ScopedTrackedConsumption() : consumption_(0) {}
+
+  ScopedTrackedConsumption(MemTrackerPtr tracker,
+                           int64_t to_consume,
+                           AlreadyConsumed already_consumed = AlreadyConsumed::kFalse)
       : tracker_(std::move(tracker)), consumption_(to_consume) {
-    DCHECK(tracker_);
-    tracker_->Consume(consumption_);
+    DCHECK(*this);
+    if (!already_consumed) {
+      tracker_->Consume(consumption_);
+    }
+  }
+
+  ScopedTrackedConsumption(const ScopedTrackedConsumption&) = delete;
+  void operator=(const ScopedTrackedConsumption&) = delete;
+
+  ScopedTrackedConsumption(ScopedTrackedConsumption&& rhs)
+      : tracker_(std::move(rhs.tracker_)), consumption_(rhs.consumption_) {
+    rhs.consumption_ = 0;
+  }
+
+  void operator=(ScopedTrackedConsumption&& rhs) {
+    if (rhs) {
+      DCHECK(!*this);
+      tracker_ = std::move(rhs.tracker_);
+      consumption_ = rhs.consumption_;
+      rhs.consumption_ = 0;
+    } else if (tracker_) {
+      tracker_->Release(consumption_);
+      tracker_ = nullptr;
+    }
   }
 
   void Reset(int64_t new_consumption) {
@@ -451,16 +542,57 @@ class ScopedTrackedConsumption {
     consumption_ = new_consumption;
   }
 
+  void Swap(ScopedTrackedConsumption* rhs) {
+    std::swap(tracker_, rhs->tracker_);
+    std::swap(consumption_, rhs->consumption_);
+  }
+
+  explicit operator bool() const {
+    return tracker_ != nullptr;
+  }
+
   ~ScopedTrackedConsumption() {
-    tracker_->Release(consumption_);
+    if (tracker_) {
+      tracker_->Release(consumption_);
+    }
+  }
+
+  void Add(int64_t delta) {
+    tracker_->Consume(delta);
+    consumption_ += delta;
   }
 
   int64_t consumption() const { return consumption_; }
 
  private:
-  std::shared_ptr<MemTracker> tracker_;
+  MemTrackerPtr tracker_;
   int64_t consumption_;
 };
+
+template <class F>
+int64_t AbsRelMemLimit(int64_t value, const F& f) {
+  if (value < 0) {
+    return f() * std::min<int64_t>(-value, 100) / 100;
+  }
+  if (value == 0) {
+    return -1;
+  }
+  return value;
+}
+
+struct MemTrackerData {
+  MemTrackerPtr tracker;
+  // Depth of this tracker in hierarchy, i.e. root have depth = 0, his children 1 and so on.
+  int depth;
+  // Some mem trackers does not report their consumption to parent, so their consumption does not
+  // participate in limit calculation or parent. We accumulate such consumption in field below.
+  size_t consumption_excluded_from_ancestors = 0;
+};
+
+const MemTrackerData& CollectMemTrackerData(const MemTrackerPtr& tracker, int depth,
+                                            std::vector<MemTrackerData>* output);
+
+std::string DumpMemTrackers();
 
 } // namespace yb
 

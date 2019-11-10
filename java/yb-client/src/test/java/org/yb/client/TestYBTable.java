@@ -40,15 +40,20 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.Assert.*;
+import static org.yb.AssertionWrappers.*;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestYBTable extends BaseYBClientTest {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestYBTable.class);
 
   private static final String BASE_TABLE_NAME = TestYBTable.class.getName();
 
-  private static Schema schema = getBasicSchema();
+  private static Schema schema = getHashKeySchema();
 
   private static long testTTL = 5000L;
 
@@ -58,6 +63,7 @@ public class TestYBTable extends BaseYBClientTest {
         .setId(0)
         .setName("key")
         .setType(ProtobufHelper.QLTypeToPb(QLType.INT32))
+        .setIsHashKey(true)
         .setIsKey(true)
         .build());
     pb.addColumns(Common.ColumnSchemaPB.newBuilder()
@@ -75,9 +81,6 @@ public class TestYBTable extends BaseYBClientTest {
         .setName("column3_s")
         .setType(ProtobufHelper.QLTypeToPb(QLType.STRING))
         .setIsNullable(true)
-        .setCfileBlockSize(4096)
-        .setEncoding(Common.EncodingType.DICT_ENCODING)
-        .setCompression(Common.CompressionType.LZ4)
         .build());
     pb.addColumns(Common.ColumnSchemaPB.newBuilder()
         .setId(4)
@@ -93,7 +96,10 @@ public class TestYBTable extends BaseYBClientTest {
   }
 
   public static Schema getSortOrderSchema(ColumnSchema.SortOrder sortOrder) {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(5);
+    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(6);
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("hash", Type.INT32)
+                .hashKey(true)
+        .build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("key1", Type.INT32)
         .rangeKey(true, sortOrder)
         .build());
@@ -103,9 +109,6 @@ public class TestYBTable extends BaseYBClientTest {
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column1_i", Type.INT32).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column2_s", Type.STRING)
         .nullable(true)
-        .desiredBlockSize(4096)
-        .encoding(ColumnSchema.Encoding.DICT_ENCODING)
-        .compressionAlgorithm(ColumnSchema.CompressionAlgorithm.LZ4)
         .build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column3_b", Type.BOOL).build());
     return new Schema(columns);

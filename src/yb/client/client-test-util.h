@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-#include "yb/client/client.h"
+#include "yb/client/client_fwd.h"
 #include "yb/gutil/macros.h"
 #include "yb/util/status.h"
 
@@ -43,29 +43,29 @@ namespace yb {
 class Schema;
 
 namespace client {
+
+class TableRange;
 class YBSchema;
+
 
 // Log any pending errors in the given session, and then crash the current
 // process.
-void LogSessionErrorsAndDie(const std::shared_ptr<YBSession>& session,
-                            const Status& s);
+void LogSessionErrorsAndDie(const YBSessionPtr& session, const Status& s);
 
 // Flush the given session. If any errors occur, log them and crash
 // the process.
-inline void FlushSessionOrDie(const std::shared_ptr<YBSession>& session) {
-  Status s = session->Flush();
-  if (PREDICT_FALSE(!s.ok())) {
-    LogSessionErrorsAndDie(session, s);
-  }
-}
+void FlushSessionOrDie(const YBSessionPtr& session, const std::vector<YBqlOpPtr>& ops = {});
 
 // Scans in LEADER_ONLY mode, returning stringified rows in the given vector.
-void ScanTableToStrings(YBTable* table, std::vector<std::string>* row_strings);
+void ScanTableToStrings(const TableHandle& table, std::vector<std::string>* row_strings);
+
+// Scans in LEADER_ONLY mode, returning stringified rows.
+std::vector<std::string> ScanTableToStrings(const TableHandle& table);
 
 // Count the number of rows in the table in LEADER_ONLY mode.
-int64_t CountTableRows(YBTable* table);
+int64_t CountTableRows(const TableHandle& table);
 
-void ScanToStrings(YBScanner* scanner, std::vector<std::string>* row_strings);
+std::vector<std::string> ScanToStrings(const TableRange& range);
 
 // Convert a yb::Schema to a yb::client::YBSchema.
 YBSchema YBSchemaFromSchema(const Schema& schema);
@@ -73,4 +73,4 @@ YBSchema YBSchemaFromSchema(const Schema& schema);
 }  // namespace client
 }  // namespace yb
 
-#endif /* YB_CLIENT_CLIENT_TEST_UTIL_H */
+#endif // YB_CLIENT_CLIENT_TEST_UTIL_H_

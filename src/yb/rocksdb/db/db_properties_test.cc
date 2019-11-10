@@ -30,7 +30,6 @@
 #include "yb/rocksdb/port/stack_trace.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/perf_context.h"
-#include "yb/rocksdb/perf_level.h"
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/util/random.h"
 
@@ -182,6 +181,8 @@ void ResetTableProperties(TableProperties* tp) {
   tp->raw_value_size = 0;
   tp->num_data_blocks = 0;
   tp->num_entries = 0;
+  tp->num_filter_blocks = 0;
+  tp->num_data_index_blocks = 0;
 }
 
 void ParseTablePropertiesString(std::string tp_string, TableProperties* tp) {
@@ -192,6 +193,7 @@ void ParseTablePropertiesString(std::string tp_string, TableProperties* tp) {
 
   sscanf(tp_string.c_str(),
          "# data blocks %" SCNu64
+         " # data index blocks %" SCNu64
          " # filter blocks %" SCNu64
          " # entries %" SCNu64
          " raw key size %" SCNu64
@@ -199,26 +201,23 @@ void ParseTablePropertiesString(std::string tp_string, TableProperties* tp) {
          " raw value size %" SCNu64
          " raw average value size %lf "
          " data blocks total size %" SCNu64
-         " data index block size %" SCNu64
+         " data index size %" SCNu64
          " filter blocks total size %" SCNu64
          " filter index block size %" SCNu64,
-         &tp->num_data_blocks, &tp->num_filter_blocks, &tp->num_entries, &tp->raw_key_size,
-         &dummy_double, &tp->raw_value_size, &dummy_double, &tp->data_size, &tp->data_index_size,
-         &tp->filter_size, &tp->filter_index_size);
+         &tp->num_data_blocks, &tp->num_data_index_blocks, &tp->num_filter_blocks, &tp->num_entries,
+         &tp->raw_key_size, &dummy_double, &tp->raw_value_size, &dummy_double, &tp->data_size,
+         &tp->data_index_size, &tp->filter_size, &tp->filter_index_size);
 }
 
-void VerifySimilar(uint64_t a, uint64_t b, double bias) {
-  ASSERT_EQ(a == 0U, b == 0U);
+void VerifySimilar(uint64_t a, uint64_t b, double bias, const std::string& label) {
+  ASSERT_EQ(a == 0U, b == 0U) << " " << label << ": " << a << " vs " << b;
   if (a == 0) {
     return;
   }
-  double dbl_a = static_cast<double>(a);
-  double dbl_b = static_cast<double>(b);
-  if (dbl_a > dbl_b) {
-    ASSERT_LT(static_cast<double>(dbl_a - dbl_b) / (dbl_a + dbl_b), bias);
-  } else {
-    ASSERT_LT(static_cast<double>(dbl_b - dbl_a) / (dbl_a + dbl_b), bias);
-  }
+  const double dbl_a = static_cast<double>(a);
+  const double dbl_b = static_cast<double>(b);
+  ASSERT_LT(fabs(dbl_a - dbl_b) / (dbl_a + dbl_b), bias)
+      << " " << label << ": " << a << " vs " << b;
 }
 
 void VerifyTableProperties(const TableProperties& base_tp,
@@ -227,12 +226,14 @@ void VerifyTableProperties(const TableProperties& base_tp,
                            double index_size_bias = 0.1,
                            double data_size_bias = 0.1,
                            double num_data_blocks_bias = 0.05) {
-  VerifySimilar(base_tp.data_size, new_tp.data_size, data_size_bias);
-  VerifySimilar(base_tp.data_index_size, new_tp.data_index_size, index_size_bias);
-  VerifySimilar(base_tp.filter_size, new_tp.filter_size, filter_size_bias);
-  VerifySimilar(base_tp.filter_index_size, new_tp.filter_index_size, index_size_bias);
-  VerifySimilar(base_tp.num_data_blocks, new_tp.num_data_blocks,
-                num_data_blocks_bias);
+  VerifySimilar(base_tp.data_size, new_tp.data_size, data_size_bias, "data_size");
+  VerifySimilar(
+      base_tp.data_index_size, new_tp.data_index_size, index_size_bias, "data_index_size");
+  VerifySimilar(base_tp.filter_size, new_tp.filter_size, filter_size_bias, "filter_size");
+  VerifySimilar(
+      base_tp.filter_index_size, new_tp.filter_index_size, index_size_bias, "filter_index_size");
+  VerifySimilar(
+      base_tp.num_data_blocks, new_tp.num_data_blocks, num_data_blocks_bias, "num_data_blocks");
   ASSERT_EQ(base_tp.raw_key_size, new_tp.raw_key_size);
   ASSERT_EQ(base_tp.raw_value_size, new_tp.raw_value_size);
   ASSERT_EQ(base_tp.num_entries, new_tp.num_entries);
@@ -244,7 +245,7 @@ void GetExpectedTableProperties(TableProperties* expected_tp,
                                 const int kBloomBitsPerKey,
                                 const size_t kBlockSize) {
   const int kKeyCount = kTableCount * kKeysPerTable;
-  const int kAvgSuccessorSize = kKeySize / 2;
+  const int kAvgSuccessorSize = kKeySize / 6;
   const int kEncodingSavePerKey = kKeySize / 4;
   expected_tp->raw_key_size = kKeyCount * (kKeySize + 8);
   expected_tp->raw_value_size = kKeyCount * kValueSize;
@@ -452,6 +453,8 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
       sum_tp.raw_value_size += level_tps[level].raw_value_size;
       sum_tp.num_data_blocks += level_tps[level].num_data_blocks;
       sum_tp.num_entries += level_tps[level].num_entries;
+      sum_tp.num_filter_blocks += level_tps[level].num_filter_blocks;
+      sum_tp.num_data_index_blocks += level_tps[level].num_data_index_blocks;
     }
     db_->GetProperty(DB::Properties::kAggregatedTableProperties, &tp_string);
     ParseTablePropertiesString(tp_string, &tp);
@@ -464,6 +467,7 @@ TEST_F(DBPropertiesTest, AggregatedTablePropertiesAtLevel) {
     ASSERT_EQ(sum_tp.num_data_blocks, tp.num_data_blocks);
     ASSERT_EQ(sum_tp.num_entries, tp.num_entries);
     ASSERT_EQ(sum_tp.num_filter_blocks, tp.num_filter_blocks);
+    ASSERT_EQ(sum_tp.num_data_index_blocks, tp.num_data_index_blocks);
     if (table > 3) {
       GetExpectedTableProperties(&expected_tp, kKeySize, kValueSize,
                                  kKeysPerTable, table, kBloomBitsPerKey,
@@ -488,8 +492,8 @@ TEST_F(DBPropertiesTest, NumImmutableMemTable) {
 
     std::string big_value(1000000 * 2, 'x');
     std::string num;
-    SetPerfLevel(kEnableTime);
-    ASSERT_TRUE(GetPerfLevel() == kEnableTime);
+    SetPerfLevel(PerfLevel::kEnableTime);
+    ASSERT_TRUE(GetPerfLevel() == PerfLevel::kEnableTime);
 
     ASSERT_OK(dbfull()->Put(writeOpt, handles_[1], "k1", big_value));
     ASSERT_TRUE(dbfull()->GetProperty(handles_[1],
@@ -586,8 +590,8 @@ TEST_F(DBPropertiesTest, NumImmutableMemTable) {
         handles_[1], "rocksdb.estimate-num-keys", &int_num));
     ASSERT_EQ(int_num, base_total_size + 1);
 
-    SetPerfLevel(kDisable);
-    ASSERT_TRUE(GetPerfLevel() == kDisable);
+    SetPerfLevel(PerfLevel::kDisable);
+    ASSERT_TRUE(GetPerfLevel() == PerfLevel::kDisable);
   } while (ChangeCompactOptions());
 }
 
@@ -619,7 +623,7 @@ TEST_F(DBPropertiesTest, GetProperty) {
   std::string big_value(1000000 * 2, 'x');
   std::string num;
   uint64_t int_num;
-  SetPerfLevel(kEnableTime);
+  SetPerfLevel(PerfLevel::kEnableTime);
 
   ASSERT_TRUE(
       dbfull()->GetIntProperty("rocksdb.estimate-table-readers-mem", &int_num));
@@ -1154,7 +1158,7 @@ TEST_F(DBPropertiesTest, TablePropertiesNeedCompactTest) {
   dbfull()->TEST_WaitForCompact();
 
   {
-    SetPerfLevel(kEnableCount);
+    SetPerfLevel(PerfLevel::kEnableCount);
     perf_context.Reset();
     int c = 0;
     std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
@@ -1165,7 +1169,7 @@ TEST_F(DBPropertiesTest, TablePropertiesNeedCompactTest) {
     ASSERT_EQ(c, 0);
     ASSERT_LT(perf_context.internal_delete_skipped_count, 30u);
     ASSERT_LT(perf_context.internal_key_skipped_count, 30u);
-    SetPerfLevel(kDisable);
+    SetPerfLevel(PerfLevel::kDisable);
   }
 }
 
@@ -1209,7 +1213,7 @@ TEST_F(DBPropertiesTest, NeedCompactHintPersistentTest) {
   dbfull()->TEST_WaitForCompact();
   ASSERT_EQ(NumTableFilesAtLevel(0), 0);
   {
-    SetPerfLevel(kEnableCount);
+    SetPerfLevel(PerfLevel::kEnableCount);
     perf_context.Reset();
     int c = 0;
     std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
@@ -1220,7 +1224,7 @@ TEST_F(DBPropertiesTest, NeedCompactHintPersistentTest) {
     ASSERT_EQ(perf_context.internal_delete_skipped_count, 0);
     // We iterate every key twice. Is it a bug?
     ASSERT_LE(perf_context.internal_key_skipped_count, 2);
-    SetPerfLevel(kDisable);
+    SetPerfLevel(PerfLevel::kDisable);
   }
 }
 #endif  // ROCKSDB_LITE

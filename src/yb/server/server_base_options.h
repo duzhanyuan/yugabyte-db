@@ -36,8 +36,8 @@
 #include <vector>
 #include <mutex>
 
+#include "yb/common/common.pb.h"
 #include "yb/fs/fs_manager.h"
-#include "yb/rpc/connection.h"
 #include "yb/server/webserver_options.h"
 #include "yb/server/rpc_server.h"
 #include "yb/util/net/net_util.h"
@@ -48,13 +48,14 @@ class Env;
 
 namespace server {
 
+typedef std::vector<std::vector<HostPort>> MasterAddresses;
+typedef std::shared_ptr<const MasterAddresses> MasterAddressesPtr;
+
 // Options common to both types of servers.
 // The subclass constructor should fill these in with defaults from
 // server-specific flags.
 class ServerBaseOptions {
  public:
-  typedef std::shared_ptr<const std::vector<HostPort>> addresses_shared_ptr;
-
   Env* env;
 
   // This field is to be used as a path component for all the fs roots by FsManager. For now, we
@@ -70,22 +71,29 @@ class ServerBaseOptions {
 
   int32_t metrics_log_interval_ms;
 
-  std::string placement_cloud;
-  std::string placement_region;
-  std::string placement_zone;
+  const std::string& placement_cloud() const;
+  const std::string& placement_region() const;
+  const std::string& placement_zone() const;
+
+  bool has_placement_cloud() const;
+  void SetPlacement(std::string cloud, std::string region, std::string zone);
+
+  std::string placement_uuid;
 
   std::string master_addresses_flag;
 
-  rpc::ConnectionContextFactory connection_context_factory;
+  std::vector<HostPort> broadcast_addresses;
 
   // This can crash the process if you pass in an invalid list of master addresses!
-  void SetMasterAddresses(addresses_shared_ptr master_addresses) {
+  void SetMasterAddresses(MasterAddressesPtr master_addresses) {
     CHECK_NOTNULL(master_addresses.get());
 
-    SetMasterAddressesNoValidation(master_addresses);
+    SetMasterAddressesNoValidation(std::move(master_addresses));
   }
 
-  addresses_shared_ptr GetMasterAddresses() const;
+  MasterAddressesPtr GetMasterAddresses() const;
+
+  CloudInfoPB MakeCloudInfoPB() const;
 
   ServerBaseOptions(const ServerBaseOptions& options);
 
@@ -93,18 +101,33 @@ class ServerBaseOptions {
   ServerBaseOptions();
 
  private:
-  void SetMasterAddressesNoValidation(addresses_shared_ptr master_addresses);
+  void SetMasterAddressesNoValidation(MasterAddressesPtr master_addresses);
 
   // List of masters this server is aware of. This will get recreated on a master config change.
   // We should ensure that the vector elements are not individually updated. And the shared pointer
   // will guarantee inconsistent in-transit views of the vector are never seen during/across
   // config changes.
-  addresses_shared_ptr master_addresses_;
+  MasterAddressesPtr master_addresses_;
+
+  std::string placement_cloud_;
+  std::string placement_region_;
+  std::string placement_zone_;
 
   // Mutex to avoid concurrent access to the variable above.
   mutable std::mutex master_addresses_mtx_;
 };
 
+CHECKED_STATUS DetermineMasterAddresses(
+    const std::string& master_addresses_flag_name, const std::string& master_addresses_flag,
+    uint64_t master_replication_factor, MasterAddresses* master_addresses,
+    std::string* master_addresses_resolved_str);
+
+std::string MasterAddressesToString(const MasterAddresses& addresses);
+
+CHECKED_STATUS ResolveMasterAddresses(
+    MasterAddressesPtr master_addresses, std::vector<Endpoint>* resolved_addresses);
+
 } // namespace server
 } // namespace yb
+
 #endif /* YB_SERVER_SERVER_BASE_OPTIONS_H */

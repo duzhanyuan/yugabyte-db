@@ -22,37 +22,34 @@ namespace yb {
 namespace master {
 
 // An iterator over a YQLVirtualTable.
-class YQLVTableIterator : public common::QLRowwiseIteratorIf {
+class YQLVTableIterator : public common::YQLRowwiseIteratorIf {
  public:
-  explicit YQLVTableIterator(const std::unique_ptr<QLRowBlock> vtable);
-  CHECKED_STATUS Init(ScanSpec *spec) override;
+  // hashed_column_values - is used to filter rows, i.e. if hashed_column_values is not empty
+  // only rows starting with specified hashed columns will be iterated.
+  YQLVTableIterator(
+      std::shared_ptr<QLRowBlock> vtable,
+      const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values);
 
-  CHECKED_STATUS Init(const common::QLScanSpec& spec) override;
-
-  CHECKED_STATUS NextBlock(RowBlock *dst) override;
-
-  CHECKED_STATUS NextRow(const Schema& projection, QLTableRow* table_row) override;
-
-  // Virtual table does not contain any static column.
-  bool IsNextStaticColumn() const override { return false; }
+  virtual ~YQLVTableIterator();
 
   void SkipRow() override;
 
-  CHECKED_STATUS SetPagingStateIfNecessary(const QLReadRequestPB& request,
-                                           QLResponsePB* response) const override;
-
-  bool HasNext() const override;
+  Result<bool> HasNext() const override;
 
   std::string ToString() const override;
 
   const Schema &schema() const override;
 
-  void GetIteratorStats(std::vector<IteratorStats>* stats) const override;
+  HybridTime RestartReadHt() override { return HybridTime::kInvalid; }
 
-  virtual ~YQLVTableIterator();
  private:
-  std::unique_ptr<QLRowBlock> vtable_;
-  size_t vtable_index_;
+  CHECKED_STATUS DoNextRow(const Schema& projection, QLTableRow* table_row) override;
+
+  void Advance(bool increment);
+
+  std::shared_ptr<QLRowBlock> vtable_;
+  size_t vtable_index_ = 0;
+  const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values_;
 };
 
 }  // namespace master

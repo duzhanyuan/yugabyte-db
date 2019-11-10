@@ -33,14 +33,21 @@
 #include <unordered_map>
 
 #include "yb/rocksdb/cache.h"
-#include "yb/rocksdb/version.h"
 #include "yb/rocksdb/listener.h"
 #include "yb/util/slice.h"
+#include "yb/util/result.h"
 #include "yb/rocksdb/universal_compaction.h"
 
 #ifdef max
 #undef max
 #endif
+
+namespace yb {
+
+class MemTracker;
+class PriorityThreadPool;
+
+}
 
 namespace rocksdb {
 
@@ -54,6 +61,7 @@ enum InfoLogLevel : unsigned char;
 class SstFileManager;
 class FilterPolicy;
 class Logger;
+class MemTable;
 class MergeOperator;
 class Snapshot;
 class TableFactory;
@@ -65,6 +73,8 @@ class Statistics;
 class InternalKeyComparator;
 class WalFilter;
 class MemoryMonitor;
+
+typedef std::shared_ptr<const InternalKeyComparator> InternalKeyComparatorPtr;
 
 // DB contents are stored in a set of blocks, each of which holds a
 // sequence of key,value pairs.  Each block may be compressed before
@@ -244,7 +254,7 @@ struct ColumnFamilyOptions {
   // thread-safe.
   //
   // Default: nullptr
-  const CompactionFilter* compaction_filter;
+  CompactionFilter* compaction_filter;
 
   // This is a factory that provides compaction filter objects which allow
   // an application to modify/delete a key-value during background compaction.
@@ -812,6 +822,8 @@ struct ColumnFamilyOptions {
   void Dump(Logger* log) const;
 };
 
+typedef std::function<yb::Result<bool>(const MemTable&)> MemTableFilter;
+
 struct DBOptions {
   // Some functions that make it easier to optimize RocksDB
 
@@ -848,6 +860,15 @@ struct DBOptions {
   // e.g. to read/write files, schedule background work, etc.
   // Default: Env::Default()
   Env* env;
+
+  Env* get_checkpoint_env() const {
+    return checkpoint_env ? checkpoint_env : env;
+  }
+
+  // Env used to create checkpoints. Default: Env::Default()
+  Env* checkpoint_env;
+
+  yb::PriorityThreadPool* priority_thread_pool_for_compactions_and_flushes = nullptr;
 
   // Use to control write rate of flush and compaction. Flush has higher
   // priority than compaction. Rate limiting is disabled if nullptr.
@@ -1307,6 +1328,18 @@ struct DBOptions {
 
   // Max file size for compaction. Supported only for level0 of universal style compactions.
   uint64_t max_file_size_for_compaction = std::numeric_limits<uint64_t>::max();
+
+  // Invoked after memtable switched.
+  std::shared_ptr<std::function<MemTableFilter()>> mem_table_flush_filter_factory;
+
+  // A prefix for log messages, usually containing the tablet id.
+  std::string log_prefix;
+
+  // This RocksDB instance root mem tracker.
+  std::shared_ptr<yb::MemTracker> mem_tracker;
+
+  // Specific mem tracker for block based tables created by this RocksDB instance.
+  std::shared_ptr<yb::MemTracker> block_based_table_mem_tracker;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -1518,13 +1551,19 @@ struct WriteOptions {
         ignore_missing_column_families(false) {}
 };
 
+// On each call returned value is incremented by 1.
+// Could be used to track whether one action happened before another.
+int64_t FlushTick();
+
 // Options that control flush operations
 struct FlushOptions {
   // If true, the flush will wait until the flush is done.
   // Default: true
-  bool wait;
+  bool wait = true;
 
-  FlushOptions() : wait(true) {}
+  static constexpr int64_t kNeverIgnore = std::numeric_limits<int64_t>::max();
+
+  int64_t ignore_if_flushed_after_tick = kNeverIgnore;
 };
 
 // Get options based on some guidelines. Now only tune parameter based on

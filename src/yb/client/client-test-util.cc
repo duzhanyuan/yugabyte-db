@@ -34,6 +34,14 @@
 
 #include <vector>
 
+#include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/session.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
+
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/stl_util.h"
 #include "yb/util/test_util.h"
 
@@ -59,29 +67,50 @@ void LogSessionErrorsAndDie(const std::shared_ptr<YBSession>& session,
   CHECK_OK(s); // will fail
 }
 
-void ScanTableToStrings(YBTable* table, vector<string>* row_strings) {
-  row_strings->clear();
-  YBScanner scanner(table);
-  ASSERT_OK(scanner.SetSelection(YBClient::LEADER_ONLY));
-  ASSERT_OK(scanner.SetTimeoutMillis(60000));
-  ScanToStrings(&scanner, row_strings);
+void FlushSessionOrDie(const std::shared_ptr<YBSession>& session,
+                       const std::vector<std::shared_ptr<YBqlOp>>& ops) {
+  Status s = session->Flush();
+  if (PREDICT_FALSE(!s.ok())) {
+    LogSessionErrorsAndDie(session, s);
+  }
+  for (auto& op : ops) {
+    CHECK_EQ(QLResponsePB::YQL_STATUS_OK, op->response().status())
+        << "Status: " << QLResponsePB::QLStatus_Name(op->response().status());
+  }
 }
 
-int64_t CountTableRows(YBTable* table) {
-  vector<string> rows;
-  client::ScanTableToStrings(table, &rows);
+void ScanTableToStrings(const TableHandle& table, std::vector<std::string>* row_strings) {
+  row_strings->clear();
+  for (const auto& row : TableRange(table)) {
+    row_strings->push_back(row.ToString());
+  }
+}
+
+std::vector<std::string> ScanTableToStrings(const TableHandle& table) {
+  std::vector<std::string> result;
+  ScanTableToStrings(table, &result);
+  return result;
+}
+
+int64_t CountTableRows(const TableHandle& table) {
+  std::vector<std::string> rows;
+  ScanTableToStrings(table, &rows);
   return rows.size();
 }
 
-void ScanToStrings(YBScanner* scanner, vector<string>* row_strings) {
-  ASSERT_OK(scanner->Open());
-  vector<YBRowResult> rows;
-  while (scanner->HasMoreRows()) {
-    ASSERT_OK(scanner->NextBatch(&rows));
-    for (const YBRowResult& row : rows) {
-      row_strings->push_back(row.ToString());
-    }
+std::vector<std::string> ScanToStrings(const TableRange& range) {
+  std::vector<std::pair<int32_t, std::string>> rows;
+  for (const auto& row : range) {
+    rows.emplace_back(row.column(0).int32_value(), row.ToString());
   }
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+  std::vector<std::string> result;
+  result.reserve(rows.size());
+  for (auto& row : rows) {
+    result.emplace_back(std::move(row.second));
+  }
+  return result;
 }
 
 YBSchema YBSchemaFromSchema(const Schema& schema) {

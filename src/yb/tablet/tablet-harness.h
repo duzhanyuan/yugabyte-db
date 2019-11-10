@@ -37,13 +37,16 @@
 #include <utility>
 #include <vector>
 
+#include "yb/common/partition.h"
 #include "yb/common/schema.h"
 #include "yb/consensus/log_anchor_registry.h"
+#include "yb/fs/fs_manager.h"
 #include "yb/server/logical_clock.h"
 #include "yb/server/metadata.h"
 
 #include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/util/env.h"
 #include "yb/util/mem_tracker.h"
@@ -60,9 +63,8 @@ namespace tablet {
 //
 // The provided schema must include column IDs.
 //
-// The partition schema will have no hash components, and a single range
-// component over the primary key columns. The partition will cover the
-// entire partition-key space.
+// The partition schema will have no hash components, and a single range component over the primary
+// key columns. The partition will cover the entire partition-key space.
 static std::pair<PartitionSchema, Partition> CreateDefaultPartition(const Schema& schema) {
   // Create a default partition schema.
   PartitionSchema partition_schema;
@@ -107,8 +109,8 @@ class TabletHarness {
     }
     RETURN_NOT_OK(fs_manager_->Open());
 
-    scoped_refptr<TabletMetadata> metadata;
-    RETURN_NOT_OK(TabletMetadata::LoadOrCreate(fs_manager_.get(),
+    RaftGroupMetadataPtr metadata;
+    RETURN_NOT_OK(RaftGroupMetadata::LoadOrCreate(fs_manager_.get(),
                                                "YBTableTest",
                                                options_.tablet_id,
                                                "YBTableTest",
@@ -116,21 +118,26 @@ class TabletHarness {
                                                schema_,
                                                partition.first,
                                                partition.second,
+                                               boost::none /* index_info */,
                                                TABLET_DATA_READY,
                                                &metadata));
     if (options_.enable_metrics) {
       metrics_registry_.reset(new MetricRegistry());
     }
 
-    clock_ = server::LogicalClock::CreateStartingAt(HybridTime::kInitialHybridTime);
+    clock_ = server::LogicalClock::CreateStartingAt(HybridTime::kInitial);
     TabletOptions tablet_options;
     tablet_.reset(new TabletClass(metadata,
+                                  std::shared_future<client::YBClient*>(),
                                   clock_,
+                                  std::shared_ptr<MemTracker>(),
                                   std::shared_ptr<MemTracker>(),
                                   metrics_registry_.get(),
                                   new log::LogAnchorRegistry(),
                                   tablet_options,
+                                  std::string() /* log_pefix_suffix */,
                                   nullptr /* transaction_participant_context */,
+                                  client::LocalTabletFilter(),
                                   nullptr /* transaction_coordinator_context */));
     return Status::OK();
   }
@@ -138,7 +145,30 @@ class TabletHarness {
   CHECKED_STATUS Open() {
     RETURN_NOT_OK(tablet_->Open());
     tablet_->MarkFinishedBootstrapping();
-    return Status::OK();
+    return tablet_->EnableCompactions();
+  }
+
+  Result<std::shared_ptr<TabletClass>> OpenTablet(const TabletId& tablet_id) {
+    RaftGroupMetadataPtr metadata;
+    RETURN_NOT_OK(RaftGroupMetadata::Load(fs_manager_.get(), tablet_id, &metadata));
+    TabletOptions tablet_options;
+    auto tablet = std::make_shared<TabletClass>(
+        metadata,
+        std::shared_future<client::YBClient*>(),
+        clock_,
+        std::shared_ptr<MemTracker>(),
+        std::shared_ptr<MemTracker>(),
+        metrics_registry_.get(),
+        new log::LogAnchorRegistry(),
+        tablet_options,
+        std::string() /* log_pefix_suffix */,
+        nullptr /* transaction_participant_context */,
+        client::LocalTabletFilter(),
+        nullptr /* transaction_coordinator_context */);
+    RETURN_NOT_OK(tablet->Open());
+    tablet->MarkFinishedBootstrapping();
+    RETURN_NOT_OK(tablet->EnableCompactions());
+    return tablet;
   }
 
   server::Clock* clock() const {
@@ -156,6 +186,8 @@ class TabletHarness {
   MetricRegistry* metrics_registry() {
     return metrics_registry_.get();
   }
+
+  const Options& options() const { return options_; }
 
  private:
   Options options_;

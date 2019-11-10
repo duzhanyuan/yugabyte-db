@@ -41,6 +41,13 @@
 namespace yb {
 namespace env_util {
 
+// Searches for the suitable "YugaByte distribution root" directory that contains the given
+// subdirectory. If the YB_HOME environment variable is specified, the value of that variable is
+// immediately returned. Otherwise, we start walking up from the directory of the current executable
+// until we are in a directory that has a subdirectory with the given name. Then we return the path
+// of that directory (not of the subdirectory).
+std::string GetRootDir(const std::string& search_for_dir);
+
 Status OpenFileForWrite(Env *env, const std::string &path,
                         std::shared_ptr<WritableFile> *file);
 
@@ -92,10 +99,15 @@ class ScopedFileDeleter {
  public:
   ScopedFileDeleter(Env* env, std::string path);
   ~ScopedFileDeleter();
+  ScopedFileDeleter(ScopedFileDeleter&& other) = default;
 
   // Do not delete the file when this object goes out of scope.
   void Cancel() {
     should_delete_ = false;
+  }
+
+  const std::string& path() {
+    return path_;
   }
 
  private:
@@ -109,4 +121,4 @@ class ScopedFileDeleter {
 } // namespace env_util
 } // namespace yb
 
-#endif
+#endif  // YB_UTIL_ENV_UTIL_H

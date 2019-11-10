@@ -35,14 +35,25 @@
 
 #include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/session.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
+
 #include "yb/gutil/mathlimits.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 #include "yb/integration-tests/test_workload.h"
+
+#include "yb/master/master_rpc.h"
+
+#include "yb/rpc/rpc.h"
+
 #include "yb/util/metrics.h"
 #include "yb/util/pstack_watcher.h"
 #include "yb/util/random.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/test_util.h"
 
 METRIC_DECLARE_entity(tablet);
@@ -51,12 +62,12 @@ METRIC_DECLARE_counter(follower_memory_pressure_rejections);
 
 using strings::Substitute;
 using std::vector;
+using namespace std::literals; // NOLINT
 
 namespace yb {
 
 using client::YBClient;
 using client::YBClientBuilder;
-using client::YBScanner;
 using client::YBTable;
 using client::YBTableName;
 
@@ -66,42 +77,20 @@ class ClientStressTest : public YBMiniClusterTestBase<ExternalMiniCluster> {
     YBMiniClusterTestBase::SetUp();
 
     ExternalMiniClusterOptions opts = default_opts();
-    if (multi_master()) {
-      opts.num_masters = 3;
-      opts.master_rpc_ports = { 0, 0, 0 };
-    }
-    opts.num_tablet_servers = 3;
     cluster_.reset(new ExternalMiniCluster(opts));
     ASSERT_OK(cluster_->Start());
   }
 
   void DoTearDown() override {
     alarm(0);
-    cluster_->Shutdown();
     YBMiniClusterTestBase::DoTearDown();
   }
 
  protected:
-  void ScannerThread(YBClient* client, const CountDownLatch* go_latch, int32_t start_key) {
-    std::shared_ptr<YBTable> table;
-    CHECK_OK(client->OpenTable(TestWorkload::kDefaultTableName, &table));
-    vector<string> rows;
-
-    go_latch->Wait();
-
-    YBScanner scanner(table.get());
-    CHECK_OK(scanner.AddConjunctPredicate(table->NewComparisonPredicate(
-        "key", client::YBPredicate::GREATER_EQUAL,
-        client::YBValue::FromInt(start_key))));
-    ScanToStrings(&scanner, &rows);
-  }
-
-  virtual bool multi_master() const {
-    return false;
-  }
-
-  virtual ExternalMiniClusterOptions default_opts() const {
-    return ExternalMiniClusterOptions();
+  virtual ExternalMiniClusterOptions default_opts() {
+    ExternalMiniClusterOptions result;
+    result.num_tablet_servers = 3;
+    return result;
   }
 };
 
@@ -120,59 +109,15 @@ TEST_F(ClientStressTest, TestLookupTimeouts) {
   SleepFor(MonoDelta::FromMilliseconds(kSleepMillis));
 }
 
-// Regression test for KUDU-1104, a race in which multiple scanners racing to populate a
-// cold meta cache on a shared Client would crash.
-//
-// This test creates a table with a lot of tablets (so that we require many round-trips to
-// the master to populate the meta cache) and then starts a bunch of parallel threads which
-// scan starting at random points in the key space.
-TEST_F(ClientStressTest, TestStartScans) {
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-    ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(i), "log_preallocate_segments", "0"));
-  }
-  TestWorkload work(cluster_.get());
-  work.set_num_tablets(40);
-  work.set_num_replicas(1);
-  work.Setup();
-
-  // We run the guts of the test several times -- it takes a while to build
-  // the 40 tablets above, but the actual scans are very fast since the table
-  // is empty.
-  for (int run = 1; run <= (AllowSlowTests() ? 10 : 2); run++) {
-    LOG(INFO) << "Starting run " << run;
-    YBClientBuilder builder;
-    std::shared_ptr<YBClient> client;
-    CHECK_OK(cluster_->CreateClient(&builder, &client));
-
-    CountDownLatch go_latch(1);
-    vector<scoped_refptr<Thread> > threads;
-    const int kNumThreads = 60;
-    Random rng(run);
-    for (int i = 0; i < kNumThreads; i++) {
-      int32_t start_key = rng.Next32();
-      scoped_refptr<yb::Thread> new_thread;
-      CHECK_OK(yb::Thread::Create(
-          "test", strings::Substitute("test-scanner-$0", i),
-          &ClientStressTest_TestStartScans_Test::ScannerThread, this,
-          client.get(), &go_latch, start_key,
-          &new_thread));
-      threads.push_back(new_thread);
-    }
-    SleepFor(MonoDelta::FromMilliseconds(50));
-
-    go_latch.CountDown();
-
-    for (const scoped_refptr<yb::Thread>& thr : threads) {
-      CHECK_OK(ThreadJoiner(thr.get()).Join());
-    }
-  }
-}
-
 // Override the base test to run in multi-master mode.
 class ClientStressTest_MultiMaster : public ClientStressTest {
  protected:
-  bool multi_master() const override {
-    return true;
+  ExternalMiniClusterOptions default_opts() override {
+    ExternalMiniClusterOptions result;
+    result.num_masters = 3;
+    result.master_rpc_ports = {0, 0, 0};
+    result.num_tablet_servers = 3;
+    return result;
   }
 };
 
@@ -216,24 +161,105 @@ TEST_F(ClientStressTest_MultiMaster, TestLeaderResolutionTimeout) {
   alarm(60);
 }
 
+namespace {
+
+class ClientStressTestSlowMultiMaster : public ClientStressTest {
+ protected:
+  ExternalMiniClusterOptions default_opts() override {
+    ExternalMiniClusterOptions result;
+    result.num_masters = 3;
+    result.master_rpc_ports = { 0, 0, 0 };
+    result.extra_master_flags = { "--master_slow_get_registration_probability=0.2"s };
+    result.num_tablet_servers = 0;
+    return result;
+  }
+};
+
+void LeaderMasterCallback(Synchronizer* sync,
+                          const Status& status,
+                          const HostPort& result) {
+  LOG_IF(INFO, status.ok()) << "Leader master host port: " << result.ToString();
+  sync->StatusCB(status);
+}
+
+void RepeatGetLeaderMaster(ExternalMiniCluster* cluster) {
+  server::MasterAddresses master_addrs;
+  for (auto i = 0; i != cluster->num_masters(); ++i) {
+    master_addrs.push_back({cluster->master(i)->bound_rpc_addr()});
+  }
+  auto stop_time = std::chrono::steady_clock::now() + 60s;
+  std::vector<std::thread> threads;
+  for (auto i = 0; i != 10; ++i) {
+    threads.emplace_back([cluster, stop_time, master_addrs]() {
+      while (std::chrono::steady_clock::now() < stop_time) {
+        rpc::Rpcs rpcs;
+        Synchronizer sync;
+        auto deadline = CoarseMonoClock::Now() + 20s;
+        auto rpc = rpc::StartRpc<master::GetLeaderMasterRpc>(
+            Bind(&LeaderMasterCallback, &sync),
+            master_addrs,
+            deadline,
+            cluster->messenger(),
+            &cluster->proxy_cache(),
+            &rpcs);
+        auto status = sync.Wait();
+        LOG_IF(INFO, !status.ok()) << "Get leader master failed: " << status;
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+}
+
+} // namespace
+
+TEST_F_EX(ClientStressTest, SlowLeaderResolution, ClientStressTestSlowMultiMaster) {
+  DontVerifyClusterBeforeNextTearDown();
+
+  RepeatGetLeaderMaster(cluster_.get());
+}
+
+namespace {
+
+class ClientStressTestSmallQueueMultiMaster : public ClientStressTest {
+ protected:
+  ExternalMiniClusterOptions default_opts() override {
+    ExternalMiniClusterOptions result;
+    result.num_masters = 3;
+    result.master_rpc_ports = { 0, 0, 0 };
+    result.extra_master_flags = { "--master_svc_queue_length=5"s };
+    result.num_tablet_servers = 0;
+    return result;
+  }
+};
+
+} // namespace
+
+TEST_F_EX(ClientStressTest, RetryLeaderResolution, ClientStressTestSmallQueueMultiMaster) {
+  DontVerifyClusterBeforeNextTearDown();
+
+  RepeatGetLeaderMaster(cluster_.get());
+}
 
 // Override the base test to start a cluster with a low memory limit.
 class ClientStressTest_LowMemory : public ClientStressTest {
  protected:
-  ExternalMiniClusterOptions default_opts() const override {
+  ExternalMiniClusterOptions default_opts() override {
     // There's nothing scientific about this number; it must be low enough to
     // trigger memory pressure request rejection yet high enough for the
     // servers to make forward progress.
     //
     // Note that if this number is set too low, the test will fail in a CHECK in TestWorkload
     // after retries are exhausted when writing an entry. This happened e.g. when a substantial
-    // upfront memory overhead was introduced by adding a large lock-free queue in PrepareThread.
-    const int kMemLimitBytes = 64 * 1024 * 1024;
+    // upfront memory overhead was introduced by adding a large lock-free queue in Preparer.
+    const int kMemLimitBytes = RegularBuildVsSanitizers(64_MB, 2_MB);
     ExternalMiniClusterOptions opts;
-    opts.extra_tserver_flags.push_back(Substitute("--memory_limit_hard_bytes=$0", kMemLimitBytes));
-    opts.extra_tserver_flags.push_back("--memory_limit_soft_percentage=0");
-    opts.extra_tserver_flags.push_back("--memory_limit_soft_percentage=0");
 
+    opts.extra_tserver_flags = { Substitute("--memory_limit_hard_bytes=$0", kMemLimitBytes),
+                                 "--memory_limit_soft_percentage=0"s };
+
+    opts.num_tablet_servers = 3;
     return opts;
   }
 };
@@ -243,24 +269,20 @@ class ClientStressTest_LowMemory : public ClientStressTest {
 // TODO(mbautin): switch this test to QL (RocksDB-backed) after we implement proper memory
 // tracking for RocksDB (https://yugabyte.atlassian.net/browse/ENG-442).
 TEST_F(ClientStressTest_LowMemory, TestMemoryThrottling) {
-  // TODO (tyusupov): remove DontVerifyClusterBeforeNextTearDown check once this test is switched
-  // to QL. Cluster check is disabled, because checksum checking is failing for Kudu tables here.
-  DontVerifyClusterBeforeNextTearDown();
-
-  // TSAN tests run much slower, so we don't want to wait for as many
+  // Sanitized tests run much slower, so we don't want to wait for as many
   // rejections before declaring the test to be passed.
-  const int64_t kMinRejections = NonTsanVsTsan(100, 20);
+  const int64_t kMinRejections = 15;
 
   const MonoDelta kMaxWaitTime = MonoDelta::FromSeconds(60);
 
   TestWorkload work(cluster_.get());
+  work.set_write_batch_size(RegularBuildVsSanitizers(25, 5));
 
   work.Setup();
   work.Start();
 
   // Wait until we've rejected some number of requests.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(kMaxWaitTime);
+  MonoTime deadline = MonoTime::Now() + kMaxWaitTime;
   while (true) {
     int64_t total_num_rejections = 0;
 
@@ -293,11 +315,68 @@ TEST_F(ClientStressTest_LowMemory, TestMemoryThrottling) {
     }
     if (total_num_rejections >= kMinRejections) {
       break;
-    } else if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    } else if (deadline.ComesBefore(MonoTime::Now())) {
       FAIL() << "Ran for " << kMaxWaitTime.ToString() << ", deadline expired and only saw "
              << total_num_rejections << " memory rejections";
     }
     SleepFor(MonoDelta::FromMilliseconds(200));
+  }
+}
+
+namespace {
+
+class ClientStressTestSmallQueueMultiMasterWithTServers : public ClientStressTest {
+ protected:
+  ExternalMiniClusterOptions default_opts() override {
+    ExternalMiniClusterOptions result;
+    result.num_masters = 3;
+    result.master_rpc_ports = { 0, 0, 0 };
+    result.extra_master_flags = {
+        "--master_svc_queue_length=5"s, "--master_inject_latency_on_tablet_lookups_ms=50"s };
+    result.num_tablet_servers = 3;
+    return result;
+  }
+};
+
+} // namespace
+
+// Check behaviour of meta cache in case of server queue is full.
+TEST_F_EX(ClientStressTest, MasterQueueFull, ClientStressTestSmallQueueMultiMasterWithTServers) {
+  TestWorkload workload(cluster_.get());
+  workload.Setup();
+
+  struct Item {
+    std::unique_ptr<client::YBClient> client;
+    std::unique_ptr<client::TableHandle> table;
+    client::YBSessionPtr session;
+    std::future<Status> future;
+  };
+
+  std::vector<Item> items;
+  constexpr size_t kNumRequests = 40;
+  while (items.size() != kNumRequests) {
+    Item item;
+    item.client = ASSERT_RESULT(cluster_->CreateClient());
+    item.table = std::make_unique<client::TableHandle>();
+    ASSERT_OK(item.table->Open(TestWorkloadOptions::kDefaultTableName, item.client.get()));
+    item.session = std::make_shared<client::YBSession>(item.client.get());
+    items.push_back(std::move(item));
+  }
+
+  int32_t key = 0;
+  const std::string kStringValue("string value");
+  for (auto& item : items) {
+    auto op = item.table->NewInsertOp();
+    auto req = op->mutable_request();
+    QLAddInt32HashValue(req, ++key);
+    item.table->AddInt32ColumnValue(req, item.table->schema().columns()[1].name(), -key);
+    item.table->AddStringColumnValue(req, item.table->schema().columns()[2].name(), kStringValue);
+    ASSERT_OK(item.session->Apply(op));
+    item.future = item.session->FlushFuture();
+  }
+
+  for (auto& item : items) {
+    ASSERT_OK(item.future.get());
   }
 }
 

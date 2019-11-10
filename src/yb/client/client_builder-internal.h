@@ -37,6 +37,7 @@
 
 #include "yb/client/client.h"
 #include "yb/common/entity_ids.h"
+#include "yb/common/wire_protocol.h"
 #include "yb/gutil/ref_counted.h"
 
 namespace yb {
@@ -56,6 +57,9 @@ class YBClientBuilder::Data {
   // can either be a single 'host:port' or a comma separated list of 'host1:port1,host2:port2,...'.
   std::vector<std::string> master_server_addrs_;
 
+  // This bool determines whether to use FLAGS_flagfile as an override of client-entered data.
+  bool skip_master_flagfile_ = false;
+
   int32_t num_reactors_;
 
   MonoDelta default_admin_operation_timeout_;
@@ -67,12 +71,17 @@ class YBClientBuilder::Data {
   // A descriptive name for the client. Useful for embedded ybclients.
   std::string client_name_ = "ybclient";
 
+  // The size of the threadpool to use for calling callbacks.
+  size_t threadpool_size_ = 0;
+
   // Placement information for the client.
   CloudInfoPB cloud_info_pb_;
 
   // When the client is part of a CQL proxy, this denotes the uuid for the associated tserver to
   // aid in detecting local tservers.
   TabletServerId uuid_;
+
+  std::shared_ptr<MemTracker> parent_mem_tracker_;
 
   bool skip_master_leader_resolution_ = false;
  private:

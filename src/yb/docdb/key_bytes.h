@@ -30,7 +30,7 @@ namespace yb {
 namespace docdb {
 
 // Represents part (usually a prefix) of a RocksDB key. Has convenience methods for composing keys
-// used in our document DB layer -> RocksDB mapping.
+// used in our DocDB layer -> RocksDB mapping.
 class KeyBytes {
  public:
 
@@ -38,8 +38,33 @@ class KeyBytes {
   explicit KeyBytes(const std::string& data) : data_(data) {}
   explicit KeyBytes(const rocksdb::Slice& slice) : data_(slice.ToBuffer()) {}
 
+  KeyBytes(const KeyBytes& rhs) = default;
+  KeyBytes& operator=(const KeyBytes& rhs) = default;
+  KeyBytes(KeyBytes&& rhs) = default;
+  KeyBytes& operator=(KeyBytes&& rhs) = default;
+
+  KeyBytes(const Slice& slice, char suffix) {
+    data_.reserve(slice.size() + 1);
+    data_.append(slice.cdata(), slice.size());
+    data_.push_back(suffix);
+  }
+
+  KeyBytes(const Slice& slice1, const Slice& slice2) {
+    data_.reserve(slice1.size() + slice2.size());
+    data_.append(slice1.cdata(), slice1.size());
+    data_.append(slice2.cdata(), slice2.size());
+  }
+
+  void Reserve(size_t len) {
+    data_.reserve(len);
+  }
+
   std::string ToString() const {
-    return yb::util::FormatBytesAsStr(data_);
+    return yb::FormatBytesAsStr(data_);
+  }
+
+  bool empty() const {
+    return data_.empty();
   }
 
   const std::string& data() const {
@@ -64,6 +89,15 @@ class KeyBytes {
 
   void AppendValueType(ValueType value_type) {
     data_.push_back(static_cast<char>(value_type));
+  }
+
+  void AppendValueTypeBeforeGroupEnd(ValueType value_type) {
+    if (data_.empty() || data_[data_.size() - 1] != ValueTypeAsChar::kGroupEnd) {
+      AppendValueType(value_type);
+      AppendValueType(ValueType::kGroupEnd);
+    } else {
+      data_.insert(data_.size() - 1, 1, static_cast<char>(value_type));
+    }
   }
 
   void AppendString(const std::string& raw_string) {
@@ -92,16 +126,50 @@ class KeyBytes {
     }
   }
 
+  void AppendVarInt(const std::string& encoded_varint_str) {
+    data_.append(encoded_varint_str);
+  }
+
+  void AppendVarIntDescending(const std::string& encoded_varint_str) {
+    // Flipping all the bits negates the varint number this string represents.
+
+    // 0 is a special case because the first two bits are always 10.
+    if (static_cast<uint8_t>(encoded_varint_str[0]) == 128) {
+      data_.push_back(encoded_varint_str[0]);
+      return;
+    }
+
+    for (auto c : encoded_varint_str) {
+      data_.push_back(~c);
+    }
+  }
+
   void AppendInt64(int64_t x) {
-    AppendInt64ToKey(x, &data_);
+    util::AppendInt64ToKey(x, &data_);
+  }
+
+  void AppendUInt64(uint64_t x) {
+    AppendUInt64ToKey(x, &data_);
+  }
+
+  void AppendDescendingUInt64(int64_t x) {
+    AppendUInt64ToKey(~x, &data_);
   }
 
   void AppendInt32(int32_t x) {
-    AppendInt32ToKey(x, &data_);
+    util::AppendInt32ToKey(x, &data_);
   }
 
-  void AppendIntentType(IntentType intent_type) {
-    data_.push_back(static_cast<char>(intent_type));
+  void AppendUInt32(uint32_t x) {
+    AppendUInt32ToKey(x, &data_);
+  }
+
+  void AppendDescendingUInt32(int32_t x) {
+    AppendUInt32ToKey(~x, &data_);
+  }
+
+  void AppendIntentTypeSet(IntentTypeSet intent_type_set) {
+    data_.push_back(static_cast<char>(intent_type_set.ToUIntPtr()));
   }
 
   void AppendDescendingInt64(int64_t x) {
@@ -122,11 +190,11 @@ class KeyBytes {
     //    -1   = 0xFF -> 0x00 -> 0x80
     //    0    = 0x00 -> 0xFF -> 0x7F
     //    127  = 0x7F -> 0x80 -> 0x00
-    AppendInt64ToKey(~x, &data_);
+    util::AppendInt64ToKey(~x, &data_);
   }
 
   void AppendDescendingInt32(int32_t x) {
-    AppendInt32ToKey(~x, &data_);
+    util::AppendInt32ToKey(~x, &data_);
   }
 
   void AppendUInt16(int16_t x) {
@@ -146,19 +214,19 @@ class KeyBytes {
   }
 
   void AppendDescendingFloat(float x) {
-    AppendFloatToKey(x, &data_, /* descending */ true);
+    util::AppendFloatToKey(x, &data_, /* descending */ true);
   }
 
   void AppendFloat(float x) {
-    AppendFloatToKey(x, &data_);
+    util::AppendFloatToKey(x, &data_);
   }
 
   void AppendDescendingDouble(double x) {
-    AppendDoubleToKey(x, &data_, /* descending */ true);
+    util::AppendDoubleToKey(x, &data_, /* descending */ true);
   }
 
   void AppendDouble(double x) {
-    AppendDoubleToKey(x, &data_);
+    util::AppendDoubleToKey(x, &data_);
   }
 
   void RemoveValueTypeSuffix(ValueType value_type) {
@@ -182,6 +250,8 @@ class KeyBytes {
   CHECKED_STATUS OnlyLacksHybridTimeFrom(const rocksdb::Slice& other_slice, bool* result) const;
 
   rocksdb::Slice AsSlice() const { return rocksdb::Slice(data_); }
+
+  operator Slice() const { return Slice(data_); }
 
   // @return This key prefix as a string reference. Assumes the reference won't be used beyond
   //         the lifetime of this object.
@@ -207,14 +277,6 @@ class KeyBytes {
     return rocksdb::Slice(data_).compare(other);
   }
 
-  bool operator <(const KeyBytes& other) {
-    return data_ < other.data_;
-  }
-
-  bool operator >(const KeyBytes& other) {
-    return data_ > other.data_;
-  }
-
   // This can be used to e.g. move the internal state of KeyBytes somewhere else, including a
   // string field in a protobuf, without copying the bytes.
   std::string* mutable_data() {
@@ -230,12 +292,32 @@ class KeyBytes {
     data_.resize(new_size);
   }
 
+  void RemoveLastByte() {
+    DCHECK(!data_.empty());
+    data_.pop_back();
+  }
+
  private:
 
   std::string data_;
 };
 
-void AppendIntentType(IntentType intent_type, KeyBytes* key);
+inline bool operator<(const KeyBytes& lhs, const KeyBytes& rhs) {
+  return lhs.data() < rhs.data();
+}
+
+inline bool operator>=(const KeyBytes& lhs, const KeyBytes& rhs) {
+  return !(lhs < rhs);
+}
+
+inline bool operator>(const KeyBytes& lhs, const KeyBytes& rhs) {
+  return rhs < lhs;
+}
+
+inline bool operator<=(const KeyBytes& lhs, const KeyBytes& rhs) {
+  return !(rhs < lhs);
+}
+
 void AppendDocHybridTime(const DocHybridTime& time, KeyBytes* key);
 
 }  // namespace docdb

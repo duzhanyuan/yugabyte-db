@@ -24,11 +24,12 @@ SystemTablet::SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable
       tablet_id_(tablet_id) {
 }
 
-const Schema& SystemTablet::SchemaRef() const {
+const Schema& SystemTablet::SchemaRef(const std::string& table_id) const {
+  // table_id is ignored. It should match the system table's id.
   return schema_;
 }
 
-const common::QLStorageIf& SystemTablet::QLStorage() const {
+const common::YQLStorageIf& SystemTablet::QLStorage() const {
   return *yql_virtual_table_;
 }
 
@@ -40,37 +41,33 @@ const TabletId& SystemTablet::tablet_id() const {
   return tablet_id_;
 }
 
-void SystemTablet::RegisterReaderTimestamp(HybridTime read_point) {
-  // NOOP.
+Status SystemTablet::RegisterReaderTimestamp(HybridTime read_point) {
+  return Status::OK();
 }
 
 void SystemTablet::UnregisterReader(HybridTime read_point) {
   // NOOP.
 }
 
-HybridTime SystemTablet::SafeTimestampToRead() const {
+HybridTime SystemTablet::DoGetSafeTime(
+    tablet::RequireLease require_lease, HybridTime min_allowed, CoarseTimePoint deadline) const {
   // HybridTime doesn't matter for SystemTablets.
   return HybridTime::kMax;
 }
 
-CHECKED_STATUS SystemTablet::HandleRedisReadRequest(
-    HybridTime timestamp, const RedisReadRequestPB& redis_read_request,
-    RedisResponsePB* response) {
-  return STATUS(NotSupported, "RedisReadRequest is not supported for system tablets!");
-}
-
-CHECKED_STATUS SystemTablet::HandleQLReadRequest(
-    HybridTime timestamp, const QLReadRequestPB& ql_read_request,
-    const TransactionMetadataPB& transaction_metadata, QLResponsePB* response,
-    gscoped_ptr<faststring>* rows_data) {
+Status SystemTablet::HandleQLReadRequest(CoarseTimePoint deadline,
+                                         const ReadHybridTime& read_time,
+                                         const QLReadRequestPB& ql_read_request,
+                                         const TransactionMetadataPB& transaction_metadata,
+                                         tablet::QLReadRequestResult* result) {
   DCHECK(!transaction_metadata.has_transaction_id());
   return tablet::AbstractTablet::HandleQLReadRequest(
-      timestamp, ql_read_request, boost::none, response, rows_data);
+      deadline, read_time, ql_read_request, boost::none, result);
 }
 
-CHECKED_STATUS SystemTablet::CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,
-                                                      const size_t row_count,
-                                                      QLResponsePB* response) const {
+Status SystemTablet::CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,
+                                              const size_t row_count,
+                                              QLResponsePB* response) const {
   // We don't support pagination for system tablets. Although we need to return an OK() status
   // here since we don't want to raise this as an error to the client, but just want to avoid
   // populating any paging state here for the client.

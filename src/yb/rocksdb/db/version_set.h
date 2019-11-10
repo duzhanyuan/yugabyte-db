@@ -31,8 +31,8 @@
 // Version,VersionSet are thread-compatible, but require external
 // synchronization on all accesses.
 
-#ifndef ROCKSDB_DB_VERSION_SET_H
-#define ROCKSDB_DB_VERSION_SET_H
+#ifndef YB_ROCKSDB_DB_VERSION_SET_H
+#define YB_ROCKSDB_DB_VERSION_SET_H
 
 #pragma once
 
@@ -78,6 +78,7 @@ class ColumnFamilyData;
 class ColumnFamilySet;
 class TableCache;
 class MergeIteratorBuilder;
+class FileNumbersProvider;
 
 // Return the smallest index i such that file_level.files[i]->largest >= key.
 // Return file_level.num_files if there is no such file.
@@ -107,7 +108,7 @@ extern void DoGenerateLevelFilesBrief(LevelFilesBrief* file_level,
 
 class VersionStorageInfo {
  public:
-  VersionStorageInfo(const InternalKeyComparator* internal_comparator,
+  VersionStorageInfo(const InternalKeyComparatorPtr& internal_comparator,
                      const Comparator* user_comparator, int num_levels,
                      CompactionStyle compaction_style,
                      VersionStorageInfo* src_vstorage);
@@ -232,6 +233,8 @@ class VersionStorageInfo {
     return static_cast<int>(files_[level].size());
   }
 
+  uint64_t NumFiles() const;
+
   // Return the combined file size of all files at the specified level.
   uint64_t NumLevelBytes(int level) const;
 
@@ -323,7 +326,7 @@ class VersionStorageInfo {
     next_file_to_compact_by_size_[level] = 0;
   }
 
-  const InternalKeyComparator* InternalComparator() {
+  const InternalKeyComparatorPtr& InternalComparator() {
     return internal_comparator_;
   }
 
@@ -346,7 +349,7 @@ class VersionStorageInfo {
   }
 
  private:
-  const InternalKeyComparator* internal_comparator_;
+  InternalKeyComparatorPtr internal_comparator_;
   const Comparator* user_comparator_;
   int num_levels_;            // Number of levels
   int num_non_empty_levels_;  // Number of levels. Any level larger than it
@@ -531,7 +534,7 @@ class Version {
   Env* env_;
   friend class VersionSet;
 
-  const InternalKeyComparator* internal_comparator() const {
+  const InternalKeyComparatorPtr& internal_comparator() const {
     return storage_info_.internal_comparator_;
   }
   const Comparator* user_comparator() const {
@@ -587,6 +590,16 @@ class Version {
   void operator=(const Version&);
 };
 
+typedef boost::intrusive_ptr<Version> VersionPtr;
+
+inline void intrusive_ptr_add_ref(Version* version) {
+  version->Ref();
+}
+
+inline void intrusive_ptr_release(Version* version) {
+  version->Unref();
+}
+
 class VersionSet {
  public:
   static constexpr uint64_t kInitialNextFileNumber = 2;
@@ -639,7 +652,7 @@ class VersionSet {
 
   // printf contents (for debugging)
   Status DumpManifest(const Options& options, const std::string& manifestFileName,
-                      bool verbose, bool hex = false, bool json = false);
+                      bool verbose, bool hex = false);
 
 #endif  // ROCKSDB_LITE
 
@@ -660,34 +673,22 @@ class VersionSet {
     return last_sequence_.load(std::memory_order_acquire);
   }
 
-  OpId FlushedOpId() const {
-    return flushed_op_id_.load(std::memory_order_acquire);
+  UserFrontier* FlushedFrontier() const {
+    return flushed_frontier_.get();
   }
 
   // Set the last sequence number to s.
-  void SetLastSequence(SequenceNumber s) {
-#ifndef NDEBUG
-    EnsureIncreasingLastSequence(LastSequence(), s);
-#endif
-    SetLastSequenceNoSanityChecking(s);
-  }
+  void SetLastSequence(SequenceNumber s);
 
   // Set last sequence number without verifying that it always keeps increasing.
-  void SetLastSequenceNoSanityChecking(SequenceNumber s) {
-    last_sequence_.store(s, std::memory_order_release);
-  }
+  void SetLastSequenceNoSanityChecking(SequenceNumber s);
 
-  // Set the last flushed op id to specified value.
-  void SetFlushedOpId(const OpId& value) {
-#ifndef NDEBUG
-    EnsureNonDecreasingFlushedOpId(FlushedOpId(), value);
-#endif
-    SetFlushedOpIdNoSanityChecking(value);
-  }
-
-  void SetFlushedOpIdNoSanityChecking(const OpId& value) {
-    flushed_op_id_.store(value, std::memory_order_release);
-  }
+  // Attempts to set the last flushed op id / hybrid time / history cutoff to the specified tuple of
+  // values. The current flushed frontier is always updated to the maximum of its current and
+  // supplied values for each dimension. This will DFATAL in case the supplied frontier regresses
+  // relative to the current frontier in any of its dimensions which have non-default (defined)
+  // values.
+  void UpdateFlushedFrontier(UserFrontierPtr values);
 
   // Mark the specified file number as used.
   // REQUIRED: this is only called during single-threaded recovery
@@ -739,14 +740,16 @@ class VersionSet {
   // This function doesn't support leveldb SST filenames
   void GetLiveFilesMetaData(std::vector<LiveFileMetaData> *metadata);
 
-  void GetObsoleteFiles(std::vector<FileMetaData*>* files,
-                        std::vector<std::string>* manifest_filenames,
-                        uint64_t min_pending_output);
+  void GetObsoleteFiles(const FileNumbersProvider& pending_outputs,
+                        std::vector<FileMetaData*>* files,
+                        std::vector<std::string>* manifest_filenames);
 
   ColumnFamilySet* GetColumnFamilySet() { return column_family_set_.get(); }
   const EnvOptions& env_options() { return env_options_; }
 
   CHECKED_STATUS Import(const std::string& source_dir, SequenceNumber seqno, VersionEdit* edit);
+
+  void UnrefFile(ColumnFamilyData* cfd, FileMetaData* f);
 
   static uint64_t GetNumLiveVersions(Version* dummy_versions);
 
@@ -765,17 +768,19 @@ class VersionSet {
   uint64_t ApproximateSize(Version* v, const FdWithBoundaries& f, const Slice& key);
 
   // Save current contents to *log
-  Status WriteSnapshot(log::Writer* log);
+  Status WriteSnapshot(log::Writer* log, UserFrontierPtr flushed_frontier_override);
 
   void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
 
   ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                        VersionEdit* edit);
 
-#ifndef NDEBUG
-  void EnsureIncreasingLastSequence(SequenceNumber prev_last_seq, SequenceNumber new_last_seq);
-  void EnsureNonDecreasingFlushedOpId(const OpId& prev_value, const OpId& new_value);
-#endif
+  static void EnsureNonDecreasingLastSequence(
+      SequenceNumber prev_last_seq, SequenceNumber new_last_seq);
+  static void EnsureNonDecreasingFlushedFrontier(
+      const UserFrontier* prev_value, const UserFrontier& new_value);
+
+  void UpdateFlushedFrontierNoSanityChecking(UserFrontierPtr values);
 
   std::unique_ptr<ColumnFamilySet> column_family_set_;
 
@@ -787,10 +792,11 @@ class VersionSet {
   uint64_t pending_manifest_file_number_ = 0;
   std::atomic<uint64_t> last_sequence_ = {0};
   uint64_t prev_log_number_ = 0; // 0 or backing store for memtable being compacted
-  std::atomic<OpId> flushed_op_id_ = {OpId()};
+  UserFrontierPtr flushed_frontier_;
 
   // Opened lazily
   std::unique_ptr<log::Writer> descriptor_log_;
+  std::string descriptor_log_file_name_;
 
   // generates a increasing version number for every new version
   uint64_t current_version_number_ = 0;
@@ -816,10 +822,13 @@ class VersionSet {
   void operator=(const VersionSet&);
 
   void LogAndApplyCFHelper(VersionEdit* edit);
-  void LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b, Version* v,
-                         VersionEdit* edit, InstrumentedMutex* mu);
+  void LogAndApplyHelper(
+      ColumnFamilyData* cfd,
+      VersionBuilder* b,
+      VersionEdit* edit,
+      InstrumentedMutex* mu);
 };
 
 }  // namespace rocksdb
 
-#endif // ROCKSDB_DB_VERSION_SET_H
+#endif // YB_ROCKSDB_DB_VERSION_SET_H

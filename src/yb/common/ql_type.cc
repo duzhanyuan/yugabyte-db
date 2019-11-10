@@ -78,6 +78,8 @@ shared_ptr<QLType> QLType::Create(DataType data_type) {
       return CreatePrimitiveType<DataType::VARINT>();
     case DataType::INET:
       return CreatePrimitiveType<DataType::INET>();
+    case DataType::JSONB:
+      return CreatePrimitiveType<DataType::JSONB>();
     case DataType::UUID:
       return CreatePrimitiveType<DataType::UUID>();
     case DataType::TIMEUUID:
@@ -126,11 +128,11 @@ shared_ptr<QLType> QLType::Create(DataType data_type) {
 
 bool QLType::IsValidPrimaryType(DataType type) {
   switch (type) {
-    case DataType::BOOL:FALLTHROUGH_INTENDED;
     case DataType::MAP: FALLTHROUGH_INTENDED;
     case DataType::SET: FALLTHROUGH_INTENDED;
     case DataType::LIST: FALLTHROUGH_INTENDED;
     case DataType::TUPLE: FALLTHROUGH_INTENDED;
+    case DataType::JSONB: FALLTHROUGH_INTENDED;
     case DataType::USER_DEFINED_TYPE:
       return false;
 
@@ -243,6 +245,7 @@ const string QLType::ToCQLString(const DataType& datatype) {
     case DataType::DECIMAL: return "decimal";
     case DataType::VARINT: return "varint";
     case DataType::INET: return "inet";
+    case DataType::JSONB: return "jsonb";
     case DataType::LIST: return "list";
     case DataType::MAP: return "map";
     case DataType::SET: return "set";

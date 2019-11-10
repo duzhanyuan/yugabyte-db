@@ -47,10 +47,11 @@
 #include "yb/common/key_encoder.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/transaction.h"
-#include "yb/tablet/metadata.pb.h"
+#include "yb/common/common.pb.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/strcat.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/util/enums.h"
 #include "yb/util/status.h"
 
 // Check that two schemas are equal, yielding a useful error message in the case that
@@ -69,6 +70,8 @@
   } while (0);
 
 namespace yb {
+
+class DeletedColumnPB;
 
 using std::vector;
 using std::unordered_map;
@@ -165,45 +168,12 @@ struct DeletedColumn {
 
   DeletedColumn(ColumnId id, const HybridTime& ht) : id(id), ht(ht) { }
 
-  static Status FromPB(const tablet::DeletedColumnPB& col, DeletedColumn* ret) {
-    ret->id = col.column_id();
-    ret->ht = HybridTime(col.deleted_hybrid_time());
-    return Status::OK();
-  }
-
-  void CopyToPB(tablet::DeletedColumnPB* pb) const {
-    pb->set_column_id(id);
-    pb->set_deleted_hybrid_time(ht.ToUint64());
-  }
+  static CHECKED_STATUS FromPB(const DeletedColumnPB& col, DeletedColumn* ret);
+  void CopyToPB(DeletedColumnPB* pb) const;
 };
 
 typedef std::unordered_set<ColumnId> ColumnIds;
 typedef std::shared_ptr<ColumnIds> ColumnIdsPtr;
-
-// Class for storing column attributes such as compression and
-// encoding.  Column attributes describe the physical storage and
-// representation of bytes, as opposed to a purely logical description
-// normally associated with the term Schema.
-//
-// Column attributes are presently specified in the ColumnSchema
-// protobuf message, but this should ideally be separate.
-struct ColumnStorageAttributes {
- public:
-  ColumnStorageAttributes()
-    : encoding(AUTO_ENCODING),
-      compression(DEFAULT_COMPRESSION),
-      cfile_block_size(0) {
-  }
-
-  string ToString() const;
-
-  EncodingType encoding;
-  CompressionType compression;
-
-  // The preferred block size for cfile blocks. If 0, uses the
-  // server-wide default.
-  int32_t cfile_block_size;
-};
 
 // The schema for a given column.
 //
@@ -213,19 +183,16 @@ class ColumnSchema {
  public:
   enum SortingType : uint8_t {
     kNotSpecified = 0,
-    kAscending,
-    kDescending
+    kAscending,          // ASC, NULLS FIRST
+    kDescending,         // DESC, NULLS FIRST
+    kAscendingNullsLast, // ASC, NULLS LAST
+    kDescendingNullsLast // DESC, NULLS LAST
   };
 
   // name: column name
   // type: column type (e.g. UINT8, INT32, STRING, MAP<INT32, STRING> ...)
   // is_nullable: true if a row value can be null
   // is_hash_key: true if a column's hash value can be used for partitioning.
-  // read_default: default value used on read if the column was not present before alter.
-  //    The value will be copied and released on ColumnSchema destruction.
-  // write_default: default value added to the row if the column value was
-  //    not specified on insert.
-  //    The value will be copied and released on ColumnSchema destruction.
   //
   // Example:
   //   ColumnSchema col_a("a", UINT32)
@@ -240,25 +207,16 @@ class ColumnSchema {
                bool is_hash_key = false,
                bool is_static = false,
                bool is_counter = false,
-               SortingType sorting_type = SortingType::kNotSpecified,
-               const void* read_default = NULL,
-               const void* write_default = NULL,
-               ColumnStorageAttributes attributes = ColumnStorageAttributes())
+               int32_t order = 0,
+               SortingType sorting_type = SortingType::kNotSpecified)
       : name_(std::move(name)),
         type_(type),
         is_nullable_(is_nullable),
         is_hash_key_(is_hash_key),
         is_static_(is_static),
         is_counter_(is_counter),
-        sorting_type_(sorting_type),
-        read_default_(read_default ? new Variant(type->main(), read_default) : NULL),
-        attributes_(std::move(attributes)) {
-    if (write_default == read_default) {
-      write_default_ = read_default_;
-    } else if (write_default != NULL) {
-      DCHECK(read_default != NULL) << "Must have a read default";
-      write_default_.reset(new Variant(type->main(), write_default));
-    }
+        order_(order),
+        sorting_type_(sorting_type) {
   }
 
   // convenience constructor for creating columns with simple (non-parametric) data types
@@ -268,15 +226,18 @@ class ColumnSchema {
                bool is_hash_key = false,
                bool is_static = false,
                bool is_counter = false,
-               SortingType sorting_type = SortingType::kNotSpecified,
-               const void* read_default = NULL,
-               const void* write_default = NULL,
-               ColumnStorageAttributes attributes = ColumnStorageAttributes())
+               int32_t order = 0,
+               SortingType sorting_type = SortingType::kNotSpecified)
       : ColumnSchema(name, QLType::Create(type), is_nullable, is_hash_key, is_static, is_counter,
-                     sorting_type, read_default, write_default, attributes) { }
+                     order, sorting_type) {
+  }
 
   const std::shared_ptr<QLType>& type() const {
     return type_;
+  }
+
+  void set_type(const std::shared_ptr<QLType>& type) {
+    type_ = type;
   }
 
   const TypeInfo* type_info() const {
@@ -299,6 +260,10 @@ class ColumnSchema {
     return is_counter_;
   }
 
+  int32_t order() const {
+    return order_;
+  }
+
   SortingType sorting_type() const {
     return sorting_type_;
   }
@@ -315,6 +280,10 @@ class ColumnSchema {
         return "asc";
       case kDescending:
         return "desc";
+      case kAscendingNullsLast:
+        return "asc nulls last";
+      case kDescendingNullsLast:
+        return "desc nulls last";
     }
     LOG (FATAL) << "Invalid sorting type: " << sorting_type_;
   }
@@ -331,44 +300,6 @@ class ColumnSchema {
   // For example, "STRING NOT NULL".
   string TypeToString() const;
 
-  // Returns true if the column has a read default value
-  bool has_read_default() const {
-    return read_default_ != NULL;
-  }
-
-  // Returns a pointer the default value associated with the column
-  // or NULL if there is no default value. You may check has_read_default() first.
-  // The returned value will be valid until the ColumnSchema will be destroyed.
-  //
-  // Example:
-  //    const uint32_t *vu32 = static_cast<const uint32_t *>(col_schema.read_default_value());
-  //    const Slice *vstr = static_cast<const Slice *>(col_schema.read_default_value());
-  const void *read_default_value() const {
-    if (read_default_ != NULL) {
-      return read_default_->value();
-    }
-    return NULL;
-  }
-
-  // Returns true if the column has a write default value
-  bool has_write_default() const {
-    return write_default_ != NULL;
-  }
-
-  // Returns a pointer the default value associated with the column
-  // or NULL if there is no default value. You may check has_write_default() first.
-  // The returned value will be valid until the ColumnSchema will be destroyed.
-  //
-  // Example:
-  //    const uint32_t *vu32 = static_cast<const uint32_t *>(col_schema.write_default_value());
-  //    const Slice *vstr = static_cast<const Slice *>(col_schema.write_default_value());
-  const void *write_default_value() const {
-    if (write_default_ != NULL) {
-      return write_default_->value();
-    }
-    return NULL;
-  }
-
   bool EqualsType(const ColumnSchema &other) const {
     return is_nullable_ == other.is_nullable_ &&
            is_hash_key_ == other.is_hash_key_ &&
@@ -376,35 +307,8 @@ class ColumnSchema {
            type_info()->type() == other.type_info()->type();
   }
 
-  bool Equals(const ColumnSchema &other, bool check_defaults) const {
-    if (!EqualsType(other) || this->name_ != other.name_)
-      return false;
-
-    // For Key comparison checking the defaults doesn't make sense,
-    // since we don't support them, for server vs user schema this comparison
-    // will always fail, since the user does not specify the defaults.
-    if (check_defaults) {
-      if (read_default_ == NULL && other.read_default_ != NULL)
-        return false;
-
-      if (write_default_ == NULL && other.write_default_ != NULL)
-        return false;
-
-      if (read_default_ != NULL && !read_default_->Equals(other.read_default_.get()))
-        return false;
-
-      if (write_default_ != NULL && !write_default_->Equals(other.write_default_.get()))
-        return false;
-    }
-    return true;
-  }
-
-  // Returns extended attributes (such as encoding, compression, etc...)
-  // associated with the column schema. The reason they are kept in a separate
-  // struct is so that in the future, they may be moved out to a more
-  // appropriate location as opposed to parts of ColumnSchema.
-  const ColumnStorageAttributes& attributes() const {
-    return attributes_;
+  bool Equals(const ColumnSchema &other) const {
+    return EqualsType(other) && this->name_ == other.name_;
   }
 
   int Compare(const void *lhs, const void *rhs) const {
@@ -455,28 +359,15 @@ class ColumnSchema {
   bool is_hash_key_;
   bool is_static_;
   bool is_counter_;
+  int32_t order_;
   SortingType sorting_type_;
-  // use shared_ptr since the ColumnSchema is always copied around.
-  std::shared_ptr<Variant> read_default_;
-  std::shared_ptr<Variant> write_default_;
-  ColumnStorageAttributes attributes_;
 };
 
 class ContiguousRow;
+const TableId kNoCopartitionTableId = "";
 
 class TableProperties {
  public:
-  TableProperties()
-      : default_time_to_live_(kNoDefaultTtl),
-        contain_counters_(false),
-        is_transactional_(false) {}
-
-  TableProperties(const TableProperties& other) {
-    default_time_to_live_ = other.default_time_to_live_;
-    contain_counters_ = other.contain_counters_;
-    is_transactional_ = other.is_transactional_;
-  }
-
   // Containing counters is a internal property instead of a user-defined property, so we don't use
   // it when comparing table properties.
   bool operator==(const TableProperties& other) const {
@@ -507,6 +398,10 @@ class TableProperties {
     return is_transactional_;
   }
 
+  YBConsistencyLevel consistency_level() const {
+    return consistency_level_;
+  }
+
   void SetContainCounters(bool contain_counters) {
     contain_counters_ = contain_counters;
   }
@@ -515,48 +410,60 @@ class TableProperties {
     is_transactional_ = is_transactional;
   }
 
-  void ToTablePropertiesPB(TablePropertiesPB *pb) const {
-    if (HasDefaultTimeToLive()) {
-      pb->set_default_time_to_live(default_time_to_live_);
-    }
-    pb->set_contain_counters(contain_counters_);
-    pb->set_is_transactional(is_transactional_);
+  void SetConsistencyLevel(YBConsistencyLevel consistency_level) {
+    consistency_level_ = consistency_level;
   }
 
-  static TableProperties FromTablePropertiesPB(const TablePropertiesPB& pb) {
-    TableProperties table_properties;
-    if (pb.has_default_time_to_live()) {
-      table_properties.SetDefaultTimeToLive(pb.default_time_to_live());
-    }
-    if (pb.has_contain_counters()) {
-      table_properties.SetContainCounters(pb.contain_counters());
-    }
-    if (pb.has_is_transactional()) {
-      table_properties.SetTransactional(pb.is_transactional());
-    }
-    return table_properties;
+  TableId CopartitionTableId() const {
+    return copartition_table_id_;
   }
 
-  void AlterFromTablePropertiesPB(const TablePropertiesPB& pb) {
-    if (pb.has_default_time_to_live()) {
-      SetDefaultTimeToLive(pb.default_time_to_live());
-    }
-    if (pb.has_is_transactional()) {
-      SetTransactional(pb.is_transactional());
-    }
+  bool HasCopartitionTableId() const {
+    return copartition_table_id_ != kNoCopartitionTableId;
   }
 
-  void Reset() {
-    default_time_to_live_ = kNoDefaultTtl;
-    contain_counters_ = false;
-    is_transactional_ = false;
+  void SetCopartitionTableId(const TableId& copartition_table_id) {
+    copartition_table_id_ = copartition_table_id;
   }
+
+  void SetUseMangledColumnName(bool value) {
+    use_mangled_column_name_ = value;
+  }
+
+  bool use_mangled_column_name() const {
+    return use_mangled_column_name_;
+  }
+
+  void SetNumTablets(int num_tablets) {
+    num_tablets_ = num_tablets;
+  }
+
+  bool HasNumTablets() const {
+    return num_tablets_ > 0;
+  }
+
+  int num_tablets() const {
+    return num_tablets_;
+  }
+
+  void ToTablePropertiesPB(TablePropertiesPB *pb) const;
+
+  static TableProperties FromTablePropertiesPB(const TablePropertiesPB& pb);
+
+  void AlterFromTablePropertiesPB(const TablePropertiesPB& pb);
+
+  void Reset();
 
  private:
   static const int kNoDefaultTtl = -1;
-  int64_t default_time_to_live_;
-  bool contain_counters_;
-  bool is_transactional_;
+  int64_t default_time_to_live_ = kNoDefaultTtl;
+  bool contain_counters_ = false;
+  bool is_transactional_ = false;
+  YBConsistencyLevel consistency_level_ = YBConsistencyLevel::STRONG;
+  TableId copartition_table_id_ = kNoCopartitionTableId;
+  boost::optional<uint32_t> wal_retention_secs_;
+  bool use_mangled_column_name_ = false;
+  int num_tablets_ = 0;
 };
 
 // The schema for a set of rows.
@@ -583,7 +490,8 @@ class Schema {
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)),
-      has_nullables_(false) {
+      has_nullables_(false),
+      cotable_id_(boost::uuids::nil_uuid()) {
   }
 
   Schema(const Schema& other);
@@ -601,14 +509,15 @@ class Schema {
   // assertion will be fired!
   Schema(const vector<ColumnSchema>& cols,
          int key_columns,
-         const TableProperties& table_properties = TableProperties())
+         const TableProperties& table_properties = TableProperties(),
+         const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid()))
     : name_to_index_bytes_(0),
       // TODO: C++11 provides a single-arg constructor
       name_to_index_(10,
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)) {
-    CHECK_OK(Reset(cols, key_columns, table_properties));
+    CHECK_OK(Reset(cols, key_columns, table_properties, cotable_id));
   }
 
   // Construct a schema with the given information.
@@ -620,23 +529,25 @@ class Schema {
   Schema(const vector<ColumnSchema>& cols,
          const vector<ColumnId>& ids,
          int key_columns,
-         const TableProperties& table_properties = TableProperties())
+         const TableProperties& table_properties = TableProperties(),
+         const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid()))
     : name_to_index_bytes_(0),
       // TODO: C++11 provides a single-arg constructor
       name_to_index_(10,
                      NameToIndexMap::hasher(),
                      NameToIndexMap::key_equal(),
                      NameToIndexMapAllocator(&name_to_index_bytes_)) {
-    CHECK_OK(Reset(cols, ids, key_columns, table_properties));
+    CHECK_OK(Reset(cols, ids, key_columns, table_properties, cotable_id));
   }
 
   // Reset this Schema object to the given schema.
   // If this fails, the Schema object is left in an inconsistent
   // state and may not be used.
   CHECKED_STATUS Reset(const vector<ColumnSchema>& cols, int key_columns,
-                       const TableProperties& table_properties = TableProperties()) {
+                       const TableProperties& table_properties = TableProperties(),
+                       const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid())) {
     std::vector<ColumnId> ids;
-    return Reset(cols, ids, key_columns, table_properties);
+    return Reset(cols, ids, key_columns, table_properties, cotable_id);
   }
 
   // Reset this Schema object to the given schema.
@@ -645,7 +556,8 @@ class Schema {
   CHECKED_STATUS Reset(const vector<ColumnSchema>& cols,
                        const vector<ColumnId>& ids,
                        int key_columns,
-                       const TableProperties& table_properties = TableProperties());
+                       const TableProperties& table_properties = TableProperties(),
+                       const Uuid& cotable_id = Uuid(boost::uuids::nil_uuid()));
 
   // Return the number of bytes needed to represent a single row of this schema.
   //
@@ -694,9 +606,11 @@ class Schema {
   }
 
   // Return the ColumnSchema corresponding to the given column ID.
-  inline const ColumnSchema& column_by_id(ColumnId id) const {
+  inline Result<const ColumnSchema&> column_by_id(ColumnId id) const {
     int idx = find_column_by_id(id);
-    DCHECK_GE(idx, 0);
+    if (idx < 0) {
+      return STATUS_FORMAT(InvalidArgument, "Column id $0 not found", id.ToString());
+    }
     return cols_[idx];
   }
 
@@ -723,8 +637,8 @@ class Schema {
 
   const std::vector<string> column_names() const {
     vector<string> column_names;
-    for (const std::pair<const StringPiece, size_t>& entry : name_to_index_) {
-      column_names.push_back(entry.first.ToString());
+    for (const auto& col : cols_) {
+      column_names.push_back(col.name());
     }
     return column_names;
   }
@@ -737,9 +651,17 @@ class Schema {
     table_properties_.SetDefaultTimeToLive(ttl_msec);
   }
 
+  void SetCopartitionTableId(const TableId& copartition_table_id) {
+    table_properties_.SetCopartitionTableId(copartition_table_id);
+  }
+
+  void SetTransactional(bool is_transactional) {
+    table_properties_.SetTransactional(is_transactional);
+  }
+
   // Return the column index corresponding to the given column,
   // or kColumnNotFound if the column is not in this schema.
-  int find_column(const StringPiece col_name) const {
+  int find_column(const GStringPiece col_name) const {
     auto iter = name_to_index_.find(col_name);
     if (PREDICT_FALSE(iter == name_to_index_.end())) {
       return kColumnNotFound;
@@ -769,7 +691,7 @@ class Schema {
   }
 
   // Returns true if the specified column (by name) is a key
-  bool is_key_column(const StringPiece col_name) const {
+  bool is_key_column(const GStringPiece col_name) const {
     return is_key_column(find_column(col_name));
   }
 
@@ -784,7 +706,7 @@ class Schema {
   }
 
   // Returns true if the specified column (by name) is a hash key
-  bool is_hash_key_column(const StringPiece col_name) const {
+  bool is_hash_key_column(const GStringPiece col_name) const {
     return is_hash_key_column(find_column(col_name));
   }
 
@@ -799,7 +721,7 @@ class Schema {
   }
 
   // Returns true if the specified column (by name) is a range column
-  bool is_range_column(const StringPiece col_name) const {
+  bool is_range_column(const GStringPiece col_name) const {
     return is_range_column(find_column(col_name));
   }
 
@@ -811,6 +733,14 @@ class Schema {
   // Returns the highest column id in this Schema.
   ColumnId max_col_id() const {
     return max_col_id_;
+  }
+
+  // Gets and sets the uuid of the non-primary table this schema belongs to co-located in a tablet.
+  const Uuid& cotable_id() const {
+    return cotable_id_;
+  }
+  void set_cotable_id(const Uuid& cotable_id) {
+    cotable_id_ = cotable_id;;
   }
 
   // Extract a given column from a row where the type is
@@ -922,7 +852,7 @@ class Schema {
   // Create a new schema containing only the selected columns.
   // The resulting schema will have no key columns defined.
   // If this schema has IDs, the resulting schema will as well.
-  CHECKED_STATUS CreateProjectionByNames(const std::vector<StringPiece>& col_names,
+  CHECKED_STATUS CreateProjectionByNames(const std::vector<GStringPiece>& col_names,
                                          Schema* out, size_t num_key_columns = 0) const;
 
   // Create a new schema containing only the selected column IDs.
@@ -967,9 +897,8 @@ class Schema {
     if (this->table_properties_ != other.table_properties_) return false;
     if (this->cols_.size() != other.cols_.size()) return false;
 
-    const bool have_column_ids = other.has_column_ids() && has_column_ids();
     for (size_t i = 0; i < other.cols_.size(); i++) {
-      if (!this->cols_[i].Equals(other.cols_[i], have_column_ids)) return false;
+      if (!this->cols_[i].Equals(other.cols_[i])) return false;
     }
 
     return true;
@@ -1048,13 +977,9 @@ class Schema {
           RETURN_NOT_OK(projector->ProjectBaseColumn(proj_idx, base_idx));
         }
       } else {
-        bool has_default = col_schema.has_read_default() || col_schema.has_write_default();
-        if (!has_default && !col_schema.is_nullable()) {
+        if (!col_schema.is_nullable()) {
           RETURN_NOT_OK(projector->ProjectExtraColumn(proj_idx));
         }
-
-        // Column missing from the Base Schema, use the default value of the projection
-        RETURN_NOT_OK(projector->ProjectDefaultColumn(proj_idx));
       }
       proj_idx++;
     }
@@ -1111,20 +1036,20 @@ class Schema {
   vector<ColumnId> col_ids_;
   vector<size_t> col_offsets_;
 
-  // The keys of this map are StringPiece references to the actual name members of the
+  // The keys of this map are GStringPiece references to the actual name members of the
   // ColumnSchema objects inside cols_. This avoids an extra copy of those strings,
-  // and also allows us to do lookups on the map using StringPiece keys, sometimes
+  // and also allows us to do lookups on the map using GStringPiece keys, sometimes
   // avoiding copies.
   //
   // The map is instrumented with a counting allocator so that we can accurately
   // measure its memory footprint.
   int64_t name_to_index_bytes_;
-  typedef STLCountingAllocator<std::pair<const StringPiece, size_t> > NameToIndexMapAllocator;
+  typedef STLCountingAllocator<std::pair<const GStringPiece, size_t> > NameToIndexMapAllocator;
   typedef unordered_map<
-      StringPiece,
+      GStringPiece,
       size_t,
-      std::hash<StringPiece>,
-      std::equal_to<StringPiece>,
+      std::hash<GStringPiece>,
+      std::equal_to<GStringPiece>,
       NameToIndexMapAllocator> NameToIndexMap;
   NameToIndexMap name_to_index_;
 
@@ -1137,6 +1062,10 @@ class Schema {
   bool has_statics_ = false;
 
   TableProperties table_properties_;
+
+  // Uuid of the non-primary table this schema belongs to co-located in a tablet. Nil for the
+  // primary or single-tenant table.
+  Uuid cotable_id_;
 
   // NOTE: if you add more members, make sure to add the appropriate
   // code to swap() and CopyFrom() as well to prevent subtle bugs.
@@ -1193,8 +1122,8 @@ class SchemaBuilder {
   CHECKED_STATUS AddColumn(const ColumnSchema& column, bool is_key);
 
   CHECKED_STATUS AddColumn(const string& name, const std::shared_ptr<QLType>& type) {
-    return AddColumn(name, type, false, false, false, false,
-                     ColumnSchema::SortingType::kNotSpecified, NULL, NULL);
+    return AddColumn(name, type, false, false, false, false, 0,
+                     ColumnSchema::SortingType::kNotSpecified);
   }
 
   // convenience function for adding columns with simple (non-parametric) data types
@@ -1203,8 +1132,8 @@ class SchemaBuilder {
   }
 
   CHECKED_STATUS AddNullableColumn(const string& name, const std::shared_ptr<QLType>& type) {
-    return AddColumn(name, type, true, false, false, false,
-                     ColumnSchema::SortingType::kNotSpecified, NULL, NULL);
+    return AddColumn(name, type, true, false, false, false, 0,
+                     ColumnSchema::SortingType::kNotSpecified);
   }
 
   // convenience function for adding columns with simple (non-parametric) data types
@@ -1218,9 +1147,8 @@ class SchemaBuilder {
                            bool is_hash_key,
                            bool is_static,
                            bool is_counter,
-                           yb::ColumnSchema::SortingType sorting_type,
-                           const void *read_default,
-                           const void *write_default);
+                           int32_t order,
+                           yb::ColumnSchema::SortingType sorting_type);
 
   // convenience function for adding columns with simple (non-parametric) data types
   CHECKED_STATUS AddColumn(const string& name,
@@ -1229,11 +1157,10 @@ class SchemaBuilder {
                            bool is_hash_key,
                            bool is_static,
                            bool is_counter,
-                           yb::ColumnSchema::SortingType sorting_type,
-                           const void *read_default,
-                           const void *write_default) {
+                           int32_t order,
+                           yb::ColumnSchema::SortingType sorting_type) {
     return AddColumn(name, QLType::Create(type), is_nullable, is_hash_key, is_static, is_counter,
-                     sorting_type, read_default, write_default);
+                     order, sorting_type);
   }
 
   CHECKED_STATUS RemoveColumn(const string& name);

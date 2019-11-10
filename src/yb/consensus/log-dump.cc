@@ -36,7 +36,6 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "yb/common/row_operations.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/log_index.h"
@@ -63,14 +62,13 @@ DEFINE_int32(truncate_data, 100,
 namespace yb {
 namespace log {
 
-using consensus::CommitMsg;
 using consensus::OperationType;
 using consensus::ReplicateMsg;
 using std::string;
 using std::vector;
 using std::cout;
 using std::endl;
-using tablet::TabletMetadata;
+using tablet::RaftGroupMetadata;
 using tserver::WriteRequestPB;
 
 enum PrintEntryType {
@@ -105,12 +103,6 @@ void PrintIdOnly(const LogEntryPB& entry) {
            << OperationType_Name(entry.replicate().op_type());
       break;
     }
-    case log::COMMIT:
-    {
-      cout << "COMMIT " << entry.commit().commited_op_id().term()
-           << "." << entry.commit().commited_op_id().index();
-      break;
-    }
     default:
       cout << "UNKNOWN: " << entry.ShortDebugString();
   }
@@ -121,26 +113,11 @@ void PrintIdOnly(const LogEntryPB& entry) {
 Status PrintDecodedWriteRequestPB(const string& indent,
                                   const Schema& tablet_schema,
                                   const WriteRequestPB& write) {
-  Schema request_schema;
-  RETURN_NOT_OK(SchemaFromPB(write.schema(), &request_schema));
-
   Arena arena(32 * 1024, 1024 * 1024);
-  RowOperationsPBDecoder dec(&write.row_operations(), &request_schema, &tablet_schema, &arena);
-  vector<DecodedRowOperation> ops;
-  RETURN_NOT_OK(dec.DecodeOperations(&ops));
 
   cout << indent << "Tablet: " << write.tablet_id() << endl;
-  cout << indent << "Consistency: "
-       << ExternalConsistencyMode_Name(write.external_consistency_mode()) << endl;
   if (write.has_propagated_hybrid_time()) {
     cout << indent << "Propagated TS: " << write.propagated_hybrid_time() << endl;
-  }
-
-  int i = 0;
-  for (const DecodedRowOperation& op : ops) {
-    // TODO (KUDU-515): Handle the case when a tablet's schema changes
-    // mid-segment.
-    cout << indent << "op " << (i++) << ": " << op.ToString(tablet_schema) << endl;
   }
 
   return Status::OK();
@@ -159,9 +136,6 @@ Status PrintDecoded(const LogEntryPB& entry, const Schema& tablet_schema) {
     } else {
       cout << indent << replicate.ShortDebugString() << endl;
     }
-  } else if (entry.has_commit()) {
-    // For COMMIT we'll just dump the PB
-    cout << indent << entry.commit().ShortDebugString() << endl;
   }
 
   return Status::OK();
@@ -172,15 +146,15 @@ Status PrintSegment(const scoped_refptr<ReadableLogSegment>& segment) {
   if (FLAGS_print_headers) {
     cout << "Header:\n" << segment->header().DebugString();
   }
-  LogEntries entries;
-  RETURN_NOT_OK(segment->ReadEntries(&entries));
+  auto read_entries = segment->ReadEntries();
+  RETURN_NOT_OK(read_entries.status);
 
   if (print_type == DONT_PRINT) return Status::OK();
 
   Schema tablet_schema;
   RETURN_NOT_OK(SchemaFromPB(segment->header().schema(), &tablet_schema));
 
-  for (const auto& entry : entries) {
+  for (const auto& entry : read_entries.entries) {
 
     if (print_type == PRINT_PB) {
       if (FLAGS_truncate_data > 0) {
@@ -203,16 +177,17 @@ Status PrintSegment(const scoped_refptr<ReadableLogSegment>& segment) {
 
 Status DumpLog(const string& tablet_id, const string& tablet_wal_path) {
   Env *env = Env::Default();
-  gscoped_ptr<LogReader> reader;
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
   FsManager fs_manager(env, fs_opts);
 
   RETURN_NOT_OK(fs_manager.Open());
-  RETURN_NOT_OK(LogReader::Open(&fs_manager,
+  std::unique_ptr<LogReader> reader;
+  RETURN_NOT_OK(LogReader::Open(env,
                                 scoped_refptr<LogIndex>(),
                                 tablet_id,
                                 tablet_wal_path,
+                                fs_manager.uuid(),
                                 scoped_refptr<MetricEntity>(),
                                 &reader));
 

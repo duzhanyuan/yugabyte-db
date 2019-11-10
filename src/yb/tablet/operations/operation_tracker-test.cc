@@ -87,7 +87,7 @@ class OperationTrackerTest : public YBTest {
 
     Status Prepare() override { return Status::OK(); }
     void Start() override {}
-    Status Apply(gscoped_ptr<consensus::CommitMsg>* commit_msg) override {
+    Status Apply() override {
       return Status::OK();
     }
     std::string ToString() const override {
@@ -234,7 +234,7 @@ static void CheckMemTracker(const shared_ptr<MemTracker>& t) {
 // rejecting new ones.
 TEST_F(OperationTrackerTest, TestTooManyOperations) {
   FLAGS_tablet_operation_memory_limit_mb = 1;
-  shared_ptr<MemTracker> t = MemTracker::CreateTracker(-1, "test");
+  shared_ptr<MemTracker> t = MemTracker::CreateTracker("test");
   tracker_.StartMemoryTracking(t);
 
   // Fill up the tracker.

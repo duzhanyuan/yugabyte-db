@@ -52,36 +52,17 @@ class Slice;
 class Status;
 namespace server {
 
-// An interface for a clock that can be used to assign timestamps to
-// operations.
+// An interface for a clock that can be used to assign timestamps to operations.
 // Implementations must respect the following assumptions:
 // 1 - Now() must return monotonically increasing numbers
 //     i.e. for any two calls, i.e. Now returns timestamp1 and timestamp2, it must
 //     hold that timestamp1 < timestamp2.
-// 2 - Update() must never set the clock backwards (corollary of 1)
+// 2 - Update() must never set the clock backwards (corollary of 1).
 class Clock : public ClockBase {
  public:
 
   // Initializes the clock.
   virtual CHECKED_STATUS Init() = 0;
-
-  // Obtains a new transaction timestamp corresponding to the current instant.
-  virtual HybridTime Now() = 0;
-
-  // Obtains a new transaction timestamp corresponding to the current instant
-  // plus the max_error.
-  virtual HybridTime NowLatest() = 0;
-
-  // Obtain a timestamp which is guaranteed to be later than the current time
-  // on any machine in the cluster.
-  //
-  // NOTE: this is not a very tight bound.
-  virtual CHECKED_STATUS GetGlobalLatest(HybridTime* t) {
-    return STATUS(NotSupported, "clock does not support global properties");
-  }
-
-  // Indicates whether this clock supports the required external consistency mode.
-  virtual bool SupportsExternalConsistencyMode(ExternalConsistencyMode mode) = 0;
 
   // Update the clock with a transaction timestamp originating from
   // another server. For instance replicas can call this so that,
@@ -90,26 +71,8 @@ class Clock : public ClockBase {
   // leader.
   virtual void Update(const HybridTime& to_update) = 0;
 
-  // Waits until the clock on all machines has advanced past 'then'.
-  // Can also be used to implement 'external consistency' in the same sense as
-  // Google's Spanner.
-  virtual CHECKED_STATUS WaitUntilAfter(const HybridTime& then,
-                                const MonoTime& deadline) = 0;
-
-  // Waits until the clock on this machine advances past 'then'. Unlike
-  // WaitUntilAfter(), this does not make any global guarantees.
-  virtual CHECKED_STATUS WaitUntilAfterLocally(const HybridTime& then,
-                                       const MonoTime& deadline) = 0;
-
-  // Return true if the given time has definitely passed (i.e any future call
-  // to Now() would return a higher value than t).
-  virtual bool IsAfter(HybridTime t) = 0;
-
   // Register the clock metrics in the given entity.
   virtual void RegisterMetrics(const scoped_refptr<MetricEntity>& metric_entity) = 0;
-
-  // Strigifies the provided timestamp according to this clock's internal format.
-  virtual std::string Stringify(HybridTime hybrid_time) = 0;
 
   virtual ~Clock() {}
 };

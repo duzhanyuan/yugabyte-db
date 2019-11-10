@@ -18,19 +18,20 @@
 
 #include <boost/optional/optional.hpp>
 
-#include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.pb.h"
 #include "yb/tserver/tserver_admin.pb.h"
+#include "yb/tserver/tserver_service.pb.h"
 
+#include "yb/common/entity_ids.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/rpc/rpc_controller.h"
+#include "yb/server/monitored_task.h"
 #include "yb/util/status.h"
 #include "yb/util/memory/memory.h"
-#include "yb/common/entity_ids.h"
 
-#include "yb/server/monitored_task.h"
-#include "yb/rpc/rpc_controller.h"
 
 namespace yb {
 
@@ -115,10 +116,10 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   // Abort this task and return its value before it was successfully aborted. If the task entered
   // a different terminal state before we were able to abort it, return that state.
-  State AbortAndReturnPrevState() override;
+  MonitoredTaskState AbortAndReturnPrevState() override;
 
-  State state() const override {
-    return state_.load();
+  MonitoredTaskState state() const override {
+    return state_.load(std::memory_order_acquire);
   }
 
   MonoTime start_timestamp() const override { return start_ts_; }
@@ -133,22 +134,29 @@ class RetryingTSRpcTask : public MonitoredTask {
   // Handle the response from the RPC request. On success, MarkSuccess() must
   // be called to mutate the state_ variable. If retry is desired, then
   // no state change is made. Retries will automatically be attempted as long
-  // as the state is kStateRunning and deadline_ has not yet passed.
+  // as the state is MonitoredTaskState::kRunning and deadline_ has not yet passed.
   virtual void HandleResponse(int attempt) = 0;
 
   // Return the id of the tablet that is the subject of the async request.
-  virtual std::string tablet_id() const = 0;
+  virtual TabletId tablet_id() const = 0;
 
   virtual Status ResetTSProxy();
 
   // Overridable log prefix with reasonable default.
   std::string LogPrefix() const {
-    return strings::Substitute("$0 (task=$1, state=$2): ",
-                               description(), this, MonitoredTask::state(state()));
+    return strings::Substitute("$0 (task=$1, state=$2): ", description(), this, ToString(state()));
   }
 
-  bool PerformStateTransition(State expected, State new_state) {
+  bool PerformStateTransition(MonitoredTaskState expected, MonitoredTaskState new_state)
+      WARN_UNUSED_RESULT {
     return state_.compare_exchange_strong(expected, new_state);
+  }
+
+  void TransitionToTerminalState(MonitoredTaskState expected, MonitoredTaskState terminal_state);
+
+  static bool IsStateTerminal(MonitoredTaskState state) {
+    return state == MonitoredTaskState::kComplete || state == MonitoredTaskState::kFailed ||
+           state == MonitoredTaskState::kAborted;
   }
 
   void AbortTask();
@@ -156,16 +164,18 @@ class RetryingTSRpcTask : public MonitoredTask {
   // Callback meant to be invoked from asynchronous RPC service proxy calls.
   void RpcCallback();
 
-  auto BindRpcCallback() ->
-    decltype(std::bind(&RetryingTSRpcTask::RpcCallback, shared_from(this))) {
-      return std::bind(&RetryingTSRpcTask::RpcCallback, shared_from(this));
+  auto BindRpcCallback() {
+    return std::bind(&RetryingTSRpcTask::RpcCallback, shared_from(this));
   }
 
   // Handle the actual work of the RPC callback. This is run on the master's worker
   // pool, rather than a reactor thread, so it may do blocking IO operations.
   void DoRpcCallback();
 
-  Master * const master_;
+  // Called when the async task unregisters either successfully or unsuccessfully.
+  virtual void UnregisterAsyncTaskCallback();
+
+  Master* const master_;
   ThreadPool* const callback_pool_;
   const gscoped_ptr<TSPicker> replica_picker_;
   const scoped_refptr<TableInfo> table_;
@@ -177,15 +187,21 @@ class RetryingTSRpcTask : public MonitoredTask {
   int attempt_;
   rpc::RpcController rpc_;
   TSDescriptor* target_ts_desc_ = nullptr;
-  std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_proxy_;
+  std::shared_ptr<tserver::TabletServerServiceProxy> ts_proxy_;
+  std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
   std::shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
 
-  std::atomic<int64_t> reactor_task_id_;
+  std::atomic<rpc::ScheduledTaskId> reactor_task_id_{rpc::kInvalidTaskId};
 
  private:
   // Returns true if we should impose a limit in the number of retries for this task type.
   bool RetryLimitTaskType() {
     return type() != ASYNC_CREATE_REPLICA && type() != ASYNC_DELETE_REPLICA;
+  }
+
+  // Returns true if we should not retry for this task type.
+  bool NoRetryTaskType() {
+    return type() == ASYNC_FLUSH_TABLETS;
   }
 
   // Reschedules the current task after a backoff delay.
@@ -202,8 +218,11 @@ class RetryingTSRpcTask : public MonitoredTask {
   // Clean up request and release resources. May call 'delete this'.
   void UnregisterAsyncTask();
 
+  // Only abort this task on reactor if it has been scheduled.
+  void AbortIfScheduled();
+
   // Use state() and MarkX() accessors.
-  std::atomic<State> state_;
+  std::atomic<MonitoredTaskState> state_;
 };
 
 // RetryingTSRpcTask subclass which always retries the same tablet server,
@@ -244,7 +263,7 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
   }
 
  protected:
-  std::string tablet_id() const override { return tablet_id_; }
+  TabletId tablet_id() const override { return tablet_id_; }
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
@@ -280,10 +299,11 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
   }
 
  protected:
-  std::string tablet_id() const override { return tablet_id_; }
+  TabletId tablet_id() const override { return tablet_id_; }
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
+  void UnregisterAsyncTaskCallback() override;
 
   const TabletId tablet_id_;
   const tablet::TabletDataState delete_type_;
@@ -312,16 +332,67 @@ class AsyncAlterTable : public RetryingTSRpcTask {
   std::string description() const override;
 
  private:
-  std::string tablet_id() const override;
+  TabletId tablet_id() const override;
 
-  std::string permanent_uuid() const;
+  TabletServerId permanent_uuid() const;
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
 
   uint32_t schema_version_;
   scoped_refptr<TabletInfo> tablet_;
-  tserver::AlterSchemaResponsePB resp_;
+  tserver::ChangeMetadataResponsePB resp_;
+};
+
+class AsyncCopartitionTable : public RetryingTSRpcTask {
+ public:
+  AsyncCopartitionTable(Master *master,
+                        ThreadPool* callback_pool,
+                        const scoped_refptr<TabletInfo>& tablet,
+                        const scoped_refptr<TableInfo>& table);
+
+  Type type() const override { return ASYNC_COPARTITION_TABLE; }
+
+  std::string type_name() const override { return "Copartition Table"; }
+
+  std::string description() const override;
+
+ private:
+  TabletId tablet_id() const override;
+
+  TabletServerId permanent_uuid() const;
+
+  void HandleResponse(int attempt) override;
+  bool SendRequest(int attempt) override;
+
+  scoped_refptr<TabletInfo> tablet_;
+  scoped_refptr<TableInfo> table_;
+  tserver::CopartitionTableResponsePB resp_;
+};
+
+// Send a Truncate() RPC request.
+class AsyncTruncate : public RetryingTSRpcTask {
+ public:
+  AsyncTruncate(Master* master,
+                ThreadPool* callback_pool,
+                const scoped_refptr<TabletInfo>& tablet);
+
+  Type type() const override { return ASYNC_TRUNCATE_TABLET; }
+
+  std::string type_name() const override { return "Truncate Tablet"; }
+
+  std::string description() const override;
+
+ protected:
+  TabletId tablet_id() const override;
+
+  TabletServerId permanent_uuid() const;
+
+  void HandleResponse(int attempt) override;
+  bool SendRequest(int attempt) override;
+
+  scoped_refptr<TabletInfo> tablet_;
+  tserver::TruncateResponsePB resp_;
 };
 
 class CommonInfoForRaftTask : public RetryingTSRpcTask {
@@ -330,15 +401,15 @@ class CommonInfoForRaftTask : public RetryingTSRpcTask {
       Master* master, ThreadPool* callback_pool, const scoped_refptr<TabletInfo>& tablet,
       const consensus::ConsensusStatePB& cstate, const std::string& change_config_ts_uuid);
 
-  std::string tablet_id() const override;
+  TabletId tablet_id() const override;
 
   virtual std::string change_config_ts_uuid() const { return change_config_ts_uuid_; }
 
  protected:
-  // Used by SendRequest. Return's false if RPC should not be sent.
+  // Used by SendOrReceiveData. Return's false if RPC should not be sent.
   virtual bool PrepareRequest(int attempt) = 0;
 
-  std::string permanent_uuid() const;
+  TabletServerId permanent_uuid() const;
 
   const scoped_refptr<TabletInfo> tablet_;
   const consensus::ConsensusStatePB cstate_;

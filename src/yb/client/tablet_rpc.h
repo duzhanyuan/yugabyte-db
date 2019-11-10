@@ -18,7 +18,6 @@
 
 #include <unordered_set>
 
-#include "yb/client/client.h"
 #include "yb/client/client-internal.h"
 #include "yb/client/client_fwd.h"
 
@@ -30,6 +29,7 @@
 #include "yb/util/result.h"
 #include "yb/util/status.h"
 #include "yb/util/trace.h"
+#include "yb/util/net/net_util.h"
 
 namespace yb {
 
@@ -49,56 +49,69 @@ class TabletRpc {
   ~TabletRpc() {}
 };
 
+tserver::TabletServerErrorPB_Code ErrorCode(const tserver::TabletServerErrorPB* error);
 class TabletInvoker {
  public:
-  explicit TabletInvoker(bool consistent_prefix,
+  explicit TabletInvoker(const bool local_tserver_only,
+                         const bool consistent_prefix,
                          YBClient* client,
                          rpc::RpcCommand* command,
                          TabletRpc* rpc,
                          RemoteTablet* tablet,
                          rpc::RpcRetrier* retrier,
-                         Trace* trace)
-      : client_(client),
-        command_(command),
-        rpc_(rpc),
-        tablet_(tablet),
-        tablet_id_(tablet != nullptr ? tablet->tablet_id() : std::string()),
-        retrier_(retrier),
-        trace_(trace),
-        consistent_prefix_(consistent_prefix) {}
+                         Trace* trace);
 
-  virtual ~TabletInvoker() {}
+  virtual ~TabletInvoker();
 
-  void Execute(const std::string& tablet_id);
+  void Execute(const std::string& tablet_id, bool leader_only = false);
+
+  // Returns true when whole operation is finished, false otherwise.
   bool Done(Status* status);
 
   bool IsLocalCall() const;
+
   const RemoteTabletPtr& tablet() const { return tablet_; }
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy() const;
+  ::yb::HostPort ProxyEndpoint() const;
   YBClient& client() const { return *client_; }
+  const RemoteTabletServer& current_ts() { return *current_ts_; }
+  bool local_tserver_only() const { return local_tserver_only_; }
 
  private:
+  friend class TabletRpcTest;
+  FRIEND_TEST(TabletRpcTest, TabletInvokerSelectTabletServerRace);
+
   void SelectTabletServer();
 
   // This is an implementation of ReadRpc with consistency level as CONSISTENT_PREFIX. As a result,
   // there is no requirement that the read needs to hit the leader.
   void SelectTabletServerWithConsistentPrefix();
 
-  // Called when we finish initializing a TS proxy.
-  // Sends the RPC, provided there was no error.
-  void InitTSProxyCb(const Status& status);
+  // This is for Redis ops which always prefer to invoke the local tablet server. In case when it
+  // is not the leader, a MOVED response will be returned.
+  void SelectLocalTabletServer();
 
   // Marks all replicas on current_ts_ as failed and retries the write on a
   // new replica.
-  void FailToNewReplica(const Status& reason);
+  CHECKED_STATUS FailToNewReplica(const Status& reason,
+                                  const tserver::TabletServerErrorPB* error_code = nullptr);
 
   // Called when we finish a lookup (to find the new consensus leader). Retries
   // the rpc after a short delay.
-  void LookupTabletCb(const Status& status);
+  void LookupTabletCb(const Result<RemoteTabletPtr>& result);
 
-  void InitialLookupTabletDone(const Status& status);
+  void InitialLookupTabletDone(const Result<RemoteTabletPtr>& result);
 
-  YBClient* client_;
+  // If we receive TABLET_NOT_FOUND and current_ts_ is set, that means we contacted a tserver
+  // with a tablet_id, but the tserver no longer has that tablet.
+  bool TabletNotFoundOnTServer(const tserver::TabletServerErrorPB* error_code,
+                               const Status& status) {
+    return status.IsNotFound() &&
+        ErrorCode(error_code) == tserver::TabletServerErrorPB::TABLET_NOT_FOUND &&
+        current_ts_ != nullptr;
+  }
+
+  YBClient* const client_;
 
   rpc::RpcCommand* const command_;
 
@@ -120,7 +133,9 @@ class TabletInvoker {
   // Cleared when new consensus configuration information arrives from the master.
   std::unordered_set<RemoteTabletServer*> followers_;
 
-  bool consistent_prefix_;
+  const bool local_tserver_only_;
+
+  const bool consistent_prefix_;
 
   // The TS receiving the write. May change if the write is retried.
   // RemoteTabletServer is taken from YBClient cache, so it is guaranteed that those objects are
@@ -129,12 +144,10 @@ class TabletInvoker {
 };
 
 CHECKED_STATUS ErrorStatus(const tserver::TabletServerErrorPB* error);
-tserver::TabletServerErrorPB_Code ErrorCode(const tserver::TabletServerErrorPB* error);
-
 template <class Response>
 HybridTime GetPropagatedHybridTime(const Response& response) {
   return response.has_propagated_hybrid_time() ? HybridTime(response.propagated_hybrid_time())
-                                               : HybridTime::kInvalidHybridTime;
+                                               : HybridTime::kInvalid;
 }
 
 } // namespace internal

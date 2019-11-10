@@ -36,6 +36,7 @@
 #include <boost/optional.hpp>
 
 #include "yb/client/client-test-util.h"
+#include "yb/client/table_handle.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/gutil/map-util.h"
 #include "yb/integration-tests/external_mini_cluster-itest-base.h"
@@ -137,9 +138,9 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
                                   &expected_index));
 
   // Open the scanner and count the rows.
-  shared_ptr<YBTable> table;
-  ASSERT_OK(client_->OpenTable(TestWorkload::kDefaultTableName, &table));
-  ASSERT_EQ(workload.rows_inserted(), CountTableRows(table.get()));
+  client::TableHandle table;
+  ASSERT_OK(table.Open(TestWorkloadOptions::kDefaultTableName, client_.get()));
+  ASSERT_EQ(workload.rows_inserted(), CountTableRows(table));
   LOG(INFO) << "Number of rows: " << workload.rows_inserted()
             << ", batches: " << workload.batches_completed()
             << ", expected index: " << expected_index;
@@ -189,24 +190,23 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
     }
     ASSERT_NE(desired_leader, nullptr);
     ASSERT_OK(itest::StartElection(desired_leader, tablet_id, kTimeout));
-    ASSERT_OK(WaitUntilCommittedOpIdIndexGrow(&expected_index,
-                                              desired_leader,
-                                              tablet_id,
-                                              kTimeout));
+    ASSERT_OK(WaitUntilCommittedOpIdIndexIsGreaterThan(&expected_index,
+                                                       desired_leader,
+                                                       tablet_id,
+                                                       kTimeout));
   }
 
   // Wait until the config is committed, otherwise AddServer() will fail.
-  ASSERT_OK(WaitUntilCommittedOpIdIndexGrow(&expected_index,
-                                            leader,
-                                            tablet_id,
-                                            kTimeout,
-                                            itest::CommittedEntryType::CONFIG));
+  ASSERT_OK(WaitUntilCommittedOpIdIndexIsGreaterThan(&expected_index,
+                                                     leader,
+                                                     tablet_id,
+                                                     kTimeout,
+                                                     itest::CommittedEntryType::CONFIG));
 
   TServerDetails* to_add = ts_map_[cluster_->tablet_server(missing_replica_index)->uuid()].get();
   ASSERT_OK(AddServer(leader, tablet_id, to_add, consensus::RaftPeerPB::PRE_VOTER,
                       boost::none, kTimeout));
-  HostPort hp;
-  ASSERT_OK(HostPortFromPB(leader->registration.common().rpc_addresses(0), &hp));
+  HostPort hp = HostPortFromPB(leader->registration.common().private_rpc_addresses(0));
   ASSERT_OK(StartRemoteBootstrap(to_add, tablet_id, leader->uuid(), hp, 1, kTimeout));
 
   const string& new_ts_uuid = cluster_->tablet_server(missing_replica_index)->uuid();
@@ -229,7 +229,7 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
                                   ++expected_index,
                                   &expected_index));
 
-  ASSERT_EQ(workload.rows_inserted(), CountTableRows(table.get()));
+  ASSERT_EQ(workload.rows_inserted(), CountTableRows(table));
 
   // Rotate leaders among the replicas and verify the new leader is the designated one each time.
   for (const auto ts_map : active_ts_map) {

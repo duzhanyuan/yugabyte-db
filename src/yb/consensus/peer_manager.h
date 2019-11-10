@@ -36,7 +36,6 @@
 #include <unordered_map>
 
 #include "yb/consensus/consensus_util.h"
-#include "yb/consensus/raft_consensus.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
@@ -45,7 +44,7 @@
 
 namespace yb {
 
-class ThreadPool;
+class ThreadPoolToken;
 
 namespace log {
 class Log;
@@ -53,6 +52,7 @@ class Log;
 
 namespace consensus {
 
+class Consensus;
 class Peer;
 class PeerMessageQueue;
 class PeerProxyFactory;
@@ -64,13 +64,11 @@ class PeerManager {
  public:
   // All of the raw pointer arguments are not owned by the PeerManager and must live at least as
   // long as the PeerManager.
-  //
-  // 'request_thread_pool' is the pool used to construct requests to send to the peers.
   PeerManager(const std::string tablet_id,
               const std::string local_uuid,
               PeerProxyFactory* peer_proxy_factory,
               PeerMessageQueue* queue,
-              ThreadPool* request_thread_pool,
+              ThreadPoolToken* raft_pool_token,
               const scoped_refptr<log::Log>& log);
 
   virtual ~PeerManager();
@@ -78,7 +76,7 @@ class PeerManager {
   virtual void SetConsensus(Consensus* consensus) {consensus_ = consensus; }
 
   // Updates 'peers_' according to the new configuration config.
-  virtual CHECKED_STATUS UpdateRaftConfig(const RaftConfigPB& config);
+  virtual void UpdateRaftConfig(const RaftConfigPB& config);
 
   // Signals all peers of the current configuration that there is a new request pending.
   virtual void SignalRequest(RequestTriggerMode trigger_mode);
@@ -92,12 +90,12 @@ class PeerManager {
  private:
   std::string GetLogPrefix() const;
 
-  typedef std::unordered_map<std::string, std::unique_ptr<Peer>> PeersMap;
+  typedef std::unordered_map<std::string, std::shared_ptr<Peer>> PeersMap;
   const std::string tablet_id_;
   const std::string local_uuid_;
   PeerProxyFactory* peer_proxy_factory_;
   PeerMessageQueue* queue_;
-  ThreadPool* thread_pool_;
+  ThreadPoolToken* raft_pool_token_;
   scoped_refptr<log::Log> log_;
   PeersMap peers_;
   Consensus* consensus_ = nullptr;

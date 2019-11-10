@@ -32,67 +32,42 @@
 #ifndef YB_TABLET_TABLET_TEST_UTIL_H
 #define YB_TABLET_TABLET_TEST_UTIL_H
 
-#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <gflags/gflags.h>
+#include "yb/common/common.pb.h"
+#include "yb/common/schema.h"
 
-#include "yb/common/iterator.h"
-#include "yb/gutil/casts.h"
-#include "yb/gutil/strings/join.h"
-#include "yb/tablet/row_op.h"
 #include "yb/tablet/tablet-harness.h"
-#include "yb/tablet/tablet.h"
-#include "yb/tablet/operations/alter_schema_operation.h"
-#include "yb/tablet/operations/write_operation.h"
-#include "yb/util/metrics.h"
+
 #include "yb/util/test_util.h"
 
-DECLARE_bool(enable_data_block_fsync);
-
 namespace yb {
-namespace tablet {
 
-using consensus::RaftConfigPB;
-using std::string;
-using std::vector;
+class FsManager;
+
+namespace docdb {
+class DocRowwiseIterator;
+}
+
+namespace server {
+class Clock;
+}
+
+namespace tablet {
 
 class YBTabletTest : public YBTest {
  public:
-  explicit YBTabletTest(const Schema& schema, TableType table_type = TableType::YQL_TABLE_TYPE)
-    : schema_(schema.CopyWithColumnIds()),
-      client_schema_(schema),
-      table_type_(table_type) {
-    // Keep unit tests fast, but only if no one has set the flag explicitly.
-    if (google::GetCommandLineFlagInfoOrDie("enable_data_block_fsync").is_default) {
-      FLAGS_enable_data_block_fsync = false;
-    }
-  }
+  explicit YBTabletTest(const Schema& schema, TableType table_type = TableType::YQL_TABLE_TYPE);
 
-  virtual void SetUp() override {
-    YBTest::SetUp();
+  void SetUp() override;
 
-    SetUpTestTablet();
-  }
+  void CreateTestTablet(const std::string& root_dir = "");
 
-  void CreateTestTablet(const string& root_dir = "") {
-    string dir = root_dir.empty() ? GetTestPath("fs_root") : root_dir;
-    TabletHarness::Options opts(dir);
-    opts.enable_metrics = true;
-    opts.table_type = table_type_;
-    bool first_time = harness_ == NULL;
-    harness_.reset(new TabletHarness(schema_, opts));
-    CHECK_OK(harness_->Create(first_time));
-  }
+  void SetUpTestTablet(const std::string& root_dir = "");
 
-  void SetUpTestTablet(const string& root_dir = "") {
-    CreateTestTablet(root_dir);
-    CHECK_OK(harness_->Open());
-  }
-
-  void TabletReOpen(const string& root_dir = "") {
+  void TabletReOpen(const std::string& root_dir = "") {
     SetUpTestTablet(root_dir);
   }
 
@@ -112,15 +87,7 @@ class YBTabletTest : public YBTest {
     return harness_->fs_manager();
   }
 
-  void AlterSchema(const Schema& schema) {
-    tserver::AlterSchemaRequestPB req;
-    req.set_schema_version(tablet()->metadata()->schema_version() + 1);
-
-    AlterSchemaOperationState operation_state(nullptr, &req);
-    ASSERT_OK(tablet()->CreatePreparedAlterSchema(&operation_state, &schema));
-    ASSERT_OK(tablet()->AlterSchema(&operation_state));
-    operation_state.Finish();
-  }
+  void AlterSchema(const Schema& schema);
 
   const std::shared_ptr<TabletClass>& tablet() const {
     return harness_->tablet();
@@ -135,109 +102,17 @@ class YBTabletTest : public YBTest {
   const Schema client_schema_;
   TableType table_type_;
 
-  gscoped_ptr<TabletHarness> harness_;
+  std::unique_ptr<TabletHarness> harness_;
 };
 
-static inline CHECKED_STATUS IterateToStringList(RowwiseIterator *iter,
-                                         vector<string> *out,
-                                         int limit = INT_MAX) {
-  out->clear();
-  Schema schema = iter->schema();
-  Arena arena(1024, 1024);
-  RowBlock block(schema, 100, &arena);
-  int fetched = 0;
-  while (iter->HasNext() && fetched < limit) {
-    RETURN_NOT_OK(iter->NextBlock(&block));
-    for (size_t i = 0; i < block.nrows() && fetched < limit; i++) {
-      out->push_back(schema.DebugRow(block.row(i)));
-      fetched++;
-    }
-  }
-  return Status::OK();
-}
-
-// Performs snapshot reads, under each of the snapshots in 'snaps', and stores
-// the results in 'collected_rows'.
-static inline void CollectRowsForSnapshots(Tablet* tablet,
-                                           const Schema& schema,
-                                           const vector<MvccSnapshot>& snaps,
-                                           vector<vector<string>* >* collected_rows) {
-  for (const MvccSnapshot& snapshot : snaps) {
-    DVLOG(1) << "Snapshot: " <<  snapshot.ToString();
-    gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(tablet->NewRowIterator(schema,
-                                     snapshot,
-                                     Tablet::UNORDERED,
-                                     boost::none,
-                                     &iter));
-    ScanSpec scan_spec;
-    ASSERT_OK(iter->Init(&scan_spec));
-    auto collector = new vector<string>();
-    ASSERT_OK(IterateToStringList(iter.get(), collector));
-    for (const auto& mrs : *collector) {
-      DVLOG(1) << "Got from MRS: " << mrs;
-    }
-    collected_rows->push_back(collector);
-  }
-}
-
-// Performs snapshot reads, under each of the snapshots in 'snaps', and verifies that
-// the results match the ones in 'expected_rows'.
-static inline void VerifySnapshotsHaveSameResult(Tablet* tablet,
-                                                 const Schema& schema,
-                                                 const vector<MvccSnapshot>& snaps,
-                                                 const vector<vector<string>* >& expected_rows) {
-  int idx = 0;
-  // Now iterate again and make sure we get the same thing.
-  for (const MvccSnapshot& snapshot : snaps) {
-    DVLOG(1) << "Snapshot: " <<  snapshot.ToString();
-    gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(tablet->NewRowIterator(schema,
-                                     snapshot,
-                                     Tablet::UNORDERED,
-                                     boost::none,
-                                     &iter));
-    ScanSpec scan_spec;
-    ASSERT_OK(iter->Init(&scan_spec));
-    vector<string> collector;
-    ASSERT_OK(IterateToStringList(iter.get(), &collector));
-    ASSERT_EQ(collector.size(), expected_rows[idx]->size());
-
-    for (int i = 0; i < expected_rows[idx]->size(); i++) {
-      DVLOG(1) << "Got from DRS: " << collector[i];
-      DVLOG(1) << "Expected: " << (*expected_rows[idx])[i];
-      ASSERT_EQ((*expected_rows[idx])[i], collector[i]);
-    }
-    idx++;
-  }
-}
-
-// Take an un-initialized iterator, Init() it, and iterate through all of its rows.
-// The resulting string contains a line per entry.
-static inline string InitAndDumpIterator(gscoped_ptr<RowwiseIterator> iter) {
-  ScanSpec scan_spec;
-  CHECK_OK(iter->Init(&scan_spec));
-
-  vector<string> out;
-  CHECK_OK(IterateToStringList(iter.get(), &out));
-  return JoinStrings(out, "\n");
-}
+CHECKED_STATUS IterateToStringList(
+    common::YQLRowwiseIteratorIf* iter, std::vector<std::string>* out, int limit = INT_MAX);
 
 // Dump all of the rows of the tablet into the given vector.
-static inline CHECKED_STATUS DumpTablet(const Tablet& tablet,
-                                        const Schema& projection,
-                                        vector<string>* out) {
-  gscoped_ptr<RowwiseIterator> iter;
-  RETURN_NOT_OK(tablet.NewRowIterator(projection, boost::none, &iter));
-  ScanSpec scan_spec;
-  RETURN_NOT_OK(iter->Init(&scan_spec));
-  std::vector<string> rows;
-  RETURN_NOT_OK(IterateToStringList(iter.get(), &rows));
-  std::sort(rows.begin(), rows.end());
-  out->swap(rows);
-  return Status::OK();
-}
+CHECKED_STATUS DumpTablet(
+    const Tablet& tablet, const Schema& projection, std::vector<std::string>* out);
 
 } // namespace tablet
 } // namespace yb
+
 #endif // YB_TABLET_TABLET_TEST_UTIL_H

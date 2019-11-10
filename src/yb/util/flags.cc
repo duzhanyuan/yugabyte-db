@@ -32,17 +32,21 @@
 
 #include "yb/util/flags.h"
 
-#include <gperftools/heap-profiler.h>
 #include <iostream>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+#ifdef TCMALLOC_ENABLED
+#include <gperftools/heap-profiler.h>
+#endif
 
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/metrics.h"
 #include "yb/util/path_util.h"
+#include "yb/util/tsan_util.h"
 #include "yb/util/url-coding.h"
 #include "yb/util/version_info.h"
 
@@ -71,12 +75,8 @@ DEFINE_string(heap_profile_path, "", "Output path to store heap profiles. If not
 TAG_FLAG(heap_profile_path, stable);
 TAG_FLAG(heap_profile_path, advanced);
 
-DEFINE_string(tserver_master_addrs, "127.0.0.1:7100",
-              "Comma separated addresses of the masters which the "
-              "tablet server should connect to. The CQL proxy reads this flag as well to "
-              "determine the new set of masters");
-TAG_FLAG(tserver_master_addrs, stable);
-
+DEFINE_int32(svc_queue_length_default, 50, "Default RPC queue length for a service");
+TAG_FLAG(svc_queue_length_default, advanced);
 
 // Tag a bunch of the flags that we inherit from glog/gflags.
 

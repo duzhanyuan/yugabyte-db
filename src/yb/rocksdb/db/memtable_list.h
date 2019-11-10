@@ -17,6 +17,9 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+#ifndef YB_ROCKSDB_DB_MEMTABLE_LIST_H
+#define YB_ROCKSDB_DB_MEMTABLE_LIST_H
+
 #pragma once
 
 #include <string>
@@ -28,7 +31,6 @@
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/memtable.h"
-#include "yb/rocksdb/db/skiplist.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/options.h"
@@ -105,6 +107,8 @@ class MemTableListVersion {
   // If include_history=true, will also search Memtables in MemTableList
   // History.
   SequenceNumber GetEarliestSequenceNumber(bool include_history = false) const;
+
+  std::string ToString() const;
 
  private:
   // REQUIRE: m is an immutable memtable
@@ -191,7 +195,8 @@ class MemTableList {
 
   // Returns the earliest memtables that needs to be flushed. The returned
   // memtables are guaranteed to be in the ascending order of created time.
-  void PickMemtablesToFlush(autovector<MemTable*>* mems);
+  void PickMemtablesToFlush(autovector<MemTable*>* mems,
+                            const MemTableFilter& filter = MemTableFilter());
 
   // Reset status of the given memtable list back to pending state so that
   // they can get picked up again on the next round of flush.
@@ -203,7 +208,7 @@ class MemTableList {
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
       const autovector<MemTable*>& m, VersionSet* vset, InstrumentedMutex* mu,
       uint64_t file_number, autovector<MemTable*>* to_delete,
-      Directory* db_directory, LogBuffer* log_buffer);
+      Directory* db_directory, LogBuffer* log_buffer, const FileNumbersHolder& file_number_holder);
 
   // New memtables are inserted at the front of the list.
   // Takes ownership of the referenced held on *m by the caller of Add().
@@ -229,6 +234,8 @@ class MemTableList {
 
   size_t* current_memory_usage() { return &current_memory_usage_; }
 
+  std::string ToString();
+
  private:
   // DB mutex held
   void InstallNewVersion();
@@ -251,3 +258,5 @@ class MemTableList {
 };
 
 }  // namespace rocksdb
+
+#endif // YB_ROCKSDB_DB_MEMTABLE_LIST_H

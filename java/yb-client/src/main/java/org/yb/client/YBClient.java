@@ -31,16 +31,18 @@
 //
 package org.yb.client;
 
-import com.google.common.net.HostAndPort;
-
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executor;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.ColumnSchema;
 import org.yb.Common.TableType;
+import org.yb.Common.YQLDatabase;
 import org.yb.Schema;
 import org.yb.Type;
 import org.yb.annotations.InterfaceAudience;
@@ -49,6 +51,7 @@ import org.yb.consensus.Metadata;
 import org.yb.master.Master;
 import org.yb.tserver.Tserver;
 
+import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Deferred;
 
 /**
@@ -75,14 +78,8 @@ public class YBClient implements AutoCloseable {
   // Redis keyspace name.
   public static final String REDIS_KEYSPACE_NAME = "system_redis";
 
-  // Redis keyspace name.
-  public static final String DEFAULT_KEYSPACE_NAME = "default_keyspace";
-
   // Redis key column name.
   public static final String REDIS_KEY_COLUMN_NAME = "key";
-
-  // 2 power 16
-  public static final int TWO_POWER_SIXTEEN = (int)Math.pow(2, 16);
 
   // Number of response errors to tolerate.
   private static final int MAX_ERRORS_TO_IGNORE = 2500;
@@ -92,6 +89,10 @@ public class YBClient implements AutoCloseable {
 
   // Log info after these many iterations.
   private static final int LOG_EVERY_NUM_ITERS = 200;
+
+  // Simple way to inject an error on Wait based APIs. If enabled, after first inject,
+  // it will be turned off. We can enhance it to use more options like every-N etc.
+  private boolean injectWaitError = false;
 
   public YBClient(AsyncYBClient asyncClient) {
     this.asyncClient = asyncClient;
@@ -104,69 +105,77 @@ public class YBClient implements AutoCloseable {
    */
   public static CreateTableOptions getRedisTableOptions(int numTablets) {
     CreateTableOptions cto = new CreateTableOptions();
-
-    if (numTablets == 0) {
-      LOG.info("Number of tablets cannot be zero, defaulting it to 1.");
-      numTablets = 1;
+    if (numTablets <= 0) {
+      String msg = "Number of tablets " + numTablets + " cannot be less than one.";
+      LOG.error(msg);
+      throw new RuntimeException(msg);
     }
 
     cto.setTableType(TableType.REDIS_TABLE_TYPE)
-        .setNumTablets(numTablets);
-
+       .setNumTablets(numTablets);
     return cto;
   }
 
+  public void createRedisNamespace() throws Exception {
+    CreateKeyspaceResponse resp = this.createKeyspace(REDIS_KEYSPACE_NAME,
+                                                      YQLDatabase.YQL_DATABASE_REDIS);
+    if (resp.hasError()) {
+      throw new RuntimeException("Could not create keyspace " + REDIS_KEYSPACE_NAME +
+                                 ". Error :" + resp.errorMessage());
+    }
+  }
+
   /**
-   * Create a redis table on the cluster with the specified name.
+   * Create a redis table on the cluster with the specified name and tablet count.
    * @param name Tables name
    * @param numTablets number of pre-split tablets
    * @return an object to communicate with the created table.
    */
   public YBTable createRedisTable(String name, int numTablets) throws Exception {
-    CreateKeyspaceResponse resp = this.createKeyspace(REDIS_KEYSPACE_NAME);
-    if (resp.hasError()) {
-      throw new RuntimeException("Could not create keyspace " + REDIS_KEYSPACE_NAME + ". Error :" +
-                                resp.errorMessage());
-    }
-    return createTable(name, getRedisSchema(), getRedisTableOptions(numTablets),
-                       REDIS_KEYSPACE_NAME);
+    createRedisNamespace();
+    return createTable(REDIS_KEYSPACE_NAME, name, getRedisSchema(),
+                       getRedisTableOptions(numTablets));
+  }
+
+  /**
+   * Create a redis table on the cluster with the specified name.
+   * @param name Table name
+   * @return an object to communicate with the created table.
+   */
+  public YBTable createRedisTable(String name) throws Exception {
+    createRedisNamespace();
+    return createRedisTableOnly(name);
+  }
+
+  public YBTable createRedisTableOnly(String name) throws Exception {
+    return createTable(REDIS_KEYSPACE_NAME, name, getRedisSchema(),
+                       new CreateTableOptions().setTableType(TableType.REDIS_TABLE_TYPE));
   }
 
   /**
    * Create a table on the cluster with the specified name and schema. Default table
    * configurations are used, mainly the table will have one tablet.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name Table's name
    * @param schema Table's schema
    * @return an object to communicate with the created table
    */
-  public YBTable createTable(String name, Schema schema) throws Exception {
-    return createTable(name, schema, new CreateTableOptions(), null);
+  public YBTable createTable(String keyspace, String name, Schema schema) throws Exception {
+    return createTable(keyspace, name, schema, new CreateTableOptions());
   }
 
   /**
    * Create a table on the cluster with the specified name, schema, and table configurations.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name
    * @param schema the table's schema
    * @param builder a builder containing the table's configurations
    * @return an object to communicate with the created table
    */
-  public YBTable createTable(String name, Schema schema, CreateTableOptions builder)
+  public YBTable createTable(String keyspace, String name, Schema schema,
+                             CreateTableOptions builder)
       throws Exception {
-    return createTable(name, schema, builder, null);
-  }
-
-  /**
-   * Create a table on the cluster with the specified name, schema, and table configurations.
-   * @param name the table's name
-   * @param schema the table's schema
-   * @param builder a builder containing the table's configurations
-   * @param keySpace CQL keyspace to which this table should belong
-   * @return an object to communicate with the created table
-   */
-  public YBTable createTable(String name, Schema schema, CreateTableOptions builder,
-                             String keySpace)
-      throws Exception {
-    Deferred<YBTable> d = asyncClient.createTable(name, schema, builder, keySpace);
+    Deferred<YBTable> d = asyncClient.createTable(keyspace, name, schema, builder);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -174,21 +183,31 @@ public class YBClient implements AutoCloseable {
    * Create a CQL keyspace.
    * @param non-null name of the keyspace.
    */
-  public CreateKeyspaceResponse createKeyspace(String keySpace)
+  public CreateKeyspaceResponse createKeyspace(String keyspace)
       throws Exception {
-    Deferred<CreateKeyspaceResponse> d = asyncClient.createKeyspace(keySpace);
+    Deferred<CreateKeyspaceResponse> d = asyncClient.createKeyspace(keyspace);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /*
+   * Create a keyspace (namespace) for the specified database type.
+   * @param non-null name of the keyspace.
+   */
+  public CreateKeyspaceResponse createKeyspace(String keyspace, YQLDatabase databaseType)
+      throws Exception {
+    Deferred<CreateKeyspaceResponse> d = asyncClient.createKeyspace(keyspace, databaseType);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
   /**
    * Delete a table on the cluster with the specified name.
-   * @param name the table's name
    * @param keyspace CQL keyspace to which this table belongs
+   * @param name the table's name
    * @return an rpc response object
    */
-  public DeleteTableResponse deleteTable(final String name, final String keyspace)
+  public DeleteTableResponse deleteTable(final String keyspace, final String name)
       throws Exception {
-    Deferred<DeleteTableResponse> d = asyncClient.deleteTable(name, keyspace);
+    Deferred<DeleteTableResponse> d = asyncClient.deleteTable(keyspace, name);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -197,27 +216,30 @@ public class YBClient implements AutoCloseable {
    *
    * When the method returns it only indicates that the master accepted the alter
    * command, use {@link YBClient#isAlterTableDone(String)} to know when the alter finishes.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name, if this is a table rename then the old table name must be passed
    * @param ato the alter table builder
    * @return an rpc response object
    */
-  public AlterTableResponse alterTable(String name, AlterTableOptions ato) throws Exception {
-    Deferred<AlterTableResponse> d = asyncClient.alterTable(name, ato);
+  public AlterTableResponse alterTable(String keyspace, String name, AlterTableOptions ato)
+      throws Exception {
+    Deferred<AlterTableResponse> d = asyncClient.alterTable(keyspace, name, ato);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
   /**
    * Helper method that checks and waits until the completion of an alter command.
    * It will block until the alter command is done or the timeout is reached.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name Table's name, if the table was renamed then that name must be checked against
    * @return a boolean indicating if the table is done being altered
    */
-  public boolean isAlterTableDone(String name) throws Exception {
+  public boolean isAlterTableDone(String keyspace, String name) throws Exception {
     long totalSleepTime = 0;
     while (totalSleepTime < getDefaultAdminOperationTimeoutMs()) {
       long start = System.currentTimeMillis();
 
-      Deferred<IsAlterTableDoneResponse> d = asyncClient.isAlterTableDone(name);
+      Deferred<IsAlterTableDoneResponse> d = asyncClient.isAlterTableDone(keyspace, name);
       IsAlterTableDoneResponse response;
       try {
         response = d.join(AsyncYBClient.SLEEP_TIME);
@@ -314,6 +336,22 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+   * Get the tablet load move completion percentage for blacklisted nodes, if any.
+   * @return the response with percent load completed.
+   */
+  public GetLoadMovePercentResponse getLeaderBlacklistCompletion()
+      throws Exception {
+    Deferred<GetLoadMovePercentResponse> d;
+    GetLoadMovePercentResponse resp;
+    int numTries = 0;
+    do {
+      d = asyncClient.getLeaderBlacklistCompletion();
+      resp = d.join(getDefaultAdminOperationTimeoutMs());
+    } while (resp.hasRetriableError() && numTries++ < MAX_NUM_RETRIES);
+    return resp;
+  }
+
+  /**
    * Check if the tablet load is balanced as per the master leader.
    * @param numServers expected number of servers across which the load needs to balanced.
    *                   Zero implies load distribution can be checked across all servers
@@ -322,6 +360,32 @@ public class YBClient implements AutoCloseable {
    */
   public IsLoadBalancedResponse getIsLoadBalanced(int numServers) throws Exception {
     Deferred<IsLoadBalancedResponse> d = asyncClient.getIsLoadBalanced(numServers);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Check if the load balancer is idle as per the master leader.
+   * @return a deferred object that yields if the load is balanced.
+   */
+  public IsLoadBalancerIdleResponse getIsLoadBalancerIdle() throws Exception {
+    Deferred<IsLoadBalancerIdleResponse> d = asyncClient.getIsLoadBalancerIdle();
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Check if the tablet leader load is balanced as per the master leader.
+   * @return a deferred object that yields if the load is balanced.
+   */
+  public AreLeadersOnPreferredOnlyResponse getAreLeadersOnPreferredOnly() throws Exception {
+    Deferred<AreLeadersOnPreferredOnlyResponse> d = asyncClient.getAreLeadersOnPreferredOnly();
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Check if initdb executed by the master is done running.
+   */
+  public IsInitDbDoneResponse getIsInitDbDone() throws Exception {
+    Deferred<IsInitDbDoneResponse> d = asyncClient.getIsInitDbDone();
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -446,7 +510,7 @@ public class YBClient implements AutoCloseable {
       }
 
       Thread.sleep(asyncClient.SLEEP_TIME);
-    } while (System.currentTimeMillis() < start + timeoutMs);
+    } while (System.currentTimeMillis() - start < timeoutMs);
 
     LOG.error("Timed out getting leader uuid.");
 
@@ -529,19 +593,30 @@ public class YBClient implements AutoCloseable {
    * @param host Master host that is being added or removed.
    * @param port RPC port of the host being added or removed.
    * @param isAdd true if we are adding a server to the master configuration, false if removing.
+   * @param useHost if caller wants to use host/port instead of uuid of server being removed.
    *
    * @return The change config response object.
    */
   public ChangeConfigResponse changeMasterConfig(
       String host, int port, boolean isAdd) throws Exception {
-    final String masterUuid = getMasterUUID(host, port);
-    if (masterUuid == null) {
-      throw new IllegalArgumentException("Invalid master host/port of " + host + "/" +
-                                          port + " - could not get it's uuid.");
+    return changeMasterConfig(host, port, isAdd, false /* useHost */);
+  }
+
+  public ChangeConfigResponse changeMasterConfig(
+      String host, int port, boolean isAdd, boolean useHost) throws Exception {
+    String masterUuid = null;
+
+    if (isAdd || !useHost) {
+      masterUuid = getMasterUUID(host, port);
+
+      if (masterUuid == null) {
+        throw new IllegalArgumentException("Invalid master host/port of " + host + "/" +
+                                            port + " - could not get it's uuid.");
+      }
     }
 
-    LOG.info("Sending changeConfig : Target host:port={}:{} at uuid={}, add={}.",
-             host, port, masterUuid, isAdd);
+    LOG.info("Sending changeConfig : Target host:port={}:{} at uuid={}, add={}, useHost={}.",
+             host, port, masterUuid, isAdd, useHost);
     long timeout = getDefaultAdminOperationTimeoutMs();
     ChangeConfigResponse resp = null;
     boolean changeConfigDone;
@@ -549,7 +624,7 @@ public class YBClient implements AutoCloseable {
       changeConfigDone = true;
       try {
         Deferred<ChangeConfigResponse> d =
-            asyncClient.changeMasterConfig(host, port, masterUuid, isAdd);
+            asyncClient.changeMasterConfig(host, port, masterUuid, isAdd, useHost);
         resp = d.join(timeout);
         if (!resp.hasError()) {
           asyncClient.updateMasterAdresses(host, port, isAdd);
@@ -606,6 +681,24 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+  * Enable encryption at rest using the key file specified
+  */
+  public boolean enableEncryptionAtRest(final String file) throws Exception {
+    Deferred<ChangeEncryptionInfoResponse> d;
+    d = asyncClient.enableEncryptionAtRest(file);
+    return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  /**
+   * Disable encryption at rest
+   */
+  public boolean disableEncryptionAtRest() throws Exception {
+    Deferred<ChangeEncryptionInfoResponse> d;
+    d = asyncClient.disableEncryptionAtRest();
+    return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  /**
   * Ping a certain server to see if it is responding to RPC requests.
   * @param host the hostname or IP of the server
   * @param port the port number of the server
@@ -618,12 +711,132 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
-  * Wait for the specific server to come online.
-  * @param hp the HostAndPort of the server
-  * @param timeoutMs the amount of time, in MS, to wait
-  * @return true if the server responded to pings in the given time, false otherwise
-  */
-  public boolean waitForServer(final HostAndPort hp, final long timeoutMs) {
+   * Set a gflag of a given server.
+   * @param hp the host and port of the server
+   * @param flag the flag to be set.
+   * @param value the value to set the flag to
+   * @return true if the server successfully set the flag
+   */
+  public boolean setFlag(HostAndPort hp, String flag, String value) throws Exception {
+    if (flag == null || flag.isEmpty() || value == null || value.isEmpty() || hp == null) {
+      LOG.warn("Invalid arguments for hp: {}, flag {}, or value: {}", hp.toString(), flag, value);
+      return false;
+    }
+    Deferred<SetFlagResponse> d = asyncClient.setFlag(hp, flag, value);
+    return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
+  }
+
+  /**
+   *  Get the list of master addresses from a given tserver.
+   * @param hp the host and port of the server
+   * @return a comma separated string containing the list of master addresses
+   */
+  public String getMasterAddresses(HostAndPort hp) throws Exception {
+    Deferred<GetMasterAddressesResponse> d = asyncClient.getMasterAddresses(hp);
+    return d.join(getDefaultAdminOperationTimeoutMs()).getMasterAddresses();
+  }
+
+  /**
+   * Check if the server is ready to serve requests.
+   * @param hp the host and port of the server.
+   * @param isTserver true if host/port is for tserver, else its master.
+   * @return server readiness response.
+   */
+  public IsServerReadyResponse isServerReady(HostAndPort hp, boolean isTserver)
+     throws Exception {
+    Deferred<IsServerReadyResponse> d = asyncClient.isServerReady(hp, isTserver);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  public interface Condition {
+    boolean get() throws Exception;
+  }
+
+  /**
+   * Checks the ping of the given ip and port.
+   */
+  private class ServerCondition implements Condition {
+    private HostAndPort hp;
+    public ServerCondition(HostAndPort hp) {
+      this.hp = hp;
+    }
+    @Override
+    public boolean get() throws Exception {
+      return ping(hp.getHostText(), hp.getPort());
+    }
+  }
+
+  /**
+   * Checks whether the IsLoadBalancedResponse has no error.
+   */
+  private class LoadBalanceCondition implements Condition {
+    private int numServers;
+    public LoadBalanceCondition(int numServers) {
+      this.numServers = numServers;
+    }
+    @Override
+    public boolean get() throws Exception {
+      IsLoadBalancedResponse resp = getIsLoadBalanced(numServers);
+      return !resp.hasError();
+    }
+  }
+
+  /**
+   * Checks whether the IsLoadBalancerIdleResponse has no error.
+   */
+  private class LoadBalancerIdleCondition implements Condition {
+    public LoadBalancerIdleCondition() {
+    }
+    @Override
+    public boolean get() throws Exception {
+      IsLoadBalancerIdleResponse resp = getIsLoadBalancerIdle();
+      return !resp.hasError();
+    }
+  }
+
+  private class AreLeadersOnPreferredOnlyCondition implements Condition {
+    @Override
+    public boolean get() throws Exception {
+      AreLeadersOnPreferredOnlyResponse resp = getAreLeadersOnPreferredOnly();
+      return !resp.hasError();
+    }
+  }
+
+  private class ReplicaMapCondition implements Condition {
+    private YBTable table;
+    Map<String, List<List<Integer>>> replicaMapExpected;
+    private long deadline;
+    public ReplicaMapCondition(YBTable table,
+                               Map<String, List<List<Integer>>> replicaMapExpected,
+                               long deadline) {
+      this.table = table;
+      this.replicaMapExpected = replicaMapExpected;
+      this.deadline = deadline;
+    }
+    @Override
+    public boolean get() throws Exception {
+      Map<String, List<List<Integer>>> replicaMap =
+          table.getMemberTypeCountsForEachTSType(deadline);
+      return replicaMap.equals(replicaMapExpected);
+    }
+  }
+
+  /**
+   * Quick and dirty error injection on Wait based API's.
+   * After every use, for now, will get automatically disabled.
+   */
+  public void injectWaitError() {
+    injectWaitError = true;
+  }
+
+  /**
+   * Helper method that loops on a condition every 500ms until it returns true or the
+   * operation times out.
+   * @param condition the Condition which implements a boolean get() method.
+   * @param timeoutMs the amount of time, in MS, to wait.
+   * @return true if the condition is true within the time frame, false otherwise.
+   */
+  private boolean waitForCondition(Condition condition, final long timeoutMs) {
     Exception finalException = null;
     long start = System.currentTimeMillis();
     int numErrors = 0;
@@ -631,7 +844,14 @@ public class YBClient implements AutoCloseable {
     String errorMessage = null;
     do {
       try {
-        if (ping(hp.getHostText(), hp.getPort())) {
+        if (injectWaitError) {
+          Thread.sleep(AsyncYBClient.SLEEP_TIME);
+          injectWaitError = false;
+          String msg = "Simulated expection due to injected error.";
+          LOG.info(msg);
+          throw new RuntimeException(msg);
+        }
+        if (condition.get()) {
           return true;
         }
       } catch (Exception e) {
@@ -650,18 +870,18 @@ public class YBClient implements AutoCloseable {
 
       numIters++;
       if (numIters % LOG_EVERY_NUM_ITERS == 0) {
-        LOG.info("Tried load balance rpc {} times so far.", numIters);
+        LOG.info("Tried operation {} times so far.", numIters);
       }
 
       // Need to wait even when ping has an exception, so the sleep is outside the above try block.
       try {
         Thread.sleep(AsyncYBClient.SLEEP_TIME);
       } catch (Exception e) {}
-    } while (System.currentTimeMillis() < start + timeoutMs);
+    } while (System.currentTimeMillis() - start < timeoutMs);
 
     if (errorMessage == null) {
-      LOG.error("Timed out waiting for server {} to come online. Final exception was {}.",
-                hp.toString(), finalException != null ? finalException.toString() : "none");
+      LOG.error("Timed out waiting for operation. Final exception was {}.",
+                finalException != null ? finalException.toString() : "none");
     } else {
       LOG.error(errorMessage);
     }
@@ -672,58 +892,63 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
+  * Wait for the specific server to come online.
+  * @param hp the HostAndPort of the server
+  * @param timeoutMs the amount of time, in MS, to wait
+  * @return true if the server responded to pings in the given time, false otherwise
+  */
+  public boolean waitForServer(final HostAndPort hp, final long timeoutMs) {
+    Condition serverCondition = new ServerCondition(hp);
+    return waitForCondition(serverCondition, timeoutMs);
+  }
+
+  /**
   * Wait for the tablet load to be balanced by master leader.
   * @param timeoutMs the amount of time, in MS, to wait
   * @param numServers expected number of servers which need to balanced.
   * @return true if the master leader does not return any error balance check.
   */
   public boolean waitForLoadBalance(final long timeoutMs, int numServers) {
-    Exception finalException = null;
-    long start = System.currentTimeMillis();
-    int numErrors = 0;
-    int numIters = 0;
-    String errorMessage = null;
-    do {
-      try {
-        IsLoadBalancedResponse resp = getIsLoadBalanced(numServers);
-        if (!resp.hasError()) {
-          return true;
-        }
-      } catch (Exception e) {
-        // We will get exceptions if we cannot connect to the other end. Catch them and save for
-        // final debug if we never succeed.
-        finalException = e;
-        numErrors++;
-        if (numErrors % LOG_ERRORS_EVERY_NUM_ITERS == 0) {
-          LOG.warn("Hit {} errors so far. Latest is : {}.", numErrors, finalException.toString());
-        }
-        if (numErrors >= MAX_ERRORS_TO_IGNORE) {
-          errorMessage = "Hit too many errors, final exception is " + finalException.toString();
-          break;
-        }
-      }
+    Condition loadBalanceCondition = new LoadBalanceCondition(numServers);
+    return waitForCondition(loadBalanceCondition, timeoutMs);
+  }
 
-      numIters++;
-      if (numIters % LOG_EVERY_NUM_ITERS == 0) {
-        LOG.info("Tried load balance rpc {} times so far.", numIters);
-      }
+  /**
+  * Wait for the tablet load to be balanced by master leader.
+  * @param timeoutMs the amount of time, in MS, to wait
+  * @return true if the master leader does not return any error balance check.
+  */
+  public boolean waitForLoadBalancerIdle(final long timeoutMs) {
+    Condition loadBalancerIdleCondition = new LoadBalancerIdleCondition();
+    return waitForCondition(loadBalancerIdleCondition, timeoutMs);
+  }
 
-      // Need to wait even when check has an exception, so sleep is outside the above try block.
-      try {
-        Thread.sleep(AsyncYBClient.SLEEP_TIME);
-      } catch (InterruptedException e) {}
-    } while ((timeoutMs == Long.MAX_VALUE) || System.currentTimeMillis() < start + timeoutMs);
+  /**
+   * Wait for the leader load to be balanced by master leader.
+   * @param timeoutMs the amount of time, in MS, to wait.
+   * @return true iff the leader count is balanced within timeoutMs.
+   */
+  public boolean waitForAreLeadersOnPreferredOnlyCondition(final long timeoutMs) {
+    Condition areLeadersOnPreferredOnlyCondition =
+        new AreLeadersOnPreferredOnlyCondition();
+    return waitForCondition(areLeadersOnPreferredOnlyCondition, timeoutMs);
+  }
 
-    if (errorMessage == null) {
-      LOG.error("Timed out waiting for load to balance. Final exception was {}.",
-                finalException != null ? finalException.toString() : "none");
-    } else {
-      LOG.error(errorMessage);
-    }
-
-    LOG.error("Returning failure after {} iterations, num errors = {}.", numIters, numErrors);
-
-    return false;
+  /**
+   * Check if the replica count per ts matches the expected, returns true if it does within
+   * timeoutMs, false otherwise.
+   * TODO(Rahul): follow similar style for this type of function will do with affinitized
+   * leaders tests.
+   * @param timeoutMs number of milliseconds before timing out.
+   * @param table the table to wait for load balancing.
+   * @param replicaMapExpected the expected map between cluster uuid and live, read replica count.
+   * @return true if the read only replica count for the table matches the expected within the
+   * expected time frame, false otherwise.
+   */
+  public boolean waitForExpectedReplicaMap(final long timeoutMs, YBTable table,
+                                            Map<String, List<List<Integer>>> replicaMapExpected) {
+    Condition replicaMapCondition = new ReplicaMapCondition(table, replicaMapExpected, timeoutMs);
+    return waitForCondition(replicaMapCondition, timeoutMs);
   }
 
   /**
@@ -738,11 +963,20 @@ public class YBClient implements AutoCloseable {
   }
 
   /**
-   * Get the list of all the tables.
-   * @return a list of all the tables
+   * Get the list of all YSQL, YCQL, and YEDIS non-system tables.
+   * @return a list of all the non-system tables
    */
   public ListTablesResponse getTablesList() throws Exception {
-    return getTablesList(null);
+    // YEDIS tables are stored as system tables, so they have to be separated.
+    ListTablesResponse nonSystemTables = getTablesList(null, true, null);
+    ListTablesResponse yedisTables;
+    // If YEDIS is not enabled, getTablesList will error out on this call.
+    try {
+      yedisTables  = getTablesList(null, false, REDIS_KEYSPACE_NAME);
+    } catch (MasterErrorException e) {
+      yedisTables = null;
+    }
+    return nonSystemTables.mergeWith(yedisTables);
   }
 
   /**
@@ -752,17 +986,46 @@ public class YBClient implements AutoCloseable {
    * @return a deferred that contains the list of table names
    */
   public ListTablesResponse getTablesList(String nameFilter) throws Exception {
-    Deferred<ListTablesResponse> d = asyncClient.getTablesList(nameFilter);
+    return getTablesList(nameFilter, false, null);
+  }
+
+  /**
+   * Get a list of table names. Passing a null filter returns all the tables. When a filter is
+   * specified, it only returns tables that satisfy a substring match. Passing excludeSysfilters
+   * will return only non-system tables (index and user tables).
+   * @param nameFilter an optional table name filter
+   * @param excludeSystemTables an optional filter to search only non-system tables
+   * @param namespace an optional filter to search tables in specific namespace
+   * @return a deferred that contains the list of table names
+   */
+  public ListTablesResponse getTablesList(
+      String nameFilter, boolean excludeSystemTables, String namespace)
+  throws Exception {
+    Deferred<ListTablesResponse> d = asyncClient.getTablesList(
+        nameFilter, excludeSystemTables, namespace);
+    return d.join(getDefaultAdminOperationTimeoutMs());
+  }
+
+  /**
+   * Create for a given tablet and stream.
+   * @param hp host port of the server.
+   * @param tableId the table id to subscribe to.
+   * @return a deferred object for the response from server.
+   */
+  public CreateCDCStreamResponse createCDCStream(
+          final HostAndPort hp, String tableId) throws Exception{
+    Deferred<CreateCDCStreamResponse> d = asyncClient.createCDCStream(hp, tableId);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
   /**
    * Test if a table exists.
+   * @param keyspace the keyspace name to which this table belongs.
    * @param name a non-null table name
    * @return true if the table exists, else false
    */
-  public boolean tableExists(String name) throws Exception {
-    Deferred<Boolean> d = asyncClient.tableExists(name);
+  public boolean tableExists(String keyspace, String name) throws Exception {
+    Deferred<Boolean> d = asyncClient.tableExists(keyspace, name);
     try {
       return d.join(getDefaultAdminOperationTimeoutMs());
     } catch (MasterErrorException e) {
@@ -786,13 +1049,13 @@ public class YBClient implements AutoCloseable {
 
   /**
    * Get the schema for a table based on the table's name.
+   * @param keyspace the keyspace name to which this table belongs.
    * @param name a non-null table name
-   * @param keyspace the keyspace name, if available
    * @return a deferred that contains the schema for the specified table
    */
-  public GetTableSchemaResponse getTableSchema(final String name, final String keyspace)
+  public GetTableSchemaResponse getTableSchema(final String keyspace, final String name)
       throws Exception {
-    Deferred<GetTableSchemaResponse> d = asyncClient.getTableSchema(name, keyspace);
+    Deferred<GetTableSchemaResponse> d = asyncClient.getTableSchema(keyspace, name);
     return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
@@ -810,23 +1073,28 @@ public class YBClient implements AutoCloseable {
   /**
    * Open the table with the given name. If the table was just created, this method will block until
    * all its tablets have also been created.
+   * @param keyspace the keyspace name to which the table belongs.
    * @param name table to open
    * @return a YBTable if the table exists, else a MasterErrorException
    */
-  public YBTable openTable(final String name) throws Exception {
-    return openTable(name, null);
+  public YBTable openTable(final String keyspace, final String name) throws Exception {
+    Deferred<YBTable> d = asyncClient.openTable(keyspace, name);
+    return d.join(getDefaultAdminOperationTimeoutMs());
   }
 
   /**
-   * Open the table with the given name. If the table was just created, this method will block until
-   * all its tablets have also been created.
-   * @param name table to open
+   * Get the list of tablet UUIDs of a table with the given name.
    * @param keyspace the keyspace name to which the table belongs.
-   * @return a YBTable if the table exists, else a MasterErrorException
+   * @param name the table name
+   * @return the set of tablet UUIDs of the table.
    */
-  public YBTable openTable(final String name, final String keyspace) throws Exception {
-    Deferred<YBTable> d = asyncClient.openTable(name, keyspace);
-    return d.join(getDefaultAdminOperationTimeoutMs());
+  public Set<String> getTabletUUIDs(final String keyspace, final String name) throws Exception {
+    Set<String> ids = new HashSet<>();
+    YBTable table = openTable(keyspace, name);
+    for (LocatedTablet tablet : table.getTabletsLocations(getDefaultAdminOperationTimeoutMs())) {
+      ids.add(new String(tablet.getTabletId()));
+    }
+    return ids;
   }
 
   /**
@@ -838,27 +1106,6 @@ public class YBClient implements AutoCloseable {
   public YBTable openTableByUUID(final String tableUUID) throws Exception {
     Deferred<YBTable> d = asyncClient.openTableByUUID(tableUUID);
     return d.join(getDefaultAdminOperationTimeoutMs());
-  }
-
-  /**
-   * Create a new session for interacting with the cluster.
-   * User is responsible for destroying the session object.
-   * This is a fully local operation (no RPCs or blocking).
-   * @return a synchronous wrapper around YBSession.
-   */
-  public YBSession newSession() {
-    AsyncYBSession session = asyncClient.newSession();
-    return new YBSession(session);
-  }
-
-  /**
-   * Creates a new {@link YBScanner.YBScannerBuilder} for a particular table.
-   * @param table the name of the table you intend to scan.
-   * The string is assumed to use the platform's default charset.
-   * @return a new scanner builder for this table
-   */
-  public YBScanner.YBScannerBuilder newScannerBuilder(YBTable table) {
-    return new YBScanner.YBScannerBuilder(asyncClient, table);
   }
 
   /**
@@ -875,8 +1122,7 @@ public class YBClient implements AutoCloseable {
    * @throws Exception
    */
   public void shutdown() throws Exception {
-    Deferred<ArrayList<Void>> d = asyncClient.shutdown();
-    d.join(getDefaultAdminOperationTimeoutMs());
+    asyncClient.shutdown();
   }
 
   /**
@@ -967,6 +1213,19 @@ public class YBClient implements AutoCloseable {
      */
     public YBClientBuilder defaultSocketReadTimeoutMs(long timeoutMs) {
       clientBuilder.defaultSocketReadTimeoutMs(timeoutMs);
+      return this;
+    }
+
+    /**
+     * Sets the certificate file in case SSL is enabled.
+     * Optional.
+     * If not provided, defaults to null.
+     * A value of null disables an SSL connection.
+     * @param certFile the path to the certificate.
+     * @return this builder
+     */
+    public YBClientBuilder sslCertFile(String certFile) {
+      clientBuilder.sslCertFile(certFile);
       return this;
     }
 

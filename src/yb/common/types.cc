@@ -80,13 +80,17 @@ class TypeInfoResolver {
     AddMapping<INT32>();
     AddMapping<UINT64>();
     AddMapping<INT64>();
+    AddMapping<VARINT>();
     AddMapping<TIMESTAMP>();
+    AddMapping<DATE>();
+    AddMapping<TIME>();
     AddMapping<STRING>();
     AddMapping<BOOL>();
     AddMapping<FLOAT>();
     AddMapping<DOUBLE>();
     AddMapping<BINARY>();
     AddMapping<INET>();
+    AddMapping<JSONB>();
     AddMapping<MAP>();
     AddMapping<SET>();
     AddMapping<LIST>();

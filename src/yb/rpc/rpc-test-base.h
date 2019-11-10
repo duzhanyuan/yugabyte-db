@@ -40,10 +40,10 @@
 
 #include "yb/rpc/acceptor.h"
 #include "yb/rpc/messenger.h"
-#include "yb/rpc/proxy.h"
 #include "yb/rpc/reactor.h"
 #include "yb/rpc/remote_method.h"
 #include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_test_util.h"
 #include "yb/rpc/rtest.pb.h"
 #include "yb/rpc/rtest.proxy.h"
 #include "yb/rpc/rtest.service.h"
@@ -62,18 +62,49 @@ namespace yb { namespace rpc {
 std::unique_ptr<ServiceIf> CreateCalculatorService(
   const scoped_refptr<MetricEntity>& metric_entity, std::string name = std::string());
 
+class CalculatorServiceMethods {
+ public:
+  static const constexpr auto kAddMethodName = "Add";
+  static const constexpr auto kDisconnectMethodName = "Disconnect";
+  static const constexpr auto kEchoMethodName = "Echo";
+  static const constexpr auto kSendStringsMethodName = "SendStrings";
+  static const constexpr auto kSleepMethodName = "Sleep";
+
+  static RemoteMethod* AddMethod() {
+    static RemoteMethod method(
+        rpc_test::CalculatorServiceIf::static_service_name(), kAddMethodName);
+    return &method;
+  }
+
+  static RemoteMethod* DisconnectMethod() {
+    static RemoteMethod method(
+        rpc_test::CalculatorServiceIf::static_service_name(), kDisconnectMethodName);
+    return &method;
+  }
+
+  static RemoteMethod* EchoMethod() {
+    static RemoteMethod method(
+        rpc_test::CalculatorServiceIf::static_service_name(), kEchoMethodName);
+    return &method;
+  }
+
+  static RemoteMethod* SendStringsMethod() {
+    static RemoteMethod method(
+        rpc_test::CalculatorServiceIf::static_service_name(), kSendStringsMethodName);
+    return &method;
+  }
+
+  static RemoteMethod* SleepMethod() {
+    static RemoteMethod method(
+        rpc_test::CalculatorServiceIf::static_service_name(), kSleepMethodName);
+    return &method;
+  }
+};
+
 // Implementation of CalculatorService which just implements the generic
 // RPC handler (no generated code).
 class GenericCalculatorService : public ServiceIf {
  public:
-  static const char *kFullServiceName;
-  static const char *kAddMethodName;
-  static const char *kSleepMethodName;
-  static const char *kSendStringsMethodName;
-
-  static const char* kFirstString;
-  static const char* kSecondString;
-
   GenericCalculatorService() {
   }
 
@@ -82,19 +113,24 @@ class GenericCalculatorService : public ServiceIf {
     // this test doesn't generate metrics, so we ignore the argument.
   }
 
-  virtual void Handle(InboundCallPtr incoming) override;
-  std::string service_name() const override { return kFullServiceName; }
-  static std::string static_service_name() { return kFullServiceName; }
+  void Handle(InboundCallPtr incoming) override;
+
+  std::string service_name() const override {
+    return rpc_test::CalculatorServiceIf::static_service_name();
+  }
 
  private:
   void DoAdd(InboundCall *incoming);
   void DoSendStrings(InboundCall* incoming);
   void DoSleep(InboundCall *incoming);
+  void DoEcho(InboundCall *incoming);
 };
 
 struct MessengerOptions {
+  MessengerOptions() = delete;
   size_t n_reactors;
   std::chrono::milliseconds keep_alive_timeout;
+  int num_connections_to_server = -1;
 };
 
 extern const MessengerOptions kDefaultClientMessengerOptions;
@@ -109,7 +145,7 @@ struct TestServerOptions {
 class TestServer {
  public:
   TestServer(std::unique_ptr<ServiceIf> service,
-             const scoped_refptr<MetricEntity>& metric_entity,
+             std::unique_ptr<Messenger>&& messenger,
              const TestServerOptions& options = TestServerOptions());
 
   TestServer(TestServer&& rhs)
@@ -125,11 +161,12 @@ class TestServer {
   void Shutdown();
 
   const Endpoint& bound_endpoint() const { return bound_endpoint_; }
-  Messenger& messenger() const { return *messenger_; }
+  Messenger* messenger() const { return messenger_.get(); }
   ServicePool& service_pool() const { return *service_pool_; }
+
  private:
   string service_name_;
-  std::shared_ptr<Messenger> messenger_;
+  std::unique_ptr<Messenger> messenger_;
   ThreadPool thread_pool_;
   scoped_refptr<ServicePool> service_pool_;
   Endpoint bound_endpoint_;
@@ -141,27 +178,43 @@ class RpcTestBase : public YBTest {
 
   void TearDown() override;
  protected:
-  std::shared_ptr<Messenger> CreateMessenger(
+  std::unique_ptr<Messenger> CreateMessenger(
       const string &name,
       const MessengerOptions& options = kDefaultClientMessengerOptions);
 
-  CHECKED_STATUS DoTestSyncCall(const Proxy &p, const char *method);
+  AutoShutdownMessengerHolder CreateAutoShutdownMessengerHolder(
+      const string &name,
+      const MessengerOptions& options = kDefaultClientMessengerOptions);
 
-  void DoTestSidecar(const Proxy &p,
+  MessengerBuilder CreateMessengerBuilder(
+      const string &name,
+      const MessengerOptions& options = kDefaultClientMessengerOptions);
+
+  CHECKED_STATUS DoTestSyncCall(Proxy* proxy, const RemoteMethod *method);
+
+  void DoTestSidecar(Proxy* proxy,
                      std::vector<size_t> sizes,
                      Status::Code expected_code = Status::Code::kOk);
 
-  void DoTestExpectTimeout(const Proxy &p, const MonoDelta &timeout);
-  void StartTestServer(Endpoint* server_endpoind,
+  void DoTestExpectTimeout(Proxy* proxy, const MonoDelta &timeout);
+
+  // Starts test server.
+  void StartTestServer(HostPort* server_hostport,
                        const TestServerOptions& options = TestServerOptions());
-  void StartTestServerWithGeneratedCode(Endpoint* server_endpoind,
+  void StartTestServer(Endpoint* server_endpoint,
+                       const TestServerOptions& options = TestServerOptions());
+  TestServer StartTestServer(const std::string& name, const IpAddress& address);
+  void StartTestServerWithGeneratedCode(HostPort* server_hostport,
+                                        const TestServerOptions& options = TestServerOptions());
+  void StartTestServerWithGeneratedCode(std::unique_ptr<Messenger>&& messenger,
+                                        HostPort* server_hostport,
                                         const TestServerOptions& options = TestServerOptions());
 
   // Start a simple socket listening on a local port, returning the address.
   // This isn't an RPC server -- just a plain socket which can be helpful for testing.
-  CHECKED_STATUS StartFakeServer(Socket *listen_sock, Endpoint* listen_endpoind);
+  CHECKED_STATUS StartFakeServer(Socket *listen_sock, HostPort* listen_hostport);
 
-  Messenger& server_messenger() const { return server_->messenger(); }
+  Messenger* server_messenger() const { return server_->messenger(); }
   TestServer& server() const { return *server_; }
   const scoped_refptr<MetricEntity>& metric_entity() const { return metric_entity_; }
 

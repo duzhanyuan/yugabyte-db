@@ -70,7 +70,7 @@
 #include "yb/rocksdb/util/mutexlock.h"
 #include "yb/rocksdb/util/rate_limiter.h"
 #include "yb/rocksdb/util/statistics.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
@@ -84,7 +84,7 @@ namespace rocksdb {
 
 static std::string RandomString(Random* rnd, int len, double ratio) {
   std::string r;
-  test::CompressibleString(rnd, ratio, len, &r);
+  CompressibleString(rnd, ratio, len, &r);
   return r;
 }
 

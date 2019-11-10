@@ -38,8 +38,8 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "yb/client/row_result.h"
-#include "yb/client/scanner-internal.h"
+#include "yb/client/table_handle.h"
+
 #include "yb/common/partition.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
@@ -58,21 +58,18 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_controller.h"
 
-using yb::client::YBRowResult;
 using yb::HostPort;
 using yb::rpc::Messenger;
 using yb::rpc::MessengerBuilder;
 using yb::rpc::RpcController;
 using yb::server::ServerStatusPB;
-using yb::client::YBScanBatch;
 using yb::tablet::TabletStatusPB;
 using yb::tserver::DeleteTabletRequestPB;
 using yb::tserver::DeleteTabletResponsePB;
 using yb::tserver::ListTabletsRequestPB;
 using yb::tserver::ListTabletsResponsePB;
-using yb::tserver::NewScanRequestPB;
-using yb::tserver::ScanRequestPB;
-using yb::tserver::ScanResponsePB;
+using yb::tserver::CountIntentsRequestPB;
+using yb::tserver::CountIntentsResponsePB;
 using yb::tserver::TabletServerAdminServiceProxy;
 using yb::tserver::TabletServerServiceProxy;
 using std::ostringstream;
@@ -87,6 +84,7 @@ const char* const kDumpTabletOp = "dump_tablet";
 const char* const kDeleteTabletOp = "delete_tablet";
 const char* const kCurrentHybridTime = "current_hybrid_time";
 const char* const kStatus = "status";
+const char* const kCountIntents = "count_intents";
 
 DEFINE_string(server_address, "localhost",
               "Address of server to run against");
@@ -133,6 +131,8 @@ class TsAdminClient {
   // "localhost" or "127.0.0.1:7050".
   TsAdminClient(std::string addr, int64_t timeout_millis);
 
+  ~TsAdminClient();
+
   // Initialized the client and connects to the specified tablet
   // server.
   Status Init();
@@ -164,15 +164,18 @@ class TsAdminClient {
 
   // Get the server status
   Status GetStatus(ServerStatusPB* pb);
+
+  // Count write intents on all tablets.
+  Status CountIntents(int64_t* num_intents);
+
  private:
   std::string addr_;
-  std::vector<yb::Endpoint> addrs_;
   MonoDelta timeout_;
   bool initted_;
+  std::unique_ptr<rpc::Messenger> messenger_;
   shared_ptr<server::GenericServiceProxy> generic_proxy_;
   gscoped_ptr<tserver::TabletServerServiceProxy> ts_proxy_;
   gscoped_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
-  shared_ptr<rpc::Messenger> messenger_;
 
   DISALLOW_COPY_AND_ASSIGN(TsAdminClient);
 };
@@ -182,19 +185,24 @@ TsAdminClient::TsAdminClient(string addr, int64_t timeout_millis)
       timeout_(MonoDelta::FromMilliseconds(timeout_millis)),
       initted_(false) {}
 
+TsAdminClient::~TsAdminClient() {
+  if (messenger_) {
+    messenger_->Shutdown();
+  }
+}
+
 Status TsAdminClient::Init() {
   CHECK(!initted_);
 
   HostPort host_port;
   RETURN_NOT_OK(host_port.ParseString(addr_, tserver::TabletServer::kDefaultPort));
-  MessengerBuilder builder("ts-cli");
-  RETURN_NOT_OK(builder.Build().MoveTo(&messenger_));
+  messenger_ = VERIFY_RESULT(MessengerBuilder("ts-cli").Build());
 
-  RETURN_NOT_OK(host_port.ResolveAddresses(&addrs_));
+  rpc::ProxyCache proxy_cache(messenger_.get());
 
-  generic_proxy_.reset(new server::GenericServiceProxy(messenger_, addrs_[0]));
-  ts_proxy_.reset(new TabletServerServiceProxy(messenger_, addrs_[0]));
-  ts_admin_proxy_.reset(new TabletServerAdminServiceProxy(messenger_, addrs_[0]));
+  generic_proxy_.reset(new server::GenericServiceProxy(&proxy_cache, host_port));
+  ts_proxy_.reset(new TabletServerServiceProxy(&proxy_cache, host_port));
+  ts_admin_proxy_.reset(new TabletServerAdminServiceProxy(&proxy_cache, host_port));
 
   initted_ = true;
 
@@ -262,53 +270,29 @@ Status TsAdminClient::DumpTablet(const std::string& tablet_id) {
   RETURN_NOT_OK(GetTabletSchema(tablet_id, &schema_pb));
   Schema schema;
   RETURN_NOT_OK(SchemaFromPB(schema_pb, &schema));
-  yb::client::YBSchema client_schema(schema);
 
-  ScanRequestPB req;
-  ScanResponsePB resp;
+  tserver::ReadRequestPB req;
+  tserver::ReadResponsePB resp;
 
-  NewScanRequestPB* new_req = req.mutable_new_scan_request();
-  RETURN_NOT_OK(SchemaToColumnPBs(
-      schema, new_req->mutable_projected_columns(),
-      SCHEMA_PB_WITHOUT_IDS | SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES));
-  new_req->set_tablet_id(tablet_id);
-  new_req->set_cache_blocks(false);
-  new_req->set_order_mode(ORDERED);
-  new_req->set_read_mode(READ_AT_SNAPSHOT);
+  req.set_tablet_id(tablet_id);
+  RpcController rpc;
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK_PREPEND(ts_proxy_->Read(req, &resp, &rpc), "Read() failed");
 
-  vector<YBRowResult> rows;
-  while (true) {
-    RpcController rpc;
-    rpc.set_timeout(timeout_);
-    RETURN_NOT_OK_PREPEND(ts_proxy_->Scan(req, &resp, &rpc),
-                          "Scan() failed");
-
-    if (resp.has_error()) {
-      return STATUS(IOError, "Failed to read: ", resp.error().ShortDebugString());
-    }
-
-    rows.clear();
-    YBScanBatch::Data results;
-    RETURN_NOT_OK(results.Reset(&rpc,
-                                &schema,
-                                &client_schema,
-                                make_gscoped_ptr(resp.release_data())));
-    results.ExtractRows(&rows);
-    for (const YBRowResult& r : rows) {
-      std::cout << r.ToString() << std::endl;
-    }
-
-    // The first response has a scanner ID. We use this for all subsequent
-    // responses.
-    if (resp.has_scanner_id()) {
-      req.set_scanner_id(resp.scanner_id());
-      req.clear_new_scan_request();
-    }
-    req.set_call_seq_id(req.call_seq_id() + 1);
-    if (!resp.has_more_results()) {
-      break;
-    }
+  if (resp.has_error()) {
+    return STATUS(IOError, "Failed to read: ", resp.error().ShortDebugString());
   }
+
+  QLRowBlock row_block(schema);
+  Slice data = VERIFY_RESULT(rpc.GetSidecar(0));
+  if (!data.empty()) {
+    RETURN_NOT_OK(row_block.Deserialize(YQL_CLIENT_CQL, &data));
+  }
+
+  for (const auto& row : row_block.rows()) {
+    std::cout << row.ToString() << std::endl;
+  }
+
   return Status::OK();
 }
 
@@ -358,6 +342,16 @@ Status TsAdminClient::GetStatus(ServerStatusPB* pb) {
   return Status::OK();
 }
 
+Status TsAdminClient::CountIntents(int64_t* num_intents) {
+  CountIntentsRequestPB req;
+  CountIntentsResponsePB resp;
+  RpcController rpc;
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(ts_admin_proxy_->CountIntents(req, &resp, &rpc));
+  *num_intents = resp.num_intents();
+  return Status::OK();
+}
+
 namespace {
 
 void SetUsage(const char* argv0) {
@@ -371,7 +365,8 @@ void SetUsage(const char* argv0) {
       << "  " << kDumpTabletOp << " <tablet_id>\n"
       << "  " << kDeleteTabletOp << " <tablet_id> <reason string>\n"
       << "  " << kCurrentHybridTime << "\n"
-      << "  " << kStatus;
+      << "  " << kStatus << "\n"
+      << "  " << kCountIntents << "\n";
   google::SetUsageMessage(str.str());
 }
 
@@ -422,16 +417,12 @@ static int TsCliMain(int argc, char** argv) {
       Partition partition;
       Partition::FromPB(ts.partition(), &partition);
 
-      string state = tablet::TabletStatePB_Name(ts.state());
+      string state = tablet::RaftGroupStatePB_Name(ts.state());
       std::cout << "Tablet id: " << ts.tablet_id() << std::endl;
       std::cout << "State: " << state << std::endl;
       std::cout << "Table name: " << ts.table_name() << std::endl;
       std::cout << "Partition: " << partition_schema.PartitionDebugString(partition, schema)
                 << std::endl;
-      if (ts.has_estimated_on_disk_size()) {
-        std::cout << "Estimated on disk size: " <<
-            HumanReadableNumBytes::ToString(ts.estimated_on_disk_size()) << std::endl;
-      }
       std::cout << "Schema: " << schema.ToString() << std::endl;
     }
   } else if (op == kAreTabletsRunningOp) {
@@ -445,7 +436,7 @@ static int TsCliMain(int argc, char** argv) {
       TabletStatusPB ts = status_and_schema.tablet_status();
       if (ts.state() != tablet::RUNNING) {
         std::cout << "Tablet id: " << ts.tablet_id() << " is "
-                  << tablet::TabletStatePB_Name(ts.state()) << std::endl;
+                  << tablet::RaftGroupStatePB_Name(ts.state()) << std::endl;
         all_running = false;
       }
     }
@@ -490,6 +481,14 @@ static int TsCliMain(int argc, char** argv) {
     RETURN_NOT_OK_PREPEND_FROM_MAIN(client.GetStatus(&status),
                                     "Unable to get status");
     std::cout << status.DebugString() << std::endl;
+  } else if (op == kCountIntents) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+    int64_t num_intents = 0;
+
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.CountIntents(&num_intents),
+                                    "Unable to count intents");
+
+    std::cout << num_intents << std::endl;
   } else {
     std::cerr << "Invalid operation: " << op << std::endl;
     google::ShowUsageWithFlagsRestrict(argv[0], __FILE__);

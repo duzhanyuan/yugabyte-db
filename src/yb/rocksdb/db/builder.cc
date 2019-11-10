@@ -42,16 +42,17 @@
 #include "yb/rocksdb/table/block_based_table_builder.h"
 #include "yb/rocksdb/table/internal_iterator.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/rocksdb/util/iostats_context_imp.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/thread_status_util.h"
+
+#include "yb/util/stats/iostats_context_imp.h"
 
 namespace rocksdb {
 
 class TableFactory;
 
 TableBuilder* NewTableBuilder(const ImmutableCFOptions& ioptions,
-                              const InternalKeyComparator& internal_comparator,
+                              const InternalKeyComparatorPtr& internal_comparator,
                               const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
                               uint32_t column_family_id,
                               WritableFileWriter* file,
@@ -66,7 +67,7 @@ TableBuilder* NewTableBuilder(const ImmutableCFOptions& ioptions,
 }
 
 TableBuilder* NewTableBuilder(const ImmutableCFOptions& ioptions,
-                              const InternalKeyComparator& internal_comparator,
+                              const InternalKeyComparatorPtr& internal_comparator,
                               const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
                               uint32_t column_family_id,
                               WritableFileWriter* metadata_file,
@@ -103,7 +104,7 @@ Status BuildTable(const std::string& dbname,
                   TableCache* table_cache,
                   InternalIterator* iter,
                   FileMetaData* meta,
-                  const InternalKeyComparator& internal_comparator,
+                  const InternalKeyComparatorPtr& internal_comparator,
                   const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
                   uint32_t column_family_id,
                   std::vector<SequenceNumber> snapshots,
@@ -142,13 +143,13 @@ Status BuildTable(const std::string& dbname,
         column_family_id, base_file_writer.get(), data_file_writer.get(), compression,
         compression_opts));
 
-    MergeHelper merge(env, internal_comparator.user_comparator(),
+    MergeHelper merge(env, internal_comparator->user_comparator(),
                       ioptions.merge_operator, nullptr, ioptions.info_log,
                       ioptions.min_partial_merge_operands,
                       true /* internal key corruption is not ok */,
                       snapshots.empty() ? 0 : snapshots.back());
 
-    CompactionIterator c_iter(iter, internal_comparator.user_comparator(),
+    CompactionIterator c_iter(iter, internal_comparator->user_comparator(),
                               &merge, kMaxSequenceNumber, &snapshots,
                               earliest_write_conflict_snapshot, env,
                               true /* internal key corruption is not ok */);

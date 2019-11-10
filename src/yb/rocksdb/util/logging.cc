@@ -27,12 +27,12 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include <cmath>
 #include <inttypes.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <cmath>
 #include "yb/rocksdb/env.h"
 #include "yb/util/slice.h"
 
@@ -91,6 +91,10 @@ void AppendNumberTo(std::string* str, uint64_t num) {
   str->append(buf);
 }
 
+void AppendBoolTo(std::string* str, const bool b) {
+  str->append(b ? "true" : "false");
+}
+
 void AppendEscapedStringTo(std::string* str, const Slice& value) {
   for (size_t i = 0; i < value.size(); i++) {
     char c = value[i];
@@ -112,7 +116,7 @@ std::string NumberToString(uint64_t num) {
 }
 
 std::string NumberToHumanString(int64_t num) {
-  char buf[16];
+  char buf[24];
   int64_t absnum = num < 0 ? -num : num;
   if (absnum < 10000) {
     snprintf(buf, sizeof(buf), "%" PRIi64, num);

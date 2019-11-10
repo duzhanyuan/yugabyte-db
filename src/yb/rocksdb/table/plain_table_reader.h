@@ -17,8 +17,8 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_TABLE_PLAIN_TABLE_READER_H
-#define ROCKSDB_TABLE_PLAIN_TABLE_READER_H
+#ifndef YB_ROCKSDB_TABLE_PLAIN_TABLE_READER_H
+#define YB_ROCKSDB_TABLE_PLAIN_TABLE_READER_H
 
 #ifndef ROCKSDB_LITE
 #include <stdint.h>
@@ -33,9 +33,12 @@
 #include "yb/rocksdb/slice_transform.h"
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/table_properties.h"
+
+#include "yb/rocksdb/table/format.h"
 #include "yb/rocksdb/table/table_reader.h"
 #include "yb/rocksdb/table/plain_table_factory.h"
 #include "yb/rocksdb/table/plain_table_index.h"
+
 #include "yb/rocksdb/util/arena.h"
 #include "yb/rocksdb/util/dynamic_bloom.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
@@ -47,7 +50,6 @@ struct BlockContents;
 class BlockHandle;
 class Footer;
 struct Options;
-class RandomAccessFile;
 struct ReadOptions;
 class TableCache;
 class TableReader;
@@ -87,7 +89,7 @@ class PlainTableReader: public TableReader {
  public:
   static Status Open(const ImmutableCFOptions& ioptions,
                      const EnvOptions& env_options,
-                     const InternalKeyComparator& internal_comparator,
+                     const InternalKeyComparatorPtr& internal_comparator,
                      unique_ptr<RandomAccessFileReader>&& file,
                      uint64_t file_size, unique_ptr<TableReader>* table,
                      const int bloom_bits_per_key, double hash_table_ratio,
@@ -122,7 +124,7 @@ class PlainTableReader: public TableReader {
   PlainTableReader(const ImmutableCFOptions& ioptions,
                    unique_ptr<RandomAccessFileReader>&& file,
                    const EnvOptions& env_options,
-                   const InternalKeyComparator& internal_comparator,
+                   const InternalKeyComparatorPtr& internal_comparator,
                    EncodingType encoding_type, uint64_t file_size,
                    const TableProperties* table_properties);
   virtual ~PlainTableReader();
@@ -147,7 +149,7 @@ class PlainTableReader: public TableReader {
   Status MmapDataIfNeeded();
 
  private:
-  const InternalKeyComparator internal_comparator_;
+  InternalKeyComparatorPtr internal_comparator_;
   EncodingType encoding_type_;
   // represents plain table's current status.
   Status status_;
@@ -168,12 +170,14 @@ class PlainTableReader: public TableReader {
   DynamicBloom bloom_;
   PlainTableReaderFileInfo file_info_;
   Arena arena_;
-  std::unique_ptr<char[]> index_block_alloc_;
-  std::unique_ptr<char[]> bloom_block_alloc_;
+  TrackedAllocation index_block_alloc_;
+  TrackedAllocation bloom_block_alloc_;
 
   const ImmutableCFOptions& ioptions_;
   uint64_t file_size_;
   std::shared_ptr<const TableProperties> table_properties_;
+  std::shared_ptr<yb::MemTracker> mem_tracker_;
+  size_t tracked_consumption_ = 0;
 
   bool IsFixedLength() const {
     return user_key_len_ != kPlainTableVariableLength;
@@ -252,4 +256,4 @@ class PlainTableReader: public TableReader {
 }  // namespace rocksdb
 #endif  // ROCKSDB_LITE
 
-#endif  // ROCKSDB_TABLE_PLAIN_TABLE_READER_H
+#endif  // YB_ROCKSDB_TABLE_PLAIN_TABLE_READER_H

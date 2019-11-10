@@ -24,7 +24,10 @@
 #endif
 
 #include <inttypes.h>
+
 #include <string>
+#include <sstream>
+
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/db/version_set.h"
@@ -34,6 +37,9 @@
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/log_buffer.h"
 #include "yb/rocksdb/util/thread_status_util.h"
+
+using yb::Result;
+using std::ostringstream;
 
 namespace rocksdb {
 
@@ -250,13 +256,38 @@ bool MemTableList::IsFlushPending() const {
 }
 
 // Returns the memtables that need to be flushed.
-void MemTableList::PickMemtablesToFlush(autovector<MemTable*>* ret) {
+void MemTableList::PickMemtablesToFlush(autovector<MemTable*>* ret, const MemTableFilter& filter) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_PICK_MEMTABLES_TO_FLUSH);
   const auto& memlist = current_->memlist_;
+  bool all_memtables_logged = false;
   for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
     MemTable* m = *it;
     if (!m->flush_in_progress_) {
+      if (filter) {
+        Result<bool> filter_result = filter(*m);
+        if (filter_result.ok()) {
+          if (!filter_result.get()) {
+            // The filter succeeded and said that this memtable cannot be flushed yet.
+            continue;
+          }
+        } else {
+          // This failure usually means that there is an empty immutable memtable. We need to output
+          // additional diagnostics in that case.
+          ostringstream ss;
+          if (!all_memtables_logged) {
+            ss << ". All memtables:\n";
+            for (const MemTable* memtable_for_logging : memlist) {
+              ss << "  " << memtable_for_logging->ToString() << "\n";
+            }
+            all_memtables_logged = true;
+          }
+          LOG(ERROR) << "Failed when checking if memtable can be flushed (will still flush it): "
+                     << filter_result.status() << ". Memtable: " << m->ToString()
+                     << ss.str();
+          // Still flush the memtable so that this error does not keep occurring.
+        }
+      }
       assert(!m->flush_completed_);
       num_flush_not_started_--;
       if (num_flush_not_started_ == 0) {
@@ -294,29 +325,31 @@ Status MemTableList::InstallMemtableFlushResults(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
     const autovector<MemTable*>& mems, VersionSet* vset, InstrumentedMutex* mu,
     uint64_t file_number, autovector<MemTable*>* to_delete,
-    Directory* db_directory, LogBuffer* log_buffer) {
+    Directory* db_directory, LogBuffer* log_buffer, const FileNumbersHolder& file_number_holder) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS);
   mu->AssertHeld();
 
   // flush was successful
-  OpId last_op_id;
+  std::unique_ptr<UserFrontiers> frontiers;
   for (size_t i = 0; i < mems.size(); ++i) {
     // All the edits are associated with the first memtable of this batch.
-    assert(i == 0 || mems[i]->GetEdits()->NumEntries() == 0);
+    DCHECK(i == 0 || mems[i]->GetEdits()->NumEntries() == 0);
 
     mems[i]->flush_completed_ = true;
-    auto op_id = mems[i]->LastOpId();
-    if (op_id) {
-      DCHECK_GE(op_id.term, last_op_id.term);
-      DCHECK_GT(op_id.index, last_op_id.index);
-      last_op_id = op_id;
+    auto temp_range = mems[i]->Frontiers();
+    if (temp_range) {
+      if (frontiers) {
+        frontiers->MergeFrontiers(*temp_range);
+      } else {
+        frontiers = temp_range->Clone();
+      }
     }
+    mems[i]->file_number_holder_ = file_number_holder;
     mems[i]->file_number_ = file_number;
   }
-  if (last_op_id) {
-    DCHECK_NE(0, mems[0]->edit_.GetNewFiles().size());
-    mems[0]->edit_.SetFlushedOpId(last_op_id);
+  if (frontiers) {
+    mems[0]->edit_.UpdateFlushedFrontier(frontiers->Largest().Clone());
   }
 
   // if some other thread is already committing, then return
@@ -328,8 +361,8 @@ Status MemTableList::InstallMemtableFlushResults(
   // Only a single thread can be executing this piece of code
   commit_in_progress_ = true;
 
-  // scan all memtables from the earliest, and commit those
-  // (in that order) that have finished flushing. Memetables
+  // Scan all memtables from the earliest, and commit those
+  // (in that order) that have finished flushing. Memtables
   // are always committed in the order that they were created.
   while (!current_->memlist_.empty() && s.ok()) {
     MemTable* m = current_->memlist_.back();  // get the last element
@@ -367,6 +400,7 @@ Status MemTableList::InstallMemtableFlushResults(
         m->edit_.Clear();
         num_flush_not_started_++;
         m->file_number_ = 0;
+        m->file_number_holder_.Reset();
         imm_flush_needed.store(true, std::memory_order_release);
       }
       ++mem_id;

@@ -16,6 +16,7 @@
 #include <boost/functional/hash/hash.hpp>
 
 #include "yb/master/master_defaults.h"
+#include "yb/master/master_util.h"
 #include "yb/master/master.pb.h"
 
 namespace yb {
@@ -26,16 +27,48 @@ DEFINE_bool(yb_system_namespace_readonly, true, "Set system keyspace read-only."
 using std::string;
 
 void YBTableName::SetIntoTableIdentifierPB(master::TableIdentifierPB* id) const {
+  SetIntoNamespaceIdentifierPB(id->mutable_namespace_());
   id->set_table_name(table_name());
-  id->mutable_namespace_()->set_name(resolved_namespace_name());
+  if (!table_id_.empty()) {
+    id->set_table_id(table_id_);
+  } else {
+    id->clear_table_id();
+  }
 }
 
-bool YBTableName::IsSystemNamespace(const std::string& namespace_name) {
-  return (namespace_name == master::kSystemNamespaceName            ||
-          namespace_name == master::kSystemAuthNamespaceName        ||
-          namespace_name == master::kSystemDistributedNamespaceName ||
-          namespace_name == master::kSystemSchemaNamespaceName      ||
-          namespace_name == master::kSystemTracesNamespaceName);
+void YBTableName::GetFromTableIdentifierPB(const master::TableIdentifierPB& id) {
+  GetFromNamespaceIdentifierPB(id.namespace_());
+  table_name_ = id.table_name();
+  if (id.has_table_id()) {
+    table_id_ = id.table_id();
+  } else {
+    table_id_.clear();
+  }
+}
+
+void YBTableName::SetIntoNamespaceIdentifierPB(master::NamespaceIdentifierPB* id) const {
+  if (!namespace_id_.empty()) {
+    id->set_id(namespace_id_);
+    if (!has_namespace()) {
+      return;
+    }
+  } else {
+    id->clear_id();
+  }
+  id->set_name(resolved_namespace_name());
+}
+
+void YBTableName::GetFromNamespaceIdentifierPB(const master::NamespaceIdentifierPB& id) {
+  namespace_name_ = id.name();
+  if (id.has_id()) {
+    namespace_id_ = id.id();
+  } else {
+    namespace_id_.clear();
+  }
+}
+
+bool YBTableName::is_system() const {
+  return master::IsSystemNamespace(resolved_namespace_name());
 }
 
 size_t hash_value(const YBTableName& table_name) {

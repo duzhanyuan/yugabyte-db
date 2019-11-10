@@ -13,12 +13,6 @@
 
 package org.yb.client;
 
-import java.util.Comparator;
-import java.util.List;
-import java.util.TreeSet;
-
-import org.yb.annotations.InterfaceAudience;
-import org.yb.Common.HostPortPB;
 import org.yb.master.Master;
 
 // This provides the wrapper to read-modify the replication factor.

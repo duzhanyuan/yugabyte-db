@@ -28,7 +28,8 @@
 #include "yb/rocksdb/db/column_family.h"
 #include "yb/rocksdb/port/stack_trace.h"
 #include "yb/rocksdb/utilities/write_batch_with_index.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
+#include "yb/rocksdb/util/random.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/utilities/merge_operators.h"
 #include "yb/rocksdb/utilities/merge_operators/string_append/stringappend.h"
@@ -254,7 +255,7 @@ void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
 
   // Verify WriteBatch can be iterated
   TestHandler handler;
-  batch->GetWriteBatch()->Iterate(&handler);
+  ASSERT_OK(batch->GetWriteBatch()->Iterate(&handler));
 
   // Verify data column family
   {

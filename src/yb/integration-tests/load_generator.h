@@ -22,21 +22,21 @@
 #include <set>
 #include <string>
 
-#include "cpp_redis/redis_client.hpp"
-#include "cpp_redis/reply.hpp"
-#include "yb/client/client.h"
-
+#include "yb/client/client_fwd.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/test_util.h"
 
-using cpp_redis::RedisClient;
-using cpp_redis::RedisReply;
-using std::shared_ptr;
-
 namespace yb {
+
+namespace redisserver {
+class RedisClient;
+}
+
 namespace load_generator {
+
+using redisserver::RedisClient;
 
 class SingleThreadedReader;
 class SingleThreadedWriter;
@@ -70,20 +70,20 @@ class SessionFactory {
 
 class YBSessionFactory : public SessionFactory {
  public:
-  YBSessionFactory(yb::client::YBClient* client, yb::client::YBTable* table);
+  YBSessionFactory(yb::client::YBClient* client, yb::client::TableHandle* table);
 
   virtual string ClientId() override;
   SingleThreadedWriter* GetWriter(MultiThreadedWriter* writer, int idx) override;
   SingleThreadedReader* GetReader(MultiThreadedReader* reader, int idx) override;
 
  protected:
-  yb::client::YBClient* client_;
-  yb::client::YBTable* table_;
+  yb::client::YBClient* const client_;
+  yb::client::TableHandle* table_;
 };
 
 class NoopSessionFactory : public YBSessionFactory {
  public:
-  NoopSessionFactory(yb::client::YBClient* client, yb::client::YBTable* table)
+  NoopSessionFactory(yb::client::YBClient* client, yb::client::TableHandle* table)
       : YBSessionFactory(client, table) {}
 
   SingleThreadedWriter* GetWriter(MultiThreadedWriter* writer, int idx) override;
@@ -124,6 +124,7 @@ class MultiThreadedAction {
   void Stop() { stop_requested_->store(true); }
   bool IsStopRequested() { return stop_requested_->load(); }
   void set_client_id(const std::string& client_id) { client_id_ = client_id; }
+  bool IsRunning() { return running_threads_latch_.count() > 0; }
 
  protected:
   friend class SingleThreadedReader;
@@ -148,6 +149,7 @@ class MultiThreadedAction {
   yb::CountDownLatch running_threads_latch_;
 
   std::atomic_bool* const stop_requested_;
+  std::atomic<bool> paused_ { false };
 
   const int value_size_;
 };
@@ -166,7 +168,7 @@ class MultiThreadedWriter : public MultiThreadedAction {
       int64_t num_keys, int64_t start_key, int num_writer_threads, SessionFactory* session_factory,
       std::atomic_bool* stop_flag, int value_size, int max_num_write_errors);
 
-  virtual void Start() override;
+  void Start() override;
   std::atomic<int64_t>* InsertionPoint() { return &inserted_up_to_inclusive_; }
   const KeyIndexSet* InsertedKeys() const { return &inserted_keys_; }
   const KeyIndexSet* FailedKeys() const { return &failed_keys_; }
@@ -174,6 +176,8 @@ class MultiThreadedWriter : public MultiThreadedAction {
   int64_t num_writes() { return next_key_.load() - start_key_; }
   int num_write_errors() { return failed_keys_.NumElements(); }
   void AssertSucceeded() { ASSERT_EQ(num_write_errors(), 0); }
+
+  void set_pause_flag(std::atomic<bool>* pause_flag) { pause_flag_ = pause_flag; }
 
  private:
   friend class SingleThreadedWriter;
@@ -193,7 +197,8 @@ class MultiThreadedWriter : public MultiThreadedAction {
   std::atomic<int64_t> next_key_;
   std::atomic<int64_t> inserted_up_to_inclusive_;
 
-  int max_num_write_errors_;
+  int max_num_write_errors_ = 0;
+  std::atomic<bool>* pause_flag_ = nullptr;
 };
 
 class SingleThreadedWriter {
@@ -201,7 +206,7 @@ class SingleThreadedWriter {
   SingleThreadedWriter(MultiThreadedWriter* writer, int writer_index)
       : multi_threaded_writer_(writer), writer_index_(writer_index) {}
   virtual ~SingleThreadedWriter() {}
-
+  void set_pause_flag(std::atomic<bool>* pause_flag) { pause_flag_ = pause_flag; }
   void Run();
 
  protected:
@@ -215,19 +220,21 @@ class SingleThreadedWriter {
 
   // Returns true if the calling writer thread should stop.
   virtual void HandleInsertionFailure(int64_t key_index, const string& key_str) = 0;
+
+  std::atomic<bool>* pause_flag_ = nullptr;
 };
 
 class YBSingleThreadedWriter : public SingleThreadedWriter {
  public:
   YBSingleThreadedWriter(
-      MultiThreadedWriter* writer, client::YBClient* client, client::YBTable* table,
+      MultiThreadedWriter* writer, client::YBClient* client, client::TableHandle* table,
       int writer_index)
       : SingleThreadedWriter(writer, writer_index), client_(client), table_(table) {}
 
  protected:
-  client::YBClient* client_;
-  client::YBTable* table_;
-  shared_ptr<client::YBSession> session_;
+  client::YBClient* const client_;
+  client::TableHandle* table_;
+  std::shared_ptr<client::YBSession> session_;
 
  private:
   virtual bool Write(int64_t key_index, const string& key_str, const string& value_str) override;
@@ -239,7 +246,7 @@ class YBSingleThreadedWriter : public SingleThreadedWriter {
 class NoopSingleThreadedWriter : public YBSingleThreadedWriter {
  public:
   NoopSingleThreadedWriter(
-      MultiThreadedWriter* reader, client::YBClient* client, client::YBTable* table,
+      MultiThreadedWriter* reader, client::YBClient* client, client::TableHandle* table,
       int reader_index) : YBSingleThreadedWriter(reader, client, table, reader_index) {}
 
  private:
@@ -258,7 +265,7 @@ class RedisSingleThreadedWriter : public SingleThreadedWriter {
   virtual void CloseSession() override;
   virtual void HandleInsertionFailure(int64_t key_index, const string& key_str) override;
 
-  vector<shared_ptr<RedisClient>> clients_;
+  std::vector<std::shared_ptr<RedisClient>> clients_;
   const string redis_server_addresses_;
 };
 
@@ -278,13 +285,12 @@ class RedisNoopSingleThreadedWriter : public RedisSingleThreadedWriter {
 // TODO: create a multi-threaded version of this.
 class SingleThreadedScanner {
  public:
-  explicit SingleThreadedScanner(yb::client::YBTable* table);
+  explicit SingleThreadedScanner(client::TableHandle* table);
 
   int64_t CountRows();
 
  private:
-  yb::client::YBTable* table_;
-  int64_t num_rows_;
+  client::TableHandle* table_;
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -296,12 +302,12 @@ enum class ReadStatus { OK, NO_ROWS, OTHER_ERROR };
 class MultiThreadedReader : public MultiThreadedAction {
  public:
   MultiThreadedReader(int64_t num_keys, int num_reader_threads,
-                        SessionFactory* session_factory,
-                        std::atomic<int64_t>* insertion_point,
-                        const KeyIndexSet* inserted_keys,
-                        const KeyIndexSet* failed_keys,
-                        std::atomic_bool* stop_flag, int value_size,
-                        int max_num_read_errors, bool stop_on_empty_read);
+                      SessionFactory* session_factory,
+                      std::atomic<int64_t>* insertion_point,
+                      const KeyIndexSet* inserted_keys,
+                      const KeyIndexSet* failed_keys,
+                      std::atomic_bool* stop_flag, int value_size,
+                      int max_num_read_errors, bool stop_on_empty_read);
 
   void IncrementReadErrorCount(ReadStatus read_status);
 
@@ -352,14 +358,14 @@ class SingleThreadedReader {
 class YBSingleThreadedReader : public SingleThreadedReader {
  public:
   YBSingleThreadedReader(
-      MultiThreadedReader* reader, client::YBClient* client, client::YBTable* table,
+      MultiThreadedReader* reader, client::YBClient* client, client::TableHandle* table,
       int reader_index)
       : SingleThreadedReader(reader, reader_index), client_(client), table_(table) {}
 
  protected:
-  client::YBClient* client_;
-  client::YBTable* table_;
-  shared_ptr<client::YBSession> session_;
+  client::YBClient* const client_;
+  client::TableHandle* table_;
+  std::shared_ptr<client::YBSession> session_;
 
  private:
   virtual ReadStatus PerformRead(
@@ -380,8 +386,8 @@ class RedisSingleThreadedReader : public SingleThreadedReader {
   virtual void ConfigureSession() override;
   virtual void CloseSession() override;
 
-  vector<shared_ptr<RedisClient>> clients_;
-  const string redis_server_addresses_;
+  std::vector<std::shared_ptr<RedisClient>> clients_;
+  const std::string redis_server_addresses_;
 };
 
 }  // namespace load_generator

@@ -54,6 +54,7 @@ import com.stumbleupon.async.Deferred;
 
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.yb.Common;
+import org.yb.Common.YQLDatabase;
 import org.yb.Schema;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.annotations.InterfaceStability;
@@ -73,11 +74,23 @@ import org.jboss.netty.channel.socket.SocketChannel;
 import org.jboss.netty.channel.socket.SocketChannelConfig;
 import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
 import org.jboss.netty.handler.timeout.ReadTimeoutHandler;
+import org.jboss.netty.handler.ssl.SslHandler;
 import org.jboss.netty.util.HashedWheelTimer;
 import org.jboss.netty.util.Timeout;
 import org.jboss.netty.util.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.security.KeyStore;
+
+import java.io.FileInputStream;
 
 import javax.annotation.concurrent.GuardedBy;
 import java.net.InetAddress;
@@ -101,7 +114,6 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static org.yb.client.ExternalConsistencyMode.CLIENT_PROPAGATED;
 
 /**
  * A fully asynchronous and thread-safe client for YB.
@@ -210,9 +222,6 @@ public class AsyncYBClient implements AutoCloseable {
   private final HashMap<String, TabletClient> ip2client =
       new HashMap<String, TabletClient>();
 
-  @GuardedBy("sessions")
-  private final Set<AsyncYBSession> sessions = new HashSet<AsyncYBSession>();
-
   // Since the masters also go through TabletClient, we need to treat them as if they were a normal
   // table. We'll use the following fake table name to identify places where we need special
   // handling.
@@ -251,6 +260,8 @@ public class AsyncYBClient implements AutoCloseable {
 
   private final long defaultSocketReadTimeoutMs;
 
+  private final String certFile;
+
   private volatile boolean closed;
 
   private AsyncYBClient(AsyncYBClientBuilder b) {
@@ -260,6 +271,7 @@ public class AsyncYBClient implements AutoCloseable {
         MASTER_TABLE_NAME_PLACEHOLDER, null, null);
     this.defaultOperationTimeoutMs = b.defaultOperationTimeoutMs;
     this.defaultAdminOperationTimeoutMs = b.defaultAdminOperationTimeoutMs;
+    this.certFile = b.certFile;
     this.defaultSocketReadTimeoutMs = b.defaultSocketReadTimeoutMs;
   }
 
@@ -297,48 +309,143 @@ public class AsyncYBClient implements AutoCloseable {
     return d;
   }
 
+  public Deferred<SetFlagResponse> setFlag(final HostAndPort hp, String flag, String value) {
+    checkIsClosed();
+    TabletClient client = newSimpleClient(hp);
+    if (client == null) {
+      throw new IllegalStateException("Could not create a client to " + hp.toString());
+    }
+    SetFlagRequest rpc = new SetFlagRequest(flag, value);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    Deferred<SetFlagResponse> d = rpc.getDeferred();
+    rpc.attempt++;
+    client.sendRpc(rpc);
+    return d;
+  }
+
+  public Deferred<GetMasterAddressesResponse> getMasterAddresses(final HostAndPort hp) {
+    checkIsClosed();
+    TabletClient client = newSimpleClient(hp);
+    if (client == null) {
+      throw new IllegalStateException("Could not create a client to " + hp.toString());
+    }
+    GetMasterAddressesRequest rpc = new GetMasterAddressesRequest();
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    Deferred<GetMasterAddressesResponse> d = rpc.getDeferred();
+    rpc.attempt++;
+    client.sendRpc(rpc);
+    return d;
+  }
+
+  /**
+   * Create for a given table and stream.
+   * @param hp host port of the server.
+   * @param tableId the table id to subscribe to.
+   * @return a deferred object for the response from server.
+   */
+  public Deferred<CreateCDCStreamResponse> createCDCStream(final HostAndPort hp, String tableId) {
+    checkIsClosed();
+    TabletClient client = newSimpleClient(hp);
+    if (client == null) {
+      throw new IllegalStateException("Could not create a client to " + hp.toString());
+    }
+    CreateCDCStreamRequest rpc = new CreateCDCStreamRequest(this.masterTable, tableId);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    Deferred<CreateCDCStreamResponse> d = rpc.getDeferred();
+    rpc.attempt++;
+    client.sendRpc(rpc);
+    return d;
+  }
+
+  /**
+   * Get changes for a given tablet and stream.
+   * @param hp host port of the server.
+   * @param table the table to get changes for.
+   * @param streamId the stream to get changes for.
+   * @param tabletId the tablet to get changes for.
+   * @param term the leader term to start getting changes for.
+   * @param index the log index to start get changes for.
+   * @param cb the callback to call once the RPC returns.
+   * @return a deferred object for the response from server.
+   */
+  public Deferred<Void> getChanges(
+          HostAndPort hp, YBTable table, String streamId, String tabletId, long term,
+          long index, Callback<Void, GetChangesResponse> cb) {
+    checkIsClosed();
+    TabletClient client = newSimpleClient(hp);
+    if (client == null) {
+      throw new IllegalStateException("Could not create a client to " + hp.toString());
+    }
+    GetChangesRequest rpc = new GetChangesRequest(table, streamId, tabletId, term, index);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    Deferred<GetChangesResponse> d = rpc.getDeferred();
+    client.sendRpc(rpc);
+    return d.addCallback(cb);
+  }
+
+  /**
+   * Check if the server is ready to serve requests.
+   * @param hp host port of the server.
+   * @param isTserver true if host/port is for tserver, else its master.
+   * @return a deferred object for the response from server.
+   */
+  public Deferred<IsServerReadyResponse> isServerReady(final HostAndPort hp, boolean isTserver) {
+    checkIsClosed();
+    TabletClient client = newSimpleClient(hp);
+    if (client == null) {
+      throw new IllegalStateException("Could not create a client to " + hp.toString());
+    }
+
+    IsServerReadyRequest rpc =
+        isTserver ? new IsTabletServerReadyRequest() : new IsMasterReadyRequest();
+    // TODO: Allow these two to be paramters in all such user API's.
+    rpc.maxAttempts = 1;
+    rpc.setTimeoutMillis(5000);
+
+    Deferred<IsServerReadyResponse> d = rpc.getDeferred();
+    rpc.attempt++;
+    client.sendRpc(rpc);
+    return d;
+  }
+
   /**
    * Create a table on the cluster with the specified name and schema. Default table
    * configurations are used, mainly the table will have one tablet.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name
    * @param schema the table's schema
    * @return a deferred object to track the progress of the createTable command that gives
    * an object to communicate with the created table
    */
-  public Deferred<YBTable> createTable(String name, Schema schema) {
-    return this.createTable(name, schema, new CreateTableOptions(), null);
+  public Deferred<YBTable> createTable(String keyspace, String name, Schema schema) {
+    return this.createTable(keyspace, name, schema, new CreateTableOptions());
   }
 
   /**
    * Create a table on the cluster with the specified name, schema, and table configurations.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name
    * @param schema the table's schema
    * @param builder a builder containing the table's configurations
    * @return a deferred object to track the progress of the createTable command that gives
    * an object to communicate with the created table
    */
-  public Deferred<YBTable> createTable(final String name,
+  public Deferred<YBTable> createTable(final String keyspace,
+                                       final String name,
                                        Schema schema,
                                        CreateTableOptions builder) {
-    return createTable(name, schema, builder, null);
-  }
-
-  public Deferred<YBTable> createTable(final String name,
-                                       Schema schema,
-                                       CreateTableOptions builder,
-                                       final String keySpace) {
     checkIsClosed();
     if (builder == null) {
       builder = new CreateTableOptions();
     }
     CreateTableRequest create = new CreateTableRequest(this.masterTable, name, schema,
-        builder, keySpace);
+        builder, keyspace);
     create.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(create).addCallbackDeferring(
         new Callback<Deferred<YBTable>, CreateTableResponse>() {
       @Override
       public Deferred<YBTable> call(CreateTableResponse createTableResponse) throws Exception {
-        return openTable(name, keySpace);
+        return openTable(keyspace, name);
       }
     });
   }
@@ -347,21 +454,35 @@ public class AsyncYBClient implements AutoCloseable {
    * Create a CQL keyspace.
    * @param name of the keyspace.
    */
-  public Deferred<CreateKeyspaceResponse> createKeyspace(String keySpace)
+  public Deferred<CreateKeyspaceResponse> createKeyspace(String keyspace)
       throws Exception {
     checkIsClosed();
-    CreateKeyspaceRequest keyspace = new CreateKeyspaceRequest(this.masterTable, keySpace);
-    keyspace.setTimeoutMillis(defaultAdminOperationTimeoutMs);
-    return sendRpcToTablet(keyspace);
+    CreateKeyspaceRequest request = new CreateKeyspaceRequest(this.masterTable, keyspace);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
+  }
+
+  /*
+   * Create a keyspace (namespace) for the specified database type.
+   * @param name of the keyspace.
+   */
+  public Deferred<CreateKeyspaceResponse> createKeyspace(String keyspace, YQLDatabase databaseType)
+      throws Exception {
+    checkIsClosed();
+    CreateKeyspaceRequest request = new CreateKeyspaceRequest(this.masterTable,
+                                                              keyspace,
+                                                              databaseType);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(request);
   }
 
   /**
    * Delete a table on the cluster with the specified name.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name
-   * @param keyspace CQL keyspace to which this table belongs, if available
    * @return a deferred object to track the progress of the deleteTable command
    */
-  public Deferred<DeleteTableResponse> deleteTable(final String name, final String keyspace) {
+  public Deferred<DeleteTableResponse> deleteTable(final String keyspace, final String name) {
     checkIsClosed();
     DeleteTableRequest delete = new DeleteTableRequest(this.masterTable, name, keyspace);
     delete.setTimeoutMillis(defaultAdminOperationTimeoutMs);
@@ -373,13 +494,15 @@ public class AsyncYBClient implements AutoCloseable {
    *
    * When the returned deferred completes it only indicates that the master accepted the alter
    * command, use {@link AsyncYBClient#isAlterTableDone(String)} to know when the alter finishes.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name, if this is a table rename then the old table name must be passed
    * @param ato the alter table builder
    * @return a deferred object to track the progress of the alter command
    */
-  public Deferred<AlterTableResponse> alterTable(String name, AlterTableOptions ato) {
+  public Deferred<AlterTableResponse> alterTable(String keyspace, String name,
+                                                 AlterTableOptions ato) {
     checkIsClosed();
-    AlterTableRequest alter = new AlterTableRequest(this.masterTable, name, ato);
+    AlterTableRequest alter = new AlterTableRequest(this.masterTable, name, ato, keyspace);
     alter.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(alter);
   }
@@ -387,12 +510,14 @@ public class AsyncYBClient implements AutoCloseable {
   /**
    * Helper method that checks and waits until the completion of an alter command.
    * It will block until the alter command is done or the deadline is reached.
+   * @param keyspace CQL keyspace to which this table belongs
    * @param name the table's name, if the table was renamed then that name must be checked against
    * @return a deferred object to track the progress of the isAlterTableDone command
    */
-  public Deferred<IsAlterTableDoneResponse> isAlterTableDone(String name) throws Exception {
+  public Deferred<IsAlterTableDoneResponse> isAlterTableDone(String keyspace, String name)
+      throws Exception {
     checkIsClosed();
-    IsAlterTableDoneRequest request = new IsAlterTableDoneRequest(this.masterTable, name);
+    IsAlterTableDoneRequest request = new IsAlterTableDoneRequest(this.masterTable, name, keyspace);
     request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(request);
   }
@@ -434,7 +559,8 @@ public class AsyncYBClient implements AutoCloseable {
    * Change the current cluster configuration.
    * @return a deferred object that yields the response to the config change.
    */
-  public Deferred<ChangeMasterClusterConfigResponse> changeMasterClusterConfig(Master.SysClusterConfigEntryPB config) {
+  public Deferred<ChangeMasterClusterConfigResponse> changeMasterClusterConfig(
+      Master.SysClusterConfigEntryPB config) {
     checkIsClosed();
     ChangeMasterClusterConfigRequest rpc = new ChangeMasterClusterConfigRequest(
         this.masterTable, config);
@@ -466,6 +592,17 @@ public class AsyncYBClient implements AutoCloseable {
   }
 
   /**
+   * Get the tablet load move completion percentage for blacklisted nodes.
+   * @return a deferred object that yields the move completion info.
+   */
+  public Deferred<GetLoadMovePercentResponse> getLeaderBlacklistCompletion() {
+    checkIsClosed();
+    GetLeaderBlacklistPercentRequest rpc = new GetLeaderBlacklistPercentRequest(this.masterTable);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
+  /**
    * Check if the tablet load is balanced as per the master leader.
    * @param numServers expected number of servers which need to balanced.
    * @return a deferred object that yields if the load is balanced.
@@ -473,6 +610,38 @@ public class AsyncYBClient implements AutoCloseable {
   public Deferred<IsLoadBalancedResponse> getIsLoadBalanced(int numServers) {
     checkIsClosed();
     IsLoadBalancedRequest rpc = new IsLoadBalancedRequest(this.masterTable, numServers);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
+  /**
+   * Check if the tablet load is balanced as per the master leader.
+   * @return a deferred object that yields if the load is balanced.
+   */
+  public Deferred<IsLoadBalancerIdleResponse> getIsLoadBalancerIdle() {
+    checkIsClosed();
+    IsLoadBalancerIdleRequest rpc = new IsLoadBalancerIdleRequest(this.masterTable);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
+  /**
+   * Check if the tablet leader load is balanced as per the master leader.
+   * @return a deferred object that yields if the leader load is balanced.
+   */
+  public Deferred<AreLeadersOnPreferredOnlyResponse> getAreLeadersOnPreferredOnly() {
+    checkIsClosed();
+    AreLeadersOnPreferredOnlyRequest rpc = new AreLeadersOnPreferredOnlyRequest(this.masterTable);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
+  /**
+   * Check if initdb executed by the master is done running.
+   */
+  public Deferred<IsInitDbDoneResponse> getIsInitDbDone() {
+    checkIsClosed();
+    IsInitDbDoneRequest rpc = new IsInitDbDoneRequest(this.masterTable);
     rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(rpc);
   }
@@ -521,6 +690,20 @@ public class AsyncYBClient implements AutoCloseable {
     return sendRpcToTablet(rpc);
   }
 
+  public Deferred<ChangeEncryptionInfoResponse> enableEncryptionAtRest(String keyFile) {
+    checkIsClosed();
+    ChangeEncryptionInfoRequest rpc = new ChangeEncryptionInfoRequest(this.masterTable, keyFile, true);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
+  public Deferred<ChangeEncryptionInfoResponse> disableEncryptionAtRest() {
+    checkIsClosed();
+    ChangeEncryptionInfoRequest rpc = new ChangeEncryptionInfoRequest(this.masterTable, "", false);
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(rpc);
+  }
+
   /**
    * Change Master Configuration request handler.
    *
@@ -528,37 +711,29 @@ public class AsyncYBClient implements AutoCloseable {
    * @param port        RPC port of the host being added or removed.
    * @param changeUuid  uuid of the master that is being added or removed.
    * @param isAdd       If we are adding or removing the master to the configuration.
+   * @param useHost     If caller wants to use host/port instead of uuid of server being removed.
    *
    * @return a deferred object that yields a change config response.
    */
   public Deferred<ChangeConfigResponse> changeMasterConfig(
-      String host, int port, String changeUuid, boolean isAdd)
+      String host, int port, String changeUuid, boolean isAdd, boolean useHost)
       throws Exception {
     checkIsClosed();
     // The sendRpcToTablet will retry to get the correct leader, so we do not set dest_uuid
     // here. Seemed very intrusive to change request's leader uuid contents during rpc retry.
     ChangeConfigRequest rpc = new ChangeConfigRequest(
-        this.masterTable, host, port, changeUuid, isAdd);
+        this.masterTable, host, port, changeUuid, isAdd, useHost);
     rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(rpc);
   }
 
   /**
    * Get the schema for a specific table given that table's name.
-   * @param name the name of the table to get a schema of.
-   * @return a deferred object that yields the schema of the specified table
-   */
-  private Deferred<GetTableSchemaResponse> getTableSchema(String name) {
-    return getTableSchema(name, null);
-  }
-
-  /**
-   * Get the schema for a specific table given that table's name.
-   * @param name the name of the table to get a schema of.
    * @param keyspace the keyspace name to which this table belongs.
+   * @param name the name of the table to get a schema of.
    * @return a deferred object that yields the schema of the specified table
    */
-  Deferred<GetTableSchemaResponse> getTableSchema(String name, final String keyspace) {
+  Deferred<GetTableSchemaResponse> getTableSchema(String keyspace, String name) {
     GetTableSchemaRequest rpc = new GetTableSchemaRequest(this.masterTable, name, null, keyspace);
     rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(rpc);
@@ -587,24 +762,39 @@ public class AsyncYBClient implements AutoCloseable {
    * Get a list of table names. Passing a null filter returns all the tables. When a filter is
    * specified, it only returns tables that satisfy a substring match.
    * @param nameFilter an optional table name filter
-   * @return a deferred that yields the list of table names
+   * @return a deferred that yields the list of non-system table names
    */
   public Deferred<ListTablesResponse> getTablesList(String nameFilter) {
-    ListTablesRequest rpc = new ListTablesRequest(this.masterTable, nameFilter);
+    return getTablesList(nameFilter, false, null);
+  }
+
+  /**
+   * Get a list of table names. Passing a null filter returns all the tables. When a filter is
+   * specified, it only returns tables that satisfy a substring match.
+   * @param nameFilter an optional table name filter
+   * @param excludeSystemTables an optional filter to search only non-system tables
+   * @param namespace an optional filter to search tables in specific namespace
+   * @return a deferred that yields the list of table names
+   */
+  public Deferred<ListTablesResponse> getTablesList(
+      String nameFilter, boolean excludeSystemTables, String namespace) {
+    ListTablesRequest rpc = new ListTablesRequest(
+      this.masterTable, nameFilter, excludeSystemTables, namespace);
     rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(rpc);
   }
 
   /**
    * Test if a table exists.
+   * @param keyspace the keyspace name to which this table belongs.
    * @param name a non-null table name
    * @return true if the table exists, else false
    */
-  public Deferred<Boolean> tableExists(final String name) {
+  public Deferred<Boolean> tableExists(final String keyspace, final String name) {
     if (name == null) {
       throw new IllegalArgumentException("The table name cannot be null");
     }
-    return getTableSchema(name).addCallbackDeferring(new Callback<Deferred<Boolean>,
+    return getTableSchema(keyspace, name).addCallbackDeferring(new Callback<Deferred<Boolean>,
         GetTableSchemaResponse>() {
       @Override
       public Deferred<Boolean> call(GetTableSchemaResponse response) throws Exception {
@@ -634,26 +824,16 @@ public class AsyncYBClient implements AutoCloseable {
   /**
    * Open the table with the given name. If the table was just created, the Deferred will only get
    * called back when all the tablets have been successfully created.
+   * @param keyspace the keyspace name to which this table belongs.
    * @param name table to open
    * @return a YBTable if the table exists, else a MasterErrorException
    */
-  public Deferred<YBTable> openTable(final String name) {
-    return openTable(name, null);
-  }
-
-  /**
-   * Open the table with the given name. If the table was just created, the Deferred will only get
-   * called back when all the tablets have been successfully created.
-   * @param name table to open
-   * @param keyspace the keyspace name, if available
-   * @return a YBTable if the table exists, else a MasterErrorException
-   */
-  public Deferred<YBTable> openTable(final String name, final String keyspace) {
+  public Deferred<YBTable> openTable(final String keyspace, final String name) {
     checkIsClosed();
 
     final OpenTableHelperRPC helper = new OpenTableHelperRPC();
 
-    return getTableSchema(name, keyspace).addCallbackDeferring(new Callback<Deferred<YBTable>,
+    return getTableSchema(keyspace, name).addCallbackDeferring(new Callback<Deferred<YBTable>,
         GetTableSchemaResponse>() {
       @Override
       public Deferred<YBTable> call(GetTableSchemaResponse response) throws Exception {
@@ -819,115 +999,6 @@ public class AsyncYBClient implements AutoCloseable {
     return defaultSocketReadTimeoutMs;
   }
 
-  /**
-   * Creates a new {@link AsyncYBScanner.AsyncYBScannerBuilder} for a particular table.
-   * @param table the name of the table you intend to scan.
-   * The string is assumed to use the platform's default charset.
-   * @return a new scanner builder for this table
-   */
-  public AsyncYBScanner.AsyncYBScannerBuilder newScannerBuilder(YBTable table) {
-    checkIsClosed();
-    return new AsyncYBScanner.AsyncYBScannerBuilder(this, table);
-  }
-
-  /**
-   * Package-private access point for {@link AsyncYBScanner}s to open themselves.
-   * @param scanner The scanner to open.
-   * @return A deferred {@link AsyncYBScanner.Response}
-   */
-  Deferred<AsyncYBScanner.Response> openScanner(final AsyncYBScanner scanner) {
-    return sendRpcToTablet(scanner.getOpenRequest()).addErrback(
-        new Callback<Exception, Exception>() {
-          public Exception call(final Exception e) {
-            String message = "Cannot openScanner because: ";
-            LOG.warn(message, e);
-            // Don't let the scanner think it's opened on this tablet.
-            scanner.invalidate();
-            return e;  // Let the error propagate.
-          }
-          public String toString() {
-            return "openScanner errback";
-          }
-        });
-  }
-
-  /**
-   * Create a new session for interacting with the cluster.
-   * User is responsible for destroying the session object.
-   * This is a fully local operation (no RPCs or blocking).
-   * @return a new AsyncYBSession
-   */
-  public AsyncYBSession newSession() {
-    checkIsClosed();
-    AsyncYBSession session = new AsyncYBSession(this);
-    synchronized (sessions) {
-      sessions.add(session);
-    }
-    return session;
-  }
-
-  /**
-   * This method is for YBSessions so that they can remove themselves as part of closing down.
-   * @param session Session to remove
-   */
-  void removeSession(AsyncYBSession session) {
-    synchronized (sessions) {
-      boolean removed = sessions.remove(session);
-      assert removed == true;
-    }
-  }
-
-  /**
-   * Package-private access point for {@link AsyncYBScanner}s to scan more rows.
-   * @param scanner The scanner to use.
-   * @return A deferred row.
-   */
-  Deferred<AsyncYBScanner.Response> scanNextRows(final AsyncYBScanner scanner) {
-    final RemoteTablet tablet = scanner.currentTablet();
-    final TabletClient client = clientFor(tablet);
-    final YRpc<AsyncYBScanner.Response> next_request = scanner.getNextRowsRequest();
-    final Deferred<AsyncYBScanner.Response> d = next_request.getDeferred();
-    if (client == null) {
-      // Oops, we no longer know anything about this client or tabletSlice.  Our
-      // cache was probably invalidated while the client was scanning.  This
-      // means that we lost the connection to that TabletServer, so we have to
-      // try to re-connect and check if the scanner is still good.
-      return sendRpcToTablet(next_request);
-    }
-    next_request.attempt++;
-    client.sendRpc(next_request);
-    return d;
-  }
-
-  /**
-   * Package-private access point for {@link AsyncYBScanner}s to close themselves.
-   * @param scanner The scanner to close.
-   * @return A deferred object that indicates the completion of the request.
-   * The {@link AsyncYBScanner.Response} can contain rows that were left to scan.
-   */
-  Deferred<AsyncYBScanner.Response> closeScanner(final AsyncYBScanner scanner) {
-    final RemoteTablet tablet = scanner.currentTablet();
-    // Getting a null tablet here without being in a closed state means we were in between tablets.
-    if (tablet == null) {
-      return Deferred.fromResult(null);
-    }
-
-    final TabletClient client = clientFor(tablet);
-    if (client == null) {
-      // Oops, we no longer know anything about this client or tabletSlice.  Our
-      // cache was probably invalidated while the client was scanning.  So
-      // we can't close this scanner properly.
-      LOG.warn("Cannot close " + scanner + " properly, no connection open for "
-          + (tablet == null ? null : tablet));
-      return Deferred.fromResult(null);
-    }
-    final YRpc<AsyncYBScanner.Response>  close_request = scanner.getCloseRequest();
-    final Deferred<AsyncYBScanner.Response> d = close_request.getDeferred();
-    close_request.attempt++;
-    client.sendRpc(close_request);
-    return d;
-  }
-
   <R> Deferred<R> sendRpcToTablet(final YRpc<R> request) {
     if (cannotRetryRequest(request)) {
       return tooManyAttemptsOrTimeout(request, null);
@@ -943,8 +1014,7 @@ public class AsyncYBClient implements AutoCloseable {
     // Set the propagated timestamp so that the next time we send a message to
     // the server the message includes the last propagated timestamp.
     long lastPropagatedTs = getLastPropagatedTimestamp();
-    if (request.getExternalConsistencyMode() == CLIENT_PROPAGATED &&
-      lastPropagatedTs != NO_TIMESTAMP) {
+    if (lastPropagatedTs != NO_TIMESTAMP) {
       request.setPropagatedTimestamp(lastPropagatedTs);
     }
 
@@ -1216,13 +1286,13 @@ public class AsyncYBClient implements AutoCloseable {
   /**
    * Checks whether or not an RPC can be retried once more.
    * @param rpc The RPC we're going to attempt to execute.
-   * @return {@code true} if this RPC already had too many attempts,
+   * @return {@code true} if this RPC already had too many attempts or ran out of time,
    * {@code false} otherwise (in which case it's OK to retry once more).
    * @throws NonRecoverableException if the request has had too many attempts
    * already.
    */
   static boolean cannotRetryRequest(final YRpc<?> rpc) {
-    return rpc.deadlineTracker.timedOut() || rpc.attempt > 100;  // TODO Don't hardcode.
+    return rpc.deadlineTracker.timedOut() || rpc.attempt >= rpc.maxAttempts;
   }
 
   /**
@@ -1696,7 +1766,7 @@ public class AsyncYBClient implements AutoCloseable {
     checkIsClosed();
     closed = true;
 
-    // This is part of step 3.  We need to execute this in its own thread
+    // This is part of step 2.  We need to execute this in its own thread
     // because Netty gets stuck in an infinite loop if you try to shut it
     // down from within a thread of its own thread pool.  They don't want
     // to fix this so as a workaround we always shut Netty's thread pool
@@ -1711,7 +1781,7 @@ public class AsyncYBClient implements AutoCloseable {
       }
     }
 
-    // 3. Release all other resources.
+    // 2. Release all other resources.
     final class ReleaseResourcesCB implements Callback<ArrayList<Void>, ArrayList<Void>> {
       public ArrayList<Void> call(final ArrayList<Void> arg) {
         LOG.debug("Releasing all remaining resources");
@@ -1724,18 +1794,9 @@ public class AsyncYBClient implements AutoCloseable {
       }
     }
 
-    // 2. Terminate all connections.
-    final class DisconnectCB implements Callback<Deferred<ArrayList<Void>>,
-        ArrayList<List<OperationResponse>>> {
-      public Deferred<ArrayList<Void>> call(final ArrayList<List<OperationResponse>> arg) {
-        return disconnectEverything().addCallback(new ReleaseResourcesCB());
-      }
-      public String toString() {
-        return "disconnect callback";
-      }
-    }
-    // 1. Flush everything.
-    return closeAllSessions().addBothDeferring(new DisconnectCB());
+    // 1. Terminate all connections and flush everything.
+    // Notice that we do not handle the errback, if there's an exception it will come straight out.
+    return disconnectEverything().addCallback(new ReleaseResourcesCB());
   }
 
   private void checkIsClosed() {
@@ -1743,25 +1804,6 @@ public class AsyncYBClient implements AutoCloseable {
       throw new IllegalStateException("Cannot proceed, the client to " + getMasterAddresses() +
                                       " has already been closed.");
     }
-  }
-
-  private Deferred<ArrayList<List<OperationResponse>>> closeAllSessions() {
-    // We create a copy because AsyncYBSession.close will call removeSession which would get us a
-    // concurrent modification during the iteration.
-    Set<AsyncYBSession> copyOfSessions;
-    synchronized (sessions) {
-      copyOfSessions = new HashSet<AsyncYBSession>(sessions);
-    }
-    if (sessions.isEmpty()) {
-      return Deferred.fromResult(null);
-    }
-    // Guaranteed that we'll have at least one session to close.
-    List<Deferred<List<OperationResponse>>> deferreds = new ArrayList<>(copyOfSessions.size());
-    for (AsyncYBSession session : copyOfSessions ) {
-      deferreds.add(session.close());
-    }
-
-    return Deferred.group(deferreds);
   }
 
   /**
@@ -1944,6 +1986,13 @@ public class AsyncYBClient implements AutoCloseable {
 
     TabletClient init(String uuid) {
       final TabletClient client = new TabletClient(AsyncYBClient.this, uuid);
+      if (certFile != null) {
+        SslHandler sslHandler = this.createSslHandler(certFile);
+        if (sslHandler != null) {
+          sslHandler.setIssueHandshake(true);
+          super.addFirst("ssl", sslHandler);
+        }
+      }
       if (defaultSocketReadTimeoutMs > 0) {
         super.addLast("timeout-handler",
             new ReadTimeoutHandler(timer,
@@ -1969,6 +2018,42 @@ public class AsyncYBClient implements AutoCloseable {
         handleDisconnect((ChannelStateEvent) event);
       }
       super.sendUpstream(event);
+    }
+
+    private SslHandler createSslHandler(String certfile) {
+      try {
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        FileInputStream fis = new FileInputStream(certFile);
+        X509Certificate ca;
+        try {
+          ca = (X509Certificate) cf.generateCertificate(fis);
+        } catch (Exception e) {
+          log.error("Exception generating certificate from input file: ", e);
+          return null;
+        } finally {
+          fis.close();
+        }
+
+        // Create a KeyStore containing our trusted CAs
+        String keyStoreType = KeyStore.getDefaultType();
+        KeyStore keyStore = KeyStore.getInstance(keyStoreType);
+        keyStore.load(null, null);
+        keyStore.setCertificateEntry("ca", ca);
+
+        // Create a TrustManager that trusts the CAs in our KeyStore
+        String tmfAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
+        tmf.init(keyStore);
+
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, tmf.getTrustManagers(), null);
+        SSLEngine sslEngine = sslContext.createSSLEngine();
+        sslEngine.setUseClientMode(true);
+        return new SslHandler(sslEngine);
+      } catch (Exception e) {
+        log.error("Exception creating sslContext: ", e);
+        return null;
+      }
     }
 
     private void handleDisconnect(final ChannelStateEvent state_event) {
@@ -2124,14 +2209,16 @@ public class AsyncYBClient implements AutoCloseable {
             new ArrayList<>(tabletLocations.getReplicasCount());
         for (Master.TabletLocationsPB.ReplicaPB replica : tabletLocations.getReplicasList()) {
 
-          List<Common.HostPortPB> addresses = replica.getTsInfo().getRpcAddressesList();
+          List<Common.HostPortPB> addresses = replica.getTsInfo().getBroadcastAddressesList();
+          if (addresses.isEmpty()) {
+            addresses = replica.getTsInfo().getPrivateRpcAddressesList();
+          }
           if (addresses.isEmpty()) {
             LOG.warn("Tablet server for tablet " + getTabletIdAsString() + " doesn't have any " +
                 "address");
             continue;
           }
-          byte[] buf = Bytes.get(replica.getTsInfo().getPermanentUuid());
-          String uuid = Bytes.getString(buf);
+          String uuid = replica.getTsInfo().getPermanentUuid().toStringUtf8();
           // from meta_cache.cc
           // TODO: if the TS advertises multiple host/ports, pick the right one
           // based on some kind of policy. For now just use the first always.
@@ -2264,7 +2351,11 @@ public class AsyncYBClient implements AutoCloseable {
       List<Common.HostPortPB> addresses = new ArrayList<Common.HostPortPB>(tabletLocations
           .getReplicasCount());
       for (Master.TabletLocationsPB.ReplicaPB replica : tabletLocations.getReplicasList()) {
-        addresses.add(replica.getTsInfo().getRpcAddresses(0));
+        if (replica.getTsInfo().getBroadcastAddressesList().isEmpty()) {
+          addresses.add(replica.getTsInfo().getPrivateRpcAddresses(0));
+        } else {
+          addresses.add(replica.getTsInfo().getBroadcastAddresses(0));
+        }
       }
       return addresses;
     }
@@ -2309,6 +2400,8 @@ public class AsyncYBClient implements AutoCloseable {
     private long defaultAdminOperationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
     private long defaultOperationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
     private long defaultSocketReadTimeoutMs = DEFAULT_SOCKET_READ_TIMEOUT_MS;
+
+    private String certFile = null;
 
     private Executor bossExecutor;
     private Executor workerExecutor;
@@ -2386,6 +2479,19 @@ public class AsyncYBClient implements AutoCloseable {
      */
     public AsyncYBClientBuilder defaultSocketReadTimeoutMs(long timeoutMs) {
       this.defaultSocketReadTimeoutMs = timeoutMs;
+      return this;
+    }
+
+    /**
+     * Sets the certificate file in case SSL is enabled.
+     * Optional.
+     * If not provided, defaults to null.
+     * A value of null disables an SSL connection.
+     * @param certFile the path to the certificate.
+     * @return this builder
+     */
+    public AsyncYBClientBuilder sslCertFile(String certFile) {
+      this.certFile = certFile;
       return this;
     }
 

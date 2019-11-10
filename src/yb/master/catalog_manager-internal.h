@@ -32,19 +32,25 @@
 #ifndef YB_MASTER_CATALOG_MANAGER_INTERNAL_H
 #define YB_MASTER_CATALOG_MANAGER_INTERNAL_H
 
+#include "yb/common/wire_protocol.h"
+#include "yb/gutil/basictypes.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/rpc/rpc_context.h"
 
 namespace yb {
+
+using tserver::TabletServerErrorPB;
+
 namespace master {
 
 // Non-template helpers.
 
-inline void SetupError(MasterErrorPB* error,
-                       MasterErrorPB::Code code,
-                       const Status& s) {
+inline CHECKED_STATUS SetupError(MasterErrorPB* error,
+                                 MasterErrorPB::Code code,
+                                 const Status& s) {
   StatusToPB(s, error->mutable_status());
   error->set_code(code);
+  return s;
 }
 
 // Template helpers.
@@ -53,7 +59,7 @@ inline void SetupError(MasterErrorPB* error,
 // Service::UnavailableError as the error, set NOT_THE_LEADER as the
 // error code and return true.
 template<class RespClass>
-void CheckIfNoLongerLeaderAndSetupError(Status s, RespClass* resp) {
+CHECKED_STATUS CheckIfNoLongerLeaderAndSetupError(const Status& s, RespClass* resp) {
   // TODO (KUDU-591): This is a bit of a hack, as right now
   // there's no way to propagate why a write to a consensus configuration has
   // failed. However, since we use Status::IllegalState()/IsAborted() to
@@ -64,8 +70,10 @@ void CheckIfNoLongerLeaderAndSetupError(Status s, RespClass* resp) {
     Status new_status = STATUS(ServiceUnavailable,
         "operation requested can only be executed on a leader master, but this"
         " master is no longer the leader", s.ToString());
-    SetupError(resp->mutable_error(), MasterErrorPB::NOT_THE_LEADER, new_status);
+    ignore_result(SetupError(resp->mutable_error(), MasterErrorPB::NOT_THE_LEADER, new_status));
   }
+
+  return s;
 }
 
 ////////////////////////////////////////////////////////////
@@ -88,16 +96,34 @@ template<typename RespClass, typename ErrorClass>
 bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrRespondInternal(
     RespClass* resp,
     rpc::RpcContext* rpc) {
-  Status& s = catalog_status_;
-  if (PREDICT_TRUE(s.ok())) {
-    s = leader_status_;
-    if (PREDICT_TRUE(s.ok())) {
+  const Status* status = &catalog_status_;
+  if (PREDICT_TRUE(status->ok())) {
+    status = &leader_status_;
+    if (PREDICT_TRUE(status->ok())) {
       return true;
     }
   }
 
-  StatusToPB(s, resp->mutable_error()->mutable_status());
+  StatusToPB(*status, resp->mutable_error()->mutable_status());
   resp->mutable_error()->set_code(ErrorClass::NOT_THE_LEADER);
+  rpc->RespondSuccess();
+  return false;
+}
+
+template<typename RespClass, typename ErrorClass>
+bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedOrRespondInternal(
+    RespClass* resp,
+    rpc::RpcContext* rpc,
+    bool set_error) {
+  const Status* status = &catalog_status_;
+  if (PREDICT_TRUE(status->ok())) {
+    return true;
+  }
+
+  if (set_error) {
+    StatusToPB(*status, resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(ErrorClass::UNKNOWN_ERROR);
+  }
   rpc->RespondSuccess();
   return false;
 }
@@ -109,13 +135,30 @@ bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrResp
   return CheckIsInitializedAndIsLeaderOrRespondInternal<RespClass, MasterErrorPB>(resp, rpc);
 }
 
-// Variation of the above method which uses TabletServerErrorPB instead.
+// Variation of the above methods using TabletServerErrorPB instead.
+template<typename RespClass>
+bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedOrRespondTServer(
+    RespClass* resp,
+    rpc::RpcContext* rpc,
+    bool set_error) {
+  return CheckIsInitializedOrRespondInternal<RespClass, TabletServerErrorPB>
+     (resp, rpc, set_error);
+}
+
 template<typename RespClass>
 bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrRespondTServer(
     RespClass* resp,
     rpc::RpcContext* rpc) {
-  return CheckIsInitializedAndIsLeaderOrRespondInternal<RespClass, tserver::TabletServerErrorPB>
+  return CheckIsInitializedAndIsLeaderOrRespondInternal<RespClass, TabletServerErrorPB>
       (resp, rpc);
+}
+
+inline std::string RequestorString(yb::rpc::RpcContext* rpc) {
+  if (rpc) {
+    return rpc->requestor_string();
+  } else {
+    return "internal request";
+  }
 }
 
 }  // namespace master

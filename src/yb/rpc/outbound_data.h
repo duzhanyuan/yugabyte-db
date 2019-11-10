@@ -14,8 +14,9 @@
 #ifndef YB_RPC_OUTBOUND_DATA_H
 #define YB_RPC_OUTBOUND_DATA_H
 
-#include <deque>
 #include <memory>
+
+#include <boost/container/small_vector.hpp>
 
 #include "yb/util/ref_cnt_buffer.h"
 
@@ -28,19 +29,53 @@ namespace rpc {
 class DumpRunningRpcsRequestPB;
 class RpcCallInProgressPB;
 
-// Interface for outbound transfers from the RPC framework.
+// Interface for outbound transfers from the RPC framework. Implementations include:
+// - RpcCall
+// - LocalOutboundCall
+// - ConnectionHeader
+// - ServerEventList
 class OutboundData : public std::enable_shared_from_this<OutboundData> {
  public:
   virtual void Transferred(const Status& status, Connection* conn) = 0;
 
-  virtual ~OutboundData() {}
   // Serializes the data to be sent out via the RPC framework.
-  virtual void Serialize(std::deque<RefCntBuffer> *output) const = 0;
+  virtual void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) = 0;
+
   virtual std::string ToString() const = 0;
+
   virtual bool DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp) = 0;
+
+  virtual bool IsFinished() const { return false; }
+
+  virtual bool IsHeartbeat() const { return false; }
+
+  virtual ~OutboundData() {}
 };
 
 typedef std::shared_ptr<OutboundData> OutboundDataPtr;
+
+class StringOutboundData : public OutboundData {
+ public:
+  StringOutboundData(const string& data, const string& name) : buffer_(data), name_(name) {}
+  StringOutboundData(const char* data, size_t len, const string& name)
+      : buffer_(data, len), name_(name) {}
+  void Transferred(const Status& status, Connection* conn) override {}
+
+  // Serializes the data to be sent out via the RPC framework.
+  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) override {
+    output->push_back(buffer_);
+  }
+
+  std::string ToString() const override { return name_; }
+
+  bool DumpPB(const DumpRunningRpcsRequestPB& req, RpcCallInProgressPB* resp) override {
+    return false;
+  }
+
+ private:
+  RefCntBuffer buffer_;
+  string name_;
+};
 
 }  // namespace rpc
 }  // namespace yb

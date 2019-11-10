@@ -46,6 +46,7 @@
 #include "yb/util/env.h"
 #include "yb/util/path_util.h"
 #include "yb/util/metrics.h"
+#include "yb/util/result.h"
 
 DECLARE_bool(enable_data_block_fsync);
 
@@ -60,17 +61,10 @@ namespace yb {
 class MemTracker;
 class MetricEntity;
 
-namespace fs {
-class BlockManager;
-class ReadableBlock;
-class WritableBlock;
-} // namespace fs
-
 namespace itest {
 class ExternalMiniClusterFsInspector;
 }
 
-class BlockId;
 class InstanceMetadataPB;
 
 struct FsManagerOpts {
@@ -105,12 +99,17 @@ struct FsManagerOpts {
 // and it's responsible for abstracting the file-system layout.
 //
 // The user should not be aware of where files are placed,
-// but instead should interact with the storage in terms of "open the block xyz"
+// but instead should interact with the storage in terms of "open the file xyz"
 // or "write a new schema metadata file for table kwz".
 //
-// The current layout is:
-//    <yb.root.dir>/data/
-//    <yb.root.dir>/data/<prefix-0>/<prefix-2>/<prefix-4>/<name>
+// The current top-level dir layout is <yb.root.dir>/yb-data/<server>/. Subdirs under it are:
+//     logs/
+//     instance
+//     wals/<table>/<tablet>
+//     tablet-meta/<tablet>
+//     data/rocksdb/<table>/<tablet>/
+//     consensus-meta/<tablet>
+
 class FsManager {
  public:
   static const char *kWalDirName;
@@ -132,29 +131,23 @@ class FsManager {
 
   //
   // Returns an error if the file system is already initialized.
-  CHECKED_STATUS CreateInitialFileSystemLayout();
+  CHECKED_STATUS CreateInitialFileSystemLayout(bool delete_fs_if_lock_found = false);
+
+  // Deletes the yb-data directory contents for data/wal. "logs" subdirectory deletion is skipped
+  // when 'delete_logs_also' is set to false.
+  // Needed for a master shell process to be stoppable and restartable correctly in shell mode.
+  CHECKED_STATUS DeleteFileSystemLayout(bool delete_logs_also = false);
+
+  // Check if a lock file is present.
+  bool HasAnyLockFiles();
+  // Delete the lock files. Used once the caller deems fs creation was succcessful.
+  CHECKED_STATUS DeleteLockFiles();
 
   void DumpFileSystemTree(std::ostream& out);
 
   // Return the UUID persisted in the local filesystem. If Open()
   // has not been called, this will crash.
   const std::string& uuid() const;
-
-  // ==========================================================================
-  //  Data read/write interfaces
-  // ==========================================================================
-
-  // Creates a new anonymous block.
-  //
-  // Block will be synced on close.
-  CHECKED_STATUS CreateNewBlock(gscoped_ptr<fs::WritableBlock>* block);
-
-  CHECKED_STATUS OpenBlock(const BlockId& block_id,
-                   gscoped_ptr<fs::ReadableBlock>* block);
-
-  CHECKED_STATUS DeleteBlock(const BlockId& block_id);
-
-  bool BlockExists(const BlockId& block_id) const;
 
   // ==========================================================================
   //  on-disk path
@@ -167,16 +160,17 @@ class FsManager {
   std::string GetFirstTabletWalDirOrDie(const std::string& table_id,
                                         const std::string& tablet_id) const;
 
-  std::string GetTabletWalRecoveryDir(const std::string& tablet_wal_path) const;
+  static std::string GetTabletWalRecoveryDir(const std::string& tablet_wal_path);
 
-  std::string GetWalSegmentFileName(const std::string& tablet_wal_path,
-                                    uint64_t sequence_number) const;
+  static std::string GetWalSegmentFileName(const std::string& tablet_wal_path,
+                                    uint64_t sequence_number);
 
-  // Return the directory where tablet superblocks should be stored.
-  std::string GetTabletMetadataDir() const;
+  // Return the directory where Raft group superblocks should be stored.
+  std::string GetRaftGroupMetadataDir() const;
+  static std::string GetRaftGroupMetadataDir(const std::string& data_dir);
 
-  // Return the path for a specific tablet's superblock.
-  std::string GetTabletMetadataPath(const std::string& tablet_id) const;
+  // Return the path for a specific Raft group's superblock.
+  std::string GetRaftGroupMetadataPath(const std::string& tablet_id) const;
 
   // List the tablet IDs in the metadata directory.
   CHECKED_STATUS ListTabletIds(std::vector<std::string>* tablet_ids);
@@ -184,8 +178,12 @@ class FsManager {
   // Return the path where InstanceMetadataPB is stored.
   std::string GetInstanceMetadataPath(const std::string& root) const;
 
+  // Return the path where the fs lock file is stored.
+  std::string GetFsLockFilePath(const std::string& root) const;
+
   // Return the directory where the consensus metadata is stored.
   std::string GetConsensusMetadataDir() const;
+  static std::string GetConsensusMetadataDir(const std::string& data_dir);
 
   // Return the path where ConsensusMetadataPB is stored.
   std::string GetConsensusMetadataPath(const std::string& tablet_id) const {
@@ -209,23 +207,21 @@ class FsManager {
     return env_->GetChildren(path, objects);
   }
 
+  Result<std::vector<std::string>> ListDir(const std::string& path) const {
+    std::vector<std::string> result;
+    RETURN_NOT_OK(env_->GetChildren(path, ExcludeDots::kTrue, &result));
+    return result;
+  }
+
   CHECKED_STATUS CreateDirIfMissing(const std::string& path, bool* created = NULL);
 
-  fs::BlockManager* block_manager() {
-    return block_manager_.get();
-  }
+  CHECKED_STATUS CreateDirIfMissingAndSync(const std::string& path, bool* created = NULL);
 
  private:
   FRIEND_TEST(FsManagerTestBase, TestDuplicatePaths);
-  friend class itest::ExternalMiniClusterFsInspector; // for access to directory names
 
   // Initializes, sanitizes, and canonicalizes the filesystem roots.
   CHECKED_STATUS Init();
-
-  // Select and create an instance of the appropriate block manager.
-  //
-  // Does not actually perform any on-disk operations.
-  void InitBlockManager();
 
   // Create a new InstanceMetadataPB.
   void CreateInstanceMetadata(InstanceMetadataPB* metadata);
@@ -251,12 +247,14 @@ class FsManager {
                           const std::vector<std::string>& objects);
 
   static const char *kDataDirName;
-  static const char *kTabletMetadataDirName;
+  static const char *kRaftGroupMetadataDirName;
   static const char *kCorruptedSuffix;
   static const char *kInstanceMetadataFileName;
+  static const char *kFsLockFileName;
   static const char *kInstanceMetadataMagicNumber;
   static const char *kTabletSuperBlockMagicNumber;
   static const char *kConsensusMetadataDirName;
+  static const char *kLogsDirName;
 
   Env *env_;
 
@@ -284,8 +282,6 @@ class FsManager {
   std::set<std::string> canonicalized_all_fs_roots_;
 
   gscoped_ptr<InstanceMetadataPB> metadata_;
-
-  gscoped_ptr<fs::BlockManager> block_manager_;
 
   bool initted_;
 

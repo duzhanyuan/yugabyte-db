@@ -31,7 +31,6 @@
 //
 
 #include <glog/logging.h>
-#include <gperftools/heap-checker.h>
 
 #include "yb/util/thread.h"
 #include "yb/util/threadlocal.h"
@@ -82,6 +81,10 @@ bool ThreadRestrictions::SetWaitAllowed(bool allowed) {
   bool previous_allowed = LoadTLS()->wait_allowed;
   LoadTLS()->wait_allowed = allowed;
   return previous_allowed;
+}
+
+bool ThreadRestrictions::IsWaitAllowed() {
+  return LoadTLS()->wait_allowed;
 }
 
 void ThreadRestrictions::AssertWaitAllowed() {

@@ -30,6 +30,8 @@
 # under the License.
 #
 
+YB_INCLUDE_EXTENSIONS()
+
 set(LINK_LIBS
   yb_client
   log
@@ -39,7 +41,6 @@ set(LINK_LIBS
   yb_fs
   yb_util
   gutil
-  cfile
   tablet
   ${YB_BASE_LIBS}
 )
@@ -54,7 +55,10 @@ target_link_libraries(insert-generated-rows
   yb_tools_util
   ${LINK_LIBS})
 
-add_executable(yb-admin yb-admin.cc)
+add_executable(yb-admin
+  yb-admin_client.cc
+  yb-admin_cli.cc
+  ${YB_ADMIN_SRCS_EXTENSIONS})
 target_link_libraries(yb-admin
   ${LINK_LIBS})
 
@@ -92,13 +96,16 @@ target_link_libraries(ysck
   tserver_service_proto
   ${YB_BASE_LIBS}
 )
+add_dependencies(
+  ysck
+  gen_src_yb_consensus_log_proto)
 
 add_executable(yb-ysck yb-ysck.cc)
 target_link_libraries(yb-ysck
   ysck
 )
 
-add_library(yb-generate_partitions yb-generate_partitions.cc)
+add_library(yb-generate_partitions bulk_load_utils.cc yb-generate_partitions.cc)
 target_link_libraries(yb-generate_partitions
   yb_client
   yb_util
@@ -132,6 +139,7 @@ target_link_libraries(yb-pbc-dump
 
 set(YB_TEST_LINK_LIBS
   ysck
+  yb_client
   yb_tools_util
   yb-generate_partitions
   integration-tests
@@ -156,3 +164,13 @@ add_executable(run-with-timeout run-with-timeout.cc)
 # If ${YB_BASE_LIBS} is removed below, there is an error in static linking mode
 # (but no error with dynamic linking!)
 target_link_libraries(run-with-timeout yb_util ${YB_BASE_LIBS})
+
+# Additional tests
+if(YB_ENT_CURRENT_SOURCE_DIR)
+  # Set the test source file folder.
+  set(CMAKE_CURRENT_LIST_DIR ${YB_ENT_CURRENT_SOURCE_DIR})
+
+  foreach(test ${TOOLS_EXTENSIONS_TESTS})
+    ADD_YB_TEST(${test})
+  endforeach()
+endif()

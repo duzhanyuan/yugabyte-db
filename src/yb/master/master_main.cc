@@ -37,16 +37,29 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/master/call_home.h"
 #include "yb/master/master.h"
+#include "yb/consensus/log_util.h"
 #include "yb/util/flags.h"
 #include "yb/util/init.h"
 #include "yb/util/logging.h"
+#include "yb/util/main_util.h"
+#include "yb/gutil/sysinfo.h"
+#include "yb/server/total_mem_watcher.h"
 
 DECLARE_bool(callhome_enabled);
 DECLARE_bool(evict_failed_followers);
 DECLARE_double(default_memory_limit_to_ram_ratio);
+DECLARE_int32(logbuflevel);
 DECLARE_int32(webserver_port);
 DECLARE_string(rpc_bind_addresses);
 DECLARE_bool(durable_wal_write);
+DECLARE_int32(stderrthreshold);
+
+DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);
+// Deprecated because it's misspelled.  But if set, this flag takes precedence over
+// remote_bootstrap_rate_limit_bytes_per_sec for compatibility.
+DECLARE_int64(remote_boostrap_rate_limit_bytes_per_sec);
+
+using namespace std::literals;
 
 namespace yb {
 namespace master {
@@ -64,21 +77,45 @@ static int MasterMain(int argc, char** argv) {
   // the desired replication factor. (It's not turtles all the way down!)
   FLAGS_evict_failed_followers = false;
 
+  // Only write FATALs by default to stderr.
+  FLAGS_stderrthreshold = google::FATAL;
+
+  // Do not sync GLOG to disk for INFO, WARNING.
+  // ERRORs, and FATALs will still cause a sync to disk.
+  FLAGS_logbuflevel = google::GLOG_WARNING;
   ParseCommandLineFlags(&argc, &argv, true);
   if (argc != 1) {
     std::cerr << "usage: " << argv[0] << std::endl;
     return 1;
   }
-  InitYBOrDie(MasterOptions::kServerType);
-  InitGoogleLoggingSafe(argv[0]);
+  LOG_AND_RETURN_FROM_MAIN_NOT_OK(log::ModifyDurableWriteFlagIfNotODirect());
+  LOG_AND_RETURN_FROM_MAIN_NOT_OK(InitYB(MasterOptions::kServerType, argv[0]));
+  LOG(INFO) << "NumCPUs determined to be: " << base::NumCPUs();
 
-  MasterOptions opts;
-  YB_EDITION_NS_PREFIX Master server(opts);
+  LOG_AND_RETURN_FROM_MAIN_NOT_OK(GetPrivateIpMode());
+
+  auto opts_result = MasterOptions::CreateMasterOptions();
+  LOG_AND_RETURN_FROM_MAIN_NOT_OK(opts_result);
+  enterprise::Master server(*opts_result);
+
+  if (FLAGS_remote_boostrap_rate_limit_bytes_per_sec > 0) {
+    LOG(WARNING) << "Flag remote_boostrap_rate_limit_bytes_per_sec has been deprecated. "
+                 << "Use remote_bootstrap_rate_limit_bytes_per_sec flag instead";
+    FLAGS_remote_bootstrap_rate_limit_bytes_per_sec =
+        FLAGS_remote_boostrap_rate_limit_bytes_per_sec;
+  }
+
+  SetDefaultInitialSysCatalogSnapshotFlags();
+
+  // ==============================================================================================
+  // End of setting master flags
+  // ==============================================================================================
+
   LOG(INFO) << "Initializing master server...";
-  CHECK_OK(server.Init());
+  LOG_AND_RETURN_FROM_MAIN_NOT_OK(server.Init());
 
   LOG(INFO) << "Starting Master server...";
-  CHECK_OK(server.Start());
+  LOG_AND_RETURN_FROM_MAIN_NOT_OK(server.Start());
 
   LOG(INFO) << "Master server successfully started.";
 
@@ -88,11 +125,12 @@ static int MasterMain(int argc, char** argv) {
     call_home->ScheduleCallHome();
   }
 
-  while (true) {
-    SleepFor(MonoDelta::FromSeconds(60));
-  }
-
-  return 0;
+  auto total_mem_watcher = server::TotalMemWatcher::Create();
+  total_mem_watcher->MemoryMonitoringLoop(
+      [&server]() { server.Shutdown(); },
+      [&server]() { return server.IsShutdown(); }
+  );
+  return EXIT_FAILURE;
 }
 
 } // namespace master

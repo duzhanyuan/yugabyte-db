@@ -15,6 +15,8 @@ package org.yb.ybcli.commands;
 
 import java.util.List;
 
+import com.google.common.net.HostAndPort;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.shell.core.CommandMarker;
@@ -30,6 +32,8 @@ import org.yb.client.ChangeConfigResponse;
 import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.GetTableSchemaResponse;
+import org.yb.client.IsLoadBalancedResponse;
+import org.yb.client.IsServerReadyResponse;
 import org.yb.client.LeaderStepDownResponse;
 import org.yb.client.ListMastersResponse;
 import org.yb.client.ListTablesResponse;
@@ -64,7 +68,8 @@ public class YBCliCommands implements CommandMarker {
 
   @CliAvailabilityIndicator({"list tablet-servers", "list tablets", "list tables", "list masters",
                              "change_config", "change_blacklist", "leader_step_down",
-                             "get_universe_config", "get_load_move_completion"})
+                             "get_universe_config", "get_load_move_completion",
+                             "is_load_balanced", "is_tserver_ready"})
   public boolean isDatabaseOperationAvailable() {
     // We can perform operations on the database once we are connected to one.
     if (connectedToDatabase) {
@@ -109,7 +114,7 @@ public class YBCliCommands implements CommandMarker {
     StringBuilder sb = new StringBuilder();
     sb.append("Got " + servers.size() + (isMaster ? " masters " : " tablet servers "));
     if (isMaster) {
-      sb.append("[(index) HostName Port UUID IsLeader]:\n");
+      sb.append("[(index) HostName Port UUID IsLeader State]:\n");
     } else {
       sb.append("[(index) HostName Port UUID]:\n");
     }
@@ -117,7 +122,8 @@ public class YBCliCommands implements CommandMarker {
     int idx = 1;
     for (ServerInfo server : servers) {
       sb.append("    (" + idx + ") " + server.getHost() + " " + server.getPort() +
-                " " + server.getUuid() + (isMaster ? " " + server.isLeader() : "") + "\n");
+                " " + server.getUuid() + (isMaster ? " " + server.isLeader() : "") +
+                (isMaster ? " " + server.getState() : "") + "\n");
       idx++;
     }
     sb.append("Time taken: " + elapsed + " ms.");
@@ -126,6 +132,10 @@ public class YBCliCommands implements CommandMarker {
 
   @CliCommand(value = "check exists", help = "Check that a table exists")
   public String checkTableExists(
+      @CliOption(key = { "keyspace", "k" },
+                 mandatory = true,
+                 help = "keyspace name")
+      final String keyspace,
       @CliOption(key = { "name", "n" },
                  help = "table identifier (name)")
       final String tableName,
@@ -134,7 +144,7 @@ public class YBCliCommands implements CommandMarker {
       final String tableUuid) {
     try {
       if (tableName != null) {
-        return Boolean.toString(ybClient.tableExists(tableName));
+        return Boolean.toString(ybClient.tableExists(keyspace, tableName));
       } else if (tableUuid != null) {
         return Boolean.toString(ybClient.tableExistsByUUID(tableUuid));
       } else {
@@ -245,21 +255,21 @@ public class YBCliCommands implements CommandMarker {
 
   @CliCommand(value = "describe table", help = "Info on a table in this database.")
   public String infoTable(
-      @CliOption(key = { "table", "t" },
-                 mandatory = true,
-                 help = "table identifier (name)")
-      final String tableName,
       @CliOption(key = { "keyspace", "k" },
                  mandatory = true,
                  help = "keyspace name")
-      final String keyspace) {
+      final String keyspace,
+      @CliOption(key = { "table", "t" },
+                 mandatory = true,
+                 help = "table identifier (name)")
+      final String tableName) {
     StringBuilder sb = new StringBuilder();
     try {
       ListTablesResponse resp = ybClient.getTablesList();
       for (Master.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
-        if (table.getName().equals(tableName)) {
+        if (table.getNamespace().getName().equals(keyspace) && table.getName().equals(tableName)) {
           printTableInfo(table, sb);
-          printSchemaInfo(ybClient.getTableSchema(tableName, keyspace), sb);
+          printSchemaInfo(ybClient.getTableSchema(keyspace, tableName), sb);
           sb.append("Time taken: ");
           sb.append(resp.getElapsedMillis());
           sb.append(" ms.");
@@ -385,7 +395,59 @@ public class YBCliCommands implements CommandMarker {
         return "Failed: " + resp.errorMessage();
       }
 
-      return "Percent completed = " + resp.getPercentCompleted();
+      return "Percent completed = " + resp.getPercentCompleted() +
+        " : Remaining = " + resp.getRemaining() + " out of Total = " + resp.getTotal();
+    } catch (Exception e) {
+      LOG.error("Caught exception ", e);
+      return "Failed: " + e.toString() + "\n";
+    }
+  }
+
+  @CliCommand(value = "is_server_ready",
+              help = "Check if server is ready to serve IO requests.")
+  public String getIsTserverReady(
+      @CliOption(key = {"host", "h"},
+                 mandatory = true,
+                 help = "Hostname or IP of the server. ") final String host,
+      @CliOption(key = {"port", "p"},
+                 mandatory = true,
+                 help = "RPC port number of the server.") final int port,
+      @CliOption(key = {"isTserver", "t"},
+                 mandatory = true,
+                 help = "True imples the tserver, else master.") final boolean isTserver) {
+    try {
+      HostAndPort hp = HostAndPort.fromParts(host, port);
+      IsServerReadyResponse resp = ybClient.isServerReady(hp, isTserver);
+
+      if (resp.hasError()) {
+        return "Failed: server response error : " + resp.errorMessage();
+      }
+
+      return "Server is ready.";
+    } catch (Exception e) {
+      LOG.error("Caught exception ", e);
+      return "Failed: " + e.toString();
+    }
+  }
+
+  @CliCommand(value = "is_load_balanced",
+              help = "Check if master leader thinks that the load is balanced across tservers.")
+  public String getIsLoadBalanced() {
+    try {
+      ListTabletServersResponse list_resp = ybClient.listTabletServers();
+
+      if (list_resp.hasError()) {
+        return "Failed: Cannot list tablet servers. Error : " + list_resp.errorMessage();
+      }
+
+      LOG.info("Checking load across " + list_resp.getTabletServersCount() + " tservers.");
+      IsLoadBalancedResponse resp = ybClient.getIsLoadBalanced(list_resp.getTabletServersCount());
+
+      if (resp.hasError()) {
+        return "Load is not balanced.";
+      }
+
+      return "Load is balanced.";
     } catch (Exception e) {
       LOG.error("Caught exception ", e);
       return "Failed: " + e.toString() + "\n";

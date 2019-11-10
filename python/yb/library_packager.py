@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 # Copyright (c) YugaByte, Inc.
 #
@@ -28,39 +28,21 @@ Run doctest tests as follows:
 
 import argparse
 import collections
-import filecmp
 import glob
-import hashlib
-import inspect
-import itertools
 import json
 import logging
 import os
-import platform
-import pprint
-import random
 import re
 import shutil
-import stat
-import string
 import subprocess
 import sys
-import urlparse
-
-from collections import deque, defaultdict
-from os.path import basename as path_basename
-from os.path import dirname as path_dirname
-from os.path import realpath
-from distutils.dir_util import mkpath
-from six.moves import urllib
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from yb.command_util import run_program, mkdir_p  # nopep8
+from yb.command_util import run_program, mkdir_p, copy_deep  # nopep8
 from yb.linuxbrew import get_linuxbrew_dir  # nopep8
+from yb.common_util import get_thirdparty_dir, YB_SRC_ROOT, sorted_grouped_by, \
+                           safe_path_join  # nopep8
 
-
-MODULE_DIR = path_dirname(realpath(__file__))
-YB_SRC_ROOT = realpath(os.path.join(MODULE_DIR, '..', '..'))
 
 # A resolved shared library dependency shown by ldd.
 # Example (split across two lines):
@@ -76,21 +58,18 @@ SYSTEM_LIBRARY_PATHS = ['/usr/lib', '/usr/lib64', '/lib', '/lib64',
 
 HOME_DIR = os.path.expanduser('~')
 LINUXBREW_HOME = get_linuxbrew_dir()
-LINUXBREW_CELLAR_GLIBC_DIR = os.path.join(LINUXBREW_HOME, 'Cellar', 'glibc')
-LINUXBREW_LDD_PATH = os.path.join(LINUXBREW_HOME, 'bin', 'ldd')
+LINUXBREW_CELLAR_GLIBC_DIR = safe_path_join(LINUXBREW_HOME, 'Cellar', 'glibc')
+ADDITIONAL_LIB_NAME_GLOBS = ['libnss_*', 'libresolv*']
+LINUXBREW_LDD_PATH = safe_path_join(LINUXBREW_HOME, 'bin', 'ldd')
 
-YB_THIRDPARTY_DIR = os.environ.get("YB_THIRDPARTY_DIR", os.path.join(YB_SRC_ROOT, 'thirdparty'))
 YB_SCRIPT_BIN_DIR = os.path.join(YB_SRC_ROOT, 'bin')
 YB_BUILD_SUPPORT_DIR = os.path.join(YB_SRC_ROOT, 'build-support')
 
 PATCHELF_NOT_AN_ELF_EXECUTABLE = 'not an ELF executable'
-PATCHELF_PATH = os.path.join(LINUXBREW_HOME, 'bin', 'patchelf')
+PATCHELF_PATH = safe_path_join(LINUXBREW_HOME, 'bin', 'patchelf')
 
 LIBRARY_PATH_RE = re.compile('^(.*[.]so)(?:$|[.].*$)')
-
-
-def group_by(arr, key_fn):
-    return [(k, list(v)) for (k, v) in itertools.groupby(sorted(arr, key=key_fn), key_fn)]
+LIBRARY_CATEGORIES = ['system', 'yb', 'yb-thirdparty', 'linuxbrew']
 
 
 # This is an alternative to global variables, bundling a few commonly used things.
@@ -98,23 +77,21 @@ DistributionContext = collections.namedtuple(
         'DistributionContext',
         ['build_dir',
          'dest_dir',
-         'os_package_manager',
-         'verbose_mode',
-         'include_system_libs',
-         'include_licenses'])
+         'verbose_mode'])
 
 
 class Dependency:
     """
     Describes a dependency of an executable or a shared library on another shared library.
-    @param name: the name of the library as requested by the dependee
+    @param name: the name of the library as requested by the original executable/shared library
     @param target: target file pointed to by the dependency
     """
-    def __init__(self, name, target, context):
+    def __init__(self, name, target, origin, context):
         self.name = name
         self.target = target
         self.category = None
         self.context = context
+        self.origin = origin
 
     def __hash__(self):
         return hash(self.name) ^ hash(self.target)
@@ -124,7 +101,8 @@ class Dependency:
                self.target == other.target
 
     def __str__(self):
-        return "Dependency({}, {})".format(repr(self.name), repr(self.target))
+        return "Dependency(name='{}', target='{}', origin='{}')".format(
+                self.name, self.target, self.origin)
 
     def __repr__(self):
         return str(self)
@@ -135,17 +113,17 @@ class Dependency:
     def get_category(self):
         """
         Categorizes binaries into a few buckets:
-        - Product -- YugaByte product itself
-        - YugaByte third-party -- built with YugaByte
-        - Linuxbrew -- built using Linuxbrew
-        - System -- grabbed from CentOS
+        - yb -- YugaByte product itself
+        - yb-thirdparty -- built with YugaByte
+        - linuxbrew -- built using Linuxbrew
+        - system -- grabbed from a system-wide library directory
         """
         if self.category:
             return self.category
 
         if self.target.startswith(LINUXBREW_HOME + '/'):
             self.category = 'linuxbrew'
-        elif self.target.startswith(YB_THIRDPARTY_DIR + '/'):
+        elif self.target.startswith(get_thirdparty_dir() + '/'):
             self.category = 'yb-thirdparty'
         elif self.target.startswith(self.context.build_dir + '/'):
             self.category = 'yb'
@@ -160,6 +138,10 @@ class Dependency:
                     break
 
         if self.category:
+            if self.category not in LIBRARY_CATEGORIES:
+                raise RuntimeError(
+                    ("Internal error: library category computed as '{}', must be one of: {}. " +
+                     "Dependency: {}").format(self.category, LIBRARY_CATEGORIES, self))
             return self.category
 
         raise RuntimeError(
@@ -171,7 +153,7 @@ class Dependency:
              "YB general-purpose script directory ('{}'), "
              "YB build support script directory ('{}'), "
              "and does not appear to be a system library (does not start with any of {})."
-             ).format(self.target, LINUXBREW_HOME, YB_THIRDPARTY_DIR, self.context.build_dir,
+             ).format(self.target, LINUXBREW_HOME, get_thirdparty_dir(), self.context.build_dir,
                       YB_SCRIPT_BIN_DIR, YB_BUILD_SUPPORT_DIR, SYSTEM_LIBRARY_PATHS))
 
 
@@ -180,18 +162,6 @@ def add_common_arguments(parser):
     Add command-line arguments common between library_packager_old.py invoked as a script, and
     the yb_release.py script.
     """
-    parser.add_argument('--no-system-libs',
-                        dest='no_system_libs',
-                        action='store_true',
-                        help='Omit system libraries from the distribution. This means the '
-                             'distribution will depend on a number of OS packages being '
-                             'already installed.')
-    parser.add_argument('--licenses',
-                        action='store_true',
-                        dest='include_licenses',
-                        help='Also include licenses in the distribution. This may slow down '
-                             'package building significantly, as we have to download and extract '
-                             'source packages to find licenses.')
     parser.add_argument('--verbose',
                         help='Enable verbose output.',
                         action='store_true')
@@ -228,10 +198,8 @@ class LibraryPackager:
                  build_dir,
                  seed_executable_patterns,
                  dest_dir,
-                 include_system_libs=True,
-                 verbose_mode=False,
-                 include_licenses=False):
-        build_dir = realpath(build_dir)
+                 verbose_mode=False):
+        build_dir = os.path.realpath(build_dir)
         if not os.path.exists(build_dir):
             raise IOError("Build directory '{}' does not exist".format(build_dir))
         self.seed_executable_patterns = seed_executable_patterns
@@ -239,16 +207,21 @@ class LibraryPackager:
         logging.debug(
             "Traversing the dependency graph of executables/libraries, starting "
             "with seed executable patterns: {}".format(", ".join(seed_executable_patterns)))
-        self.nodes_by_digest = {}
-        self.nodes_by_path = {}
         self.context = DistributionContext(
             dest_dir=dest_dir,
             build_dir=build_dir,
-            os_package_manager=Yum() if include_licenses else None,
-            include_system_libs=include_system_libs,
-            verbose_mode=verbose_mode,
-            include_licenses=include_licenses
-            )
+            verbose_mode=verbose_mode)
+        self.installed_dyn_linked_binaries = []
+        self.main_dest_bin_dir = os.path.join(self.dest_dir, 'bin')
+        self.postgres_dest_bin_dir = os.path.join(self.dest_dir, 'postgres', 'bin')
+
+    def install_dyn_linked_binary(self, src_path, dest_dir):
+        if not os.path.isdir(dest_dir):
+            raise RuntimeError("Not a directory: '{}'".format(dest_dir))
+        shutil.copy(src_path, dest_dir)
+        installed_binary_path = os.path.join(dest_dir, os.path.basename(src_path))
+        self.installed_dyn_linked_binaries.append(installed_binary_path)
+        return installed_binary_path
 
     def find_elf_dependencies(self, elf_file_path):
         """
@@ -258,7 +231,7 @@ class LibraryPackager:
         @param elf_file_path: ELF file (executable/library) path
         """
 
-        elf_file_path = realpath(elf_file_path)
+        elf_file_path = os.path.realpath(elf_file_path)
         if SYSTEM_LIBRARY_PATH_RE.match(elf_file_path):
             ldd_path = '/usr/bin/ldd'
         else:
@@ -280,9 +253,10 @@ class LibraryPackager:
             resolved_dep_match = RESOLVED_DEP_RE.match(ldd_output_line)
             if resolved_dep_match:
                 lib_name = resolved_dep_match.group(1)
-                lib_resolved_path = realpath(resolved_dep_match.group(2))
+                lib_resolved_path = os.path.realpath(resolved_dep_match.group(2))
 
-                dependencies.add(Dependency(lib_name, lib_resolved_path, self.context))
+                dependencies.add(Dependency(lib_name, lib_resolved_path, elf_file_path,
+                                            self.context))
 
             tokens = ldd_output_line.split()
             if len(tokens) >= 4 and tokens[1:4] == ['=>', 'not', 'found']:
@@ -296,6 +270,21 @@ class LibraryPackager:
 
         return dependencies
 
+    @staticmethod
+    def is_postgres_binary(file_path):
+        return os.path.dirname(file_path).endswith('/postgres/bin')
+
+    def get_dest_bin_dir_for_executable(self, file_path):
+        if self.is_postgres_binary(file_path):
+            dest_bin_dir = self.postgres_dest_bin_dir
+        else:
+            dest_bin_dir = self.main_dest_bin_dir
+        return dest_bin_dir
+
+    @staticmethod
+    def join_binary_names_for_bash(binary_names):
+        return ' '.join(['"{}"'.format(name) for name in binary_names])
+
     def package_binaries(self):
         """
         The main entry point to this class. Arranges binaries (executables and shared libraries),
@@ -304,72 +293,57 @@ class LibraryPackager:
         """
         all_deps = []
 
-        executables = []
-
-        dest_bin_dir = os.path.join(self.dest_dir, 'bin')
-        mkdir_p(dest_bin_dir)
-
         dest_lib_dir = os.path.join(self.dest_dir, 'lib')
         mkdir_p(dest_lib_dir)
 
-        unwrapped_bin_dir = os.path.join(dest_lib_dir, 'unwrapped')
-        mkdir_p(unwrapped_bin_dir)
+        mkdir_p(self.main_dest_bin_dir)
+        mkdir_p(self.postgres_dest_bin_dir)
 
-        unwrapped_executables = []
+        main_elf_names_to_patch = []
+        postgres_elf_names_to_patch = []
 
-        ld_library_path = ":".join(
-            ["${BASH_SOURCE%/*}/../lib/" + category
-             for category in ['system', 'yb', 'yb-thirdparty', 'linuxbrew']] + SYSTEM_LIBRARY_PATHS
-        )
         for seed_executable_glob in self.seed_executable_patterns:
-            re_match = re.match(r'^build/latest/(.*)$', seed_executable_glob)
-            if re_match:
-                updated_glob = os.path.join(self.context.build_dir, re_match.group(1))
-                logging.info(
-                    "Automatically updating seed glob to be relative to build dir: {} -> {}".format(
-                        seed_executable_glob, updated_glob))
-                seed_executable_glob = updated_glob
-            for executable in glob.glob(seed_executable_glob):
+            glob_results = glob.glob(seed_executable_glob)
+            if not glob_results:
+                raise RuntimeError("No files found matching the pattern '{}'".format(
+                    seed_executable_glob))
+            for executable in glob_results:
                 deps = self.find_elf_dependencies(executable)
                 all_deps += deps
+                dest_bin_dir = self.get_dest_bin_dir_for_executable(executable)
                 if deps:
-                    executables.append(executable)
-                    shutil.copy(executable, unwrapped_bin_dir)
+                    self.install_dyn_linked_binary(executable, dest_bin_dir)
                     executable_basename = os.path.basename(executable)
-                    unwrapped_executables.append(
-                            os.path.join(unwrapped_bin_dir, executable_basename))
-                    wrapper_script_path = os.path.join(dest_bin_dir, executable_basename)
-                    with open(wrapper_script_path, 'w') as wrapper_script_file:
-                        wrapper_script_file.write(
-                            "#!/usr/bin/env bash\n"
-                            "LD_LIBRARY_PATH=" + ld_library_path + " exec "
-                            "${BASH_SOURCE%/*}/../lib/unwrapped/" + executable_basename + ' "$@"')
-                    os.chmod(wrapper_script_path, 0755)
+                    if self.is_postgres_binary(executable):
+                        postgres_elf_names_to_patch.append(executable_basename)
+                    else:
+                        main_elf_names_to_patch.append(executable_basename)
                 else:
                     # This is probably a script.
                     shutil.copy(executable, dest_bin_dir)
 
-        shutil.copy(PATCHELF_PATH, dest_bin_dir)
+        # Not using the install_dyn_linked_binary method for copying patchelf and ld.so as we won't
+        # need to do any post-processing on these two later.
+        shutil.copy(PATCHELF_PATH, self.main_dest_bin_dir)
 
         ld_path = os.path.join(LINUXBREW_HOME, 'lib', 'ld.so')
         shutil.copy(ld_path, dest_lib_dir)
 
         all_deps = sorted(set(all_deps))
 
-        for dep_name, deps in group_by(all_deps, lambda dep: dep.name):
+        for dep_name, deps in sorted_grouped_by(all_deps, lambda dep: dep.name):
             targets = sorted(set([dep.target for dep in deps]))
             if len(targets) > 1:
-                raise RuntimeException(
+                raise RuntimeError(
                     "Multiple dependencies with the same name {} but different targets: {}".format(
-                        dep_name, targets
+                        dep_name, deps
                     ))
 
-        categories = sorted(set([dep.get_category() for dep in all_deps]))
-        for category, deps_in_category in group_by(all_deps, lambda dep: dep.get_category()):
-            if category == 'system':
-                # We completely skip all system dependencies. They are supposed to be installed
-                # separately on the target system.
-                continue
+        linuxbrew_dest_dir = os.path.join(self.dest_dir, 'linuxbrew')
+        linuxbrew_lib_dest_dir = os.path.join(linuxbrew_dest_dir, 'lib')
+
+        for category, deps_in_category in sorted_grouped_by(all_deps,
+                                                            lambda dep: dep.get_category()):
             logging.info("Found {} dependencies in category '{}':".format(
                 len(deps_in_category), category))
 
@@ -378,79 +352,96 @@ class LibraryPackager:
                 logging.info("    {} -> {}".format(
                     dep.name + ' ' * (max_name_len - len(dep.name)), dep.target))
 
-            category_dest_dir = os.path.join(dest_lib_dir, category)
+            if category == 'linuxbrew':
+                category_dest_dir = linuxbrew_lib_dest_dir
+            else:
+                category_dest_dir = os.path.join(dest_lib_dir, category)
             mkdir_p(category_dest_dir)
 
             for dep in deps_in_category:
-                shutil.copy(dep.target, category_dest_dir)
-                target_basename = os.path.basename(dep.target)
+                self.install_dyn_linked_binary(dep.target, category_dest_dir)
                 if os.path.basename(dep.target) != dep.name:
                     symlink(os.path.basename(dep.target),
                             os.path.join(category_dest_dir, dep.name))
 
-        linuxbrew_lib_dest_dir = os.path.join(dest_lib_dir, 'linuxbrew')
+        # Add libresolv and libnss_* libraries explicitly because they are loaded by glibc at
+        # runtime and will not be discovered automatically using ldd.
+        for additional_lib_name_glob in ADDITIONAL_LIB_NAME_GLOBS:
+            for lib_path in glob.glob(os.path.join(LINUXBREW_CELLAR_GLIBC_DIR, '*', 'lib',
+                                                   additional_lib_name_glob)):
+                lib_basename = os.path.basename(lib_path)
+                if lib_basename.endswith('.a'):
+                    continue
+                if os.path.isfile(lib_path):
+                    self.install_dyn_linked_binary(lib_path, linuxbrew_lib_dest_dir)
+                elif os.path.islink(lib_path):
+                    link_target_basename = os.path.basename(os.readlink(lib_path))
+                    symlink(link_target_basename,
+                            os.path.join(linuxbrew_lib_dest_dir, lib_basename))
+                else:
+                    raise RuntimeError(
+                        "Expected '{}' to be a file or a symlink".format(lib_path))
 
-        # Add libnss_* libraries explicitly because they are loaded by glibc at runtime and will not
-        # be discovered automatically using ldd.
-        for libnss_path in glob.glob(os.path.join(LINUXBREW_CELLAR_GLIBC_DIR, '*', 'lib',
-                                                  'libnss_*')):
-            lib_basename = os.path.basename(libnss_path)
-            if os.path.isfile(libnss_path):
-                shutil.copy(libnss_path, linuxbrew_lib_dest_dir)
-            elif os.path.islink(libnss_path):
-                link_target_basename = os.path.basename(os.readlink(libnss_path))
-                symlink(link_target_basename, os.path.join(linuxbrew_lib_dest_dir, lib_basename))
-            else:
-                raise RuntimeError("Expected '{}' to be a file or a symlink".format(libnss_path))
+        for installed_binary in self.installed_dyn_linked_binaries:
+            # Sometimes files that we copy from other locations are not even writable by user!
+            subprocess.check_call(['chmod', 'u+w', installed_binary])
+            # Remove rpath (we will set it appropriately in post_install.sh).
+            run_patchelf('--remove-rpath', installed_binary)
 
-        # Remove rpath as we're using LD_LIBRARY_PATH in wrapper scripts.
-        for unwrapped_executable_path in unwrapped_executables:
-            run_patchelf('--remove-rpath', unwrapped_executable_path)
+        # Add other files used by glibc at runtime.
+        linuxbrew_glibc_real_path = os.path.normpath(
+            os.path.join(os.path.realpath(LINUXBREW_LDD_PATH), '..', '..'))
 
+        linuxbrew_glibc_rel_path = os.path.relpath(
+            linuxbrew_glibc_real_path, os.path.realpath(LINUXBREW_HOME))
+        # We expect glibc to live under a path like "Cellar/glibc/2.23" in LINUXBREW_HOME.
+        if not linuxbrew_glibc_rel_path.startswith('Cellar/glibc/'):
+            raise ValueError(
+                "Expected to find glibc under Cellar/glibc/<version> in Linuxbrew, but found it "
+                "at: '%s'" % linuxbrew_glibc_rel_path)
 
-if __name__ == '__main__':
-    if not os.path.isdir(YB_THIRDPARTY_DIR):
-        raise RuntimeError("Third-party dependency directory '{}' does not exist".format(
-            YB_THIRDPARTY_DIR))
+        rel_paths = []
+        for glibc_rel_path in [
+            'etc/ld.so.cache',
+            'etc/localtime',
+            'lib/locale/locale-archive',
+            'lib/gconv',
+            'libexec/getconf',
+            'share/locale',
+            'share/zoneinfo',
+        ]:
+            rel_paths.append(os.path.join(linuxbrew_glibc_rel_path, glibc_rel_path))
 
-    parser = argparse.ArgumentParser(description=LibraryPackager.__doc__)
-    parser.add_argument('--build-dir',
-                        help='Build directory to pick up executables/libraries from.',
-                        required=True)
-    parser.add_argument('--dest-dir',
-                        help='Destination directory to save the self-sufficient directory tree '
-                             'of executables and libraries at.',
-                        required=True)
-    parser.add_argument('--clean-dest',
-                        help='Remove the destination directory if it already exists. Only works '
-                             'with directories under /tmp/... for safety.',
-                        action='store_true')
-    add_common_arguments(parser)
+        terminfo_glob_pattern = os.path.join(LINUXBREW_HOME, 'Cellar/ncurses/*/share/terminfo')
+        terminfo_paths = glob.glob(terminfo_glob_pattern)
+        if len(terminfo_paths) != 1:
+            raise ValueError(
+                "Failed to find the terminfo directory using glob pattern %s. "
+                "Found: %s" % (terminfo_glob_pattern, terminfo_paths))
+        terminfo_rel_path = os.path.relpath(terminfo_paths[0], LINUXBREW_HOME)
+        rel_paths.append(terminfo_rel_path)
 
-    args = parser.parse_args()
-    log_level = logging.INFO
-    if args.verbose:
-        log_level = logging.DEBUG
-    logging.basicConfig(
-        level=log_level,
-        format="[" + path_basename(__file__) + "] %(asctime)s %(levelname)s: %(message)s")
+        for rel_path in rel_paths:
+            src = os.path.join(LINUXBREW_HOME, rel_path)
+            dst = os.path.join(linuxbrew_dest_dir, rel_path)
+            copy_deep(src, dst, create_dst_dir=True)
 
-    release_manifest_path = os.path.join(YB_SRC_ROOT, 'yb_release_manifest.json')
-    release_manifest = json.load(open(release_manifest_path))
-    if args.clean_dest and os.path.exists(args.dest_dir):
-        if args.dest_dir.startswith('/tmp/'):
-            logging.info(("--clean-dest specified and '{}' already exists, "
-                          "deleting.").format(args.dest_dir))
-            shutil.rmtree(args.dest_dir)
-        else:
-            raise RuntimeError(
-                    "For safety, --clean-dest only works with destination directories "
-                    "under /tmp/...")
+        post_install_path = os.path.join(self.main_dest_bin_dir, 'post_install.sh')
+        with open(post_install_path) as post_install_script_input:
+            post_install_script = post_install_script_input.read()
 
-    packager = LibraryPackager(build_dir=args.build_dir,
-                               seed_executable_patterns=release_manifest['bin'],
-                               dest_dir=args.dest_dir,
-                               verbose_mode=args.verbose,
-                               include_system_libs=not args.no_system_libs,
-                               include_licenses=args.include_licenses)
-    packager.package_binaries()
+        new_post_install_script = post_install_script
+        replacements = [("original_linuxbrew_path_to_patch", LINUXBREW_HOME)]
+        for macro_var_name, list_of_binary_names in [
+            ("main_elf_names_to_patch", main_elf_names_to_patch),
+            ("postgres_elf_names_to_patch", postgres_elf_names_to_patch),
+        ]:
+            replacements.append(
+                (macro_var_name, self.join_binary_names_for_bash(list_of_binary_names)))
+
+        for macro_var_name, value in replacements:
+            new_post_install_script = new_post_install_script.replace(
+                '${%s}' % macro_var_name, value)
+
+        with open(post_install_path, 'w') as post_install_script_output:
+            post_install_script_output.write(new_post_install_script)

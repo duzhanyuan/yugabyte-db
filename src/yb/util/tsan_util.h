@@ -25,6 +25,10 @@ constexpr T NonTsanVsTsan(T value_not_in_tsan, T value_in_tsan) {
 #endif
 }
 
+constexpr bool IsTsan() {
+  return NonTsanVsTsan(false, true);
+}
+
 template <class T>
 constexpr T RegularBuildVsSanitizers(T regular_build_value, T sanitizer_value) {
 #if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
@@ -33,6 +37,12 @@ constexpr T RegularBuildVsSanitizers(T regular_build_value, T sanitizer_value) {
   return regular_build_value;
 #endif
 }
+
+constexpr bool IsSanitizer() {
+  return RegularBuildVsSanitizers(false, true);
+}
+
+const int kTimeMultiplier = RegularBuildVsSanitizers(1, 3);
 
 }  // namespace yb
 

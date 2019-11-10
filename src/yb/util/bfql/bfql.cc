@@ -28,6 +28,22 @@ using strings::Substitute;
 namespace yb {
 namespace bfql {
 
+//--------------------------------------------------------------------------------------------------
+bool IsAggregateOpcode(TSOpcode op) {
+  switch (op) {
+  case TSOpcode::kAvg: FALLTHROUGH_INTENDED;
+  case TSOpcode::kCount: FALLTHROUGH_INTENDED;
+  case TSOpcode::kMax: FALLTHROUGH_INTENDED;
+  case TSOpcode::kMin: FALLTHROUGH_INTENDED;
+  case TSOpcode::kSum:
+    return true;
+  default:
+    return false;
+  }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Check compatible type in function call.
 inline bool IsCompatible(DataType left, DataType right) {
   return QLType::IsPotentiallyConvertible(left, right);
 }
@@ -54,8 +70,10 @@ static bool HasExactTypeSignature(const std::vector<DataType>& signature,
 
     // Return false if one of the following is true.
     // - The number of arguments is less than the formal count.
-    // - The datatype of an argument is not an exact match of the signature type.
-    if (index >= actual_count || signature[index] != actual_types[index]) {
+    // - The datatype of an argument is not an exact match of the signature type and the
+    //   signature type is not ANYTYPE.
+    if (index >= actual_count || (signature[index] != actual_types[index] &&
+        signature[index] != DataType::NULL_VALUE_TYPE)) {
       return false;
     }
   }
@@ -179,6 +197,7 @@ static Status FindMatch(
                       Substitute("Found too many matches for builtin function '$0'", ql_name));
       }
       compatible_operator = bf_operator;
+      VLOG(3) << "Matched function with opcode " << static_cast<int>(max_opcode);
     }
 
     // Break the loop if we have processed all operators in the overloading chain.

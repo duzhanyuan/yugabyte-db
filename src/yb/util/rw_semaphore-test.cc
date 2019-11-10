@@ -31,15 +31,16 @@
 //
 
 #include <mutex>
+#include <thread>
 #include <vector>
 
-#include <boost/thread/thread.hpp>
 #include <boost/thread/shared_mutex.hpp>
 #include <gtest/gtest.h>
+
 #include "yb/util/monotime.h"
 #include "yb/util/rw_semaphore.h"
+#include "yb/util/shared_lock.h"
 
-using boost::thread;
 using std::vector;
 
 namespace yb {
@@ -67,7 +68,7 @@ void Writer(SharedState* state) {
 void Reader(SharedState* state) {
   int prev_val = 0;
   while (true) {
-    boost::shared_lock<rw_semaphore> l(state->sem);
+    SharedLock<rw_semaphore> l(state->sem);
     // The int var should only be seen to increase.
     CHECK_GE(state->int_var, prev_val);
     prev_val = state->int_var;
@@ -81,11 +82,11 @@ void Reader(SharedState* state) {
 // When run under TSAN this also verifies the barriers.
 TEST(RWSemaphoreTest, TestBasicOperation) {
   SharedState s;
-  vector<thread*> threads;
+  vector<std::thread> threads;
   // Start 5 readers and writers.
   for (int i = 0; i < 5; i++) {
-    threads.push_back(new thread(Reader, &s));
-    threads.push_back(new thread(Writer, &s));
+    threads.emplace_back(std::bind(Reader, &s));
+    threads.emplace_back(std::bind(Writer, &s));
   }
 
   // Let them contend for a short amount of time.
@@ -97,9 +98,8 @@ TEST(RWSemaphoreTest, TestBasicOperation) {
     s.done = true;
   }
 
-  for (thread* t : threads) {
-    t->join();
-    delete t;
+  for (auto& t : threads) {
+    t.join();
   }
 }
 

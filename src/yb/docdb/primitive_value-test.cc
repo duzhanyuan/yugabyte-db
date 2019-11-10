@@ -17,6 +17,7 @@
 #include <map>
 
 #include "yb/util/random.h"
+#include "yb/util/random_util.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/bytes_formatter.h"
@@ -68,24 +69,25 @@ void TestEncoding(const char* expected_str, const PrimitiveValue& primitive_valu
 }
 
 template <typename T>
-void CompareSlices(KeyBytes key_bytes1, KeyBytes key_bytes2, T val1, T val2) {
+void CompareSlices(
+    KeyBytes key_bytes1, KeyBytes key_bytes2, T val1, T val2, string str1, string str2) {
   rocksdb::Slice slice1 = key_bytes1.AsSlice();
   rocksdb::Slice slice2 = key_bytes2.AsSlice();
   if (val1 > val2) {
     ASSERT_LT(0, slice1.compare(slice2)) << strings::Substitute("Failed for values $0, $1",
-                                                                val1, val2);
+              str1, str2);
   } else if (val1 < val2) {
     ASSERT_GT(0, slice1.compare(slice2)) << strings::Substitute("Failed for values $0, $1",
-                                                                val1, val2);
+              str1, str2);
   } else {
     ASSERT_EQ(0, slice1.compare(slice2)) << strings::Substitute("Failed for values $0, $1",
-                                                                val1, val2);
+              str1, str2);
   }
 }
 
 void TestCopy(PrimitiveValue&& v1, int64_t ttl, int64_t write_time) {
   v1.SetTtl(ttl);
-  v1.SetWritetime(write_time);
+  v1.SetWriteTime(write_time);
   // Uses copy constructor.
   PrimitiveValue v2 = v1;
   ASSERT_EQ(v1, v2);
@@ -102,7 +104,7 @@ void TestCopy(PrimitiveValue&& v1, int64_t ttl, int64_t write_time) {
 
 void TestMove(PrimitiveValue&& v1, int64_t ttl, int64_t write_time) {
   v1.SetTtl(ttl);
-  v1.SetWritetime(write_time);
+  v1.SetWriteTime(write_time);
   PrimitiveValue vtemp = v1;
   // Uses move constructor.
   PrimitiveValue v2 = std::move(v1);
@@ -139,6 +141,10 @@ TEST(PrimitiveValueTest, TestToString) {
   ASSERT_EQ("-2147483648",
             PrimitiveValue::Int32(numeric_limits<int32_t>::min()).ToString());
 
+  ASSERT_EQ("0", PrimitiveValue::UInt64(numeric_limits<uint64_t>::min()).ToString());
+  ASSERT_EQ("18446744073709551615",
+            PrimitiveValue::UInt64(numeric_limits<uint64_t>::max()).ToString());
+
   ASSERT_EQ("3.1415", PrimitiveValue::Double(3.1415).ToString());
   ASSERT_EQ("100.0", PrimitiveValue::Double(100.0).ToString());
   ASSERT_EQ("1.000000E-100", PrimitiveValue::Double(1e-100).ToString());
@@ -150,14 +156,14 @@ TEST(PrimitiveValueTest, TestToString) {
   ASSERT_EQ("ArrayIndex(123)", PrimitiveValue::ArrayIndex(123).ToString());
   ASSERT_EQ("ArrayIndex(-123)", PrimitiveValue::ArrayIndex(-123).ToString());
 
-  ASSERT_EQ("HT(p=100200300400500, l=1234)",
+  ASSERT_EQ("HT{ physical: 100200300400500 logical: 1234 }",
       PrimitiveValue(HybridTime(100200300400500l * 4096 + 1234)).ToString());
 
   // HybridTimes use an unsigned 64-bit integer as an internal representation.
-  ASSERT_EQ("HT(Min)", PrimitiveValue(HybridTime(0)).ToString());
-  ASSERT_EQ("HT(Initial)", PrimitiveValue(HybridTime(1)).ToString());
-  ASSERT_EQ("HT(Max)", PrimitiveValue(HybridTime(numeric_limits<uint64_t>::max())).ToString());
-  ASSERT_EQ("HT(Max)", PrimitiveValue(HybridTime(-1)).ToString());
+  ASSERT_EQ("HT<min>", PrimitiveValue(HybridTime(0)).ToString());
+  ASSERT_EQ("HT<initial>", PrimitiveValue(HybridTime(1)).ToString());
+  ASSERT_EQ("HT<max>", PrimitiveValue(HybridTime(numeric_limits<uint64_t>::max())).ToString());
+  ASSERT_EQ("HT<max>", PrimitiveValue(HybridTime(-1)).ToString());
 
   ASSERT_EQ("UInt16Hash(65535)",
             PrimitiveValue::UInt16Hash(numeric_limits<uint16_t>::max()).ToString());
@@ -323,7 +329,7 @@ TEST(PrimitiveValueTest, TestRandomComparableColumnId) {
     ColumnId column_id1(r.Next() % (std::numeric_limits<ColumnIdRep>::max()));
     ColumnId column_id2(r.Next() % (std::numeric_limits<ColumnIdRep>::max()));
     CompareSlices(PrimitiveValue(column_id1).ToKeyBytes(), PrimitiveValue(column_id2).ToKeyBytes(),
-                  column_id1, column_id2);
+                  column_id1, column_id2, column_id1.ToString(), column_id2.ToString());
   }
 }
 
@@ -333,7 +339,33 @@ TEST(PrimitiveValueTest, TestRandomComparableInt32) {
     int32_t val1 = r.Next32();
     int32_t val2 = r.Next32();
     CompareSlices(PrimitiveValue::Int32(val1).ToKeyBytes(),
-                  PrimitiveValue::Int32(val2).ToKeyBytes(), val1, val2);
+                  PrimitiveValue::Int32(val2).ToKeyBytes(),
+                  val1, val2,
+                  std::to_string(val1), std::to_string(val2));
+  }
+}
+
+TEST(PrimitiveValueTest, TestRandomComparableUInt64) {
+  Random r(0);
+  for (int i = 0; i < 1000; i++) {
+    uint64_t val1 = r.Next64();
+    uint64_t val2 = r.Next64();
+    CompareSlices(PrimitiveValue::UInt64(val1).ToKeyBytes(),
+                  PrimitiveValue::UInt64(val2).ToKeyBytes(),
+                  val1, val2,
+                  std::to_string(val1), std::to_string(val2));
+  }
+}
+
+TEST(PrimitiveValueTest, TestRandomComparableUUIDs) {
+  Random r(0);
+  for (int i = 0; i < 1000; i++) {
+    Uuid val1 (Uuid::Generate());
+    Uuid val2 (Uuid::Generate());
+    CompareSlices(PrimitiveValue(val1).ToKeyBytes(),
+        PrimitiveValue(val2).ToKeyBytes(),
+        val1, val2,
+        val1.ToString(), val2.ToString());
   }
 }
 
@@ -342,6 +374,7 @@ TEST(PrimitiveValueTest, TestCopy) {
   TestCopy(PrimitiveValue("a"), 1000, 1000);
   TestCopy(PrimitiveValue::Double(3.0), 1000, 1000);
   TestCopy(PrimitiveValue::Int32(1000), 1000, 1000);
+  TestCopy(PrimitiveValue::UInt64(1000), 1000, 1000);
   TestCopy(PrimitiveValue(Timestamp(1000)), 1000, 1000);
   InetAddress addr;
   ASSERT_OK(addr.FromString("1.2.3.4"));
@@ -354,11 +387,74 @@ TEST(PrimitiveValueTest, TestMove) {
   TestMove(PrimitiveValue("a"), 1000, 1000);
   TestMove(PrimitiveValue::Double(3.0), 1000, 1000);
   TestMove(PrimitiveValue::Int32(1000), 1000, 1000);
+  TestMove(PrimitiveValue::UInt64(1000), 1000, 1000);
   TestMove(PrimitiveValue(Timestamp(1000)), 1000, 1000);
   InetAddress addr;
   ASSERT_OK(addr.FromString("1.2.3.4"));
   TestMove(PrimitiveValue(addr), 1000, 1000);
   TestMove(PrimitiveValue(HybridTime(1000)), 1000, 1000);
+}
+
+// Ensures that the serialized version of a primitive value compares the same way as the primitive
+// value.
+void ComparePrimitiveValues(const PrimitiveValue& v1, const PrimitiveValue& v2) {
+  LOG(INFO) << "Comparing primitive values: " << v1 << ", " << v2;
+  KeyBytes k1;
+  KeyBytes k2;
+  v1.AppendToKey(&k1);
+  v2.AppendToKey(&k2);
+  ASSERT_EQ(v1 < v2, k1 < k2);
+}
+
+TEST(PrimitiveValueTest, TestAllTypesComparisons) {
+  Random r(MonoTime::Now().ToUint64());
+  ComparePrimitiveValues(PrimitiveValue(RandomHumanReadableString(10, &r)),
+                         PrimitiveValue(RandomHumanReadableString(10, &r)));
+
+  ComparePrimitiveValues(PrimitiveValue(r.Next64()), PrimitiveValue(r.Next64()));
+
+  ComparePrimitiveValues(PrimitiveValue(Timestamp(r.Next64())),
+                         PrimitiveValue(Timestamp(r.Next64())));
+
+  InetAddress addr1;
+  InetAddress addr2;
+  ASSERT_OK(addr1.FromBytes(RandomHumanReadableString(4, &r)));
+  ASSERT_OK(addr2.FromBytes(RandomHumanReadableString(4, &r)));
+  ComparePrimitiveValues(PrimitiveValue(addr1), PrimitiveValue(addr2));
+
+  ComparePrimitiveValues(PrimitiveValue(Uuid(Uuid::Generate())),
+                         PrimitiveValue(Uuid(Uuid::Generate())));
+
+  ComparePrimitiveValues(PrimitiveValue(HybridTime::FromMicros(r.Next64())),
+                         PrimitiveValue(HybridTime::FromMicros(r.Next64())));
+
+  ComparePrimitiveValues(
+      PrimitiveValue(DocHybridTime(HybridTime::FromMicros(r.Next64()), r.Next32())),
+      PrimitiveValue(DocHybridTime(HybridTime::FromMicros(r.Next64()), r.Next32())));
+
+  ComparePrimitiveValues(
+      PrimitiveValue(ColumnId(r.Next32())),
+      PrimitiveValue(ColumnId(r.Next32())));
+
+  ComparePrimitiveValues(
+      PrimitiveValue::Double(r.NextDoubleFraction()),
+      PrimitiveValue::Double(r.NextDoubleFraction()));
+
+  ComparePrimitiveValues(
+      PrimitiveValue::Float(r.NextDoubleFraction()),
+      PrimitiveValue::Float(r.NextDoubleFraction()));
+
+  ComparePrimitiveValues(
+      PrimitiveValue::Decimal(std::to_string(r.NextDoubleFraction()), SortOrder::kAscending),
+      PrimitiveValue::Decimal(std::to_string(r.NextDoubleFraction()), SortOrder::kAscending));
+
+  ComparePrimitiveValues(
+      PrimitiveValue::VarInt(std::to_string(r.Next64()), SortOrder::kAscending),
+      PrimitiveValue::VarInt(std::to_string(r.Next64()), SortOrder::kAscending));
+
+  ComparePrimitiveValues(
+      PrimitiveValue::Int32(r.Next32()),
+      PrimitiveValue::Int32(r.Next32()));
 }
 
 }  // namespace docdb

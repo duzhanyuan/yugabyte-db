@@ -30,6 +30,9 @@
 // under the License.
 //
 
+#include <sys/uio.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <vector>
 
@@ -43,13 +46,16 @@
 #include "yb/consensus/opid_util.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/tablet/mvcc.h"
 #include "yb/util/random.h"
 
 DEFINE_int32(num_batches, 10000,
              "Number of batches to write to/read from the Log in TestWriteManyBatches");
 
 DECLARE_int32(log_min_segments_to_retain);
+DECLARE_bool(never_fsync);
+DECLARE_bool(writable_file_use_fsync);
+DECLARE_int32(o_direct_block_alignment_bytes);
+DECLARE_int32(o_direct_block_size_bytes);
 
 namespace yb {
 namespace log {
@@ -64,7 +70,6 @@ extern const char* kTestTablet;
 struct TestLogSequenceElem {
   enum ElemType {
     REPLICATE,
-    COMMIT,
     ROLL
   };
   ElemType type;
@@ -105,9 +110,9 @@ class LogTest : public LogTestBase {
                                        int first_repl_index,
                                        LogReader* reader) {
     string fqp = GetTestPath(strings::Substitute("wal-00000000$0", sequence_number));
-    gscoped_ptr<WritableFile> w_log_seg;
+    std::unique_ptr<WritableFile> w_log_seg;
     RETURN_NOT_OK(fs_manager_->env()->NewWritableFile(fqp, &w_log_seg));
-    gscoped_ptr<RandomAccessFile> r_log_seg;
+    std::unique_ptr<RandomAccessFile> r_log_seg;
     RETURN_NOT_OK(fs_manager_->env()->NewRandomAccessFile(fqp, &r_log_seg));
 
     scoped_refptr<ReadableLogSegment> readable_segment(
@@ -162,13 +167,13 @@ TEST_F(LogTest, TestMultipleEntriesInABatch) {
   // RollOver() the batch so that we have a properly formed footer.
   ASSERT_OK(log_->AllocateSegmentAndRollOver());
 
-  LogEntries entries;
   SegmentSequence segments;
   ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
 
-  ASSERT_OK(segments[0]->ReadEntries(&entries));
+  auto read_entries = segments[0]->ReadEntries();
+  ASSERT_OK(read_entries.status);
 
-  ASSERT_EQ(2, entries.size());
+  ASSERT_EQ(2, read_entries.entries.size());
 
   // Verify the index.
   {
@@ -214,8 +219,84 @@ TEST_F(LogTest, TestFsync) {
   opid.set_index(1);
 
   ASSERT_OK(AppendNoOp(&opid));
-
   ASSERT_OK(log_->Close());
+}
+
+// Tests interval for durable wal write
+TEST_F(LogTest, TestFsyncInterval) {
+  options_.interval_durable_wal_write = MonoDelta::FromMilliseconds(1);
+  BuildLog();
+
+  OpId opid;
+  opid.set_term(0);
+  opid.set_index(1);
+
+  ASSERT_OK(AppendNoOp(&opid));
+  SleepFor(MonoDelta::FromMilliseconds(2));
+  ASSERT_OK(AppendNoOp(&opid));
+  ASSERT_OK(log_->Close());
+}
+
+// Tests interval for durable wal write physically
+TEST_F(LogTest, TestFsyncIntervalPhysical) {
+  int interval = 1;
+  options_.interval_durable_wal_write = MonoDelta::FromMilliseconds(interval);
+  FLAGS_never_fsync = false;
+  FLAGS_durable_wal_write = false;
+  options_.preallocate_segments = false;
+  BuildLog();
+
+  OpId opid;
+  opid.set_term(0);
+  opid.set_index(1);
+
+  SegmentSequence segments;
+  ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_EQ(segments.size(), 1);
+  int64_t orig_size = segments[0]->file_size();
+  string fileName = segments.back()->readable_file()->filename();
+
+  ASSERT_OK(AppendNoOp(&opid));
+  SleepFor(MonoDelta::FromMilliseconds(interval + 1));
+  ASSERT_OK(AppendNoOp(&opid));
+
+  ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_EQ(segments.size(), 1);
+  int64_t new_size = segments[0]->file_size();
+  ASSERT_GT(new_size, orig_size);
+
+#if defined(__linux__)
+  int fd = open(fileName.c_str(), O_RDONLY | O_DIRECT);
+  ASSERT_GE(fd, 0);
+#elif defined(__APPLE__)
+  int fd = open(fileName.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  ASSERT_NE(fcntl(fd, F_NOCACHE, 1), -1);
+#endif
+  void* temp_buf = nullptr;
+  ASSERT_EQ(posix_memalign(&temp_buf, FLAGS_o_direct_block_alignment_bytes,
+                           FLAGS_o_direct_block_size_bytes), 0);
+  ASSERT_GT(pread(fd, temp_buf, FLAGS_o_direct_block_size_bytes, 0), orig_size);
+  ASSERT_OK(log_->Close());
+  free(temp_buf);
+}
+
+// Tests data size for durable wal write
+TEST_F(LogTest, TestFsyncDataSize) {
+  options_.bytes_durable_wal_write_mb = 1;
+  options_.interval_durable_wal_write = MonoDelta::FromMilliseconds(10000);
+  BuildLog();
+
+  OpId opid;
+  opid.set_term(0);
+  opid.set_index(1);
+
+  int size;
+  ASSERT_OK(AppendNoOps(&opid, 100 * 1024, &size));
+  SleepFor(MonoDelta::FromMilliseconds(1));
+  ASSERT_OK(AppendNoOp(&opid));
+  ASSERT_OK(log_->Close());
+  LOG(INFO)<< "Wrote " << size << " batches to log";
 }
 
 // Regression test for part of KUDU-735:
@@ -257,7 +338,7 @@ TEST_F(LogTest, TestLogNotTrimmed) {
   SegmentSequence segments;
   ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
 
-  ASSERT_OK(segments[0]->ReadEntries(&entries));
+  ASSERT_OK(segments[0]->ReadEntries().status);
   // Close after testing to ensure correct shutdown
   // TODO : put this in TearDown() with a test on log state?
   ASSERT_OK(log_->Close());
@@ -274,14 +355,14 @@ TEST_F(LogTest, TestBlankLogFile) {
   ASSERT_EQ(log_->GetLogReader()->num_segments(), 1);
 
   // ...and we're able to read from it.
-  LogEntries entries;
   SegmentSequence segments;
   ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
 
-  ASSERT_OK(segments[0]->ReadEntries(&entries));
+  auto read_entries = segments[0]->ReadEntries();
+  ASSERT_OK(read_entries.status);
 
   // ...It's just that it's empty.
-  ASSERT_EQ(entries.size(), 0);
+  ASSERT_EQ(read_entries.entries.size(), 0);
 }
 
 void LogTest::DoCorruptionTest(CorruptionType type, CorruptionPosition place,
@@ -307,25 +388,24 @@ void LogTest::DoCorruptionTest(CorruptionType type, CorruptionPosition place,
       offset = entry.offset_in_segment + kEntryHeaderSize + 1;
       break;
   }
-  ASSERT_OK(CorruptLogFile(
-      env_.get(), log_->ActiveSegmentPathForTests(), type, offset));
+  ASSERT_OK(CorruptLogFile(env_.get(), log_->ActiveSegmentForTests()->path(), type, offset));
 
   // Open a new reader -- we don't reuse the existing LogReader from log_
   // because it has a cached header.
-  gscoped_ptr<LogReader> reader;
-  ASSERT_OK(LogReader::Open(fs_manager_.get(),
+  std::unique_ptr<LogReader> reader;
+  ASSERT_OK(LogReader::Open(fs_manager_->env(),
                             make_scoped_refptr(new LogIndex(log_->log_dir_)),
-                            kTestTablet, tablet_wal_path_, nullptr, &reader));
+                            kTestTablet, tablet_wal_path_, fs_manager_->uuid(), nullptr, &reader));
   ASSERT_EQ(1, reader->num_segments());
 
   SegmentSequence segments;
   ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
-  Status s = segments[0]->ReadEntries(&entries_);
-  ASSERT_EQ(s.CodeAsString(), expected_status.CodeAsString())
-    << "Got unexpected status: " << s.ToString();
+  auto read_entries = segments[0]->ReadEntries();
+  ASSERT_EQ(read_entries.status.CodeAsString(), expected_status.CodeAsString())
+      << "Got unexpected status: " << read_entries.status;
 
   // Last entry is ignored, but we should still see the previous ones.
-  ASSERT_EQ(expected_entries, entries_.size());
+  ASSERT_EQ(expected_entries, read_entries.entries.size());
 }
 // Tests that the log reader reads up until some truncated entry is found.
 // It should still return OK, since on a crash, it's acceptable to have
@@ -375,22 +455,26 @@ TEST_F(LogTest, TestSegmentRollover) {
   ASSERT_FALSE(segments.back()->HasFooter());
   ASSERT_OK(log_->Close());
 
-  gscoped_ptr<LogReader> reader;
-  ASSERT_OK(LogReader::Open(fs_manager_.get(), NULL, kTestTablet, tablet_wal_path_, NULL, &reader));
+  std::unique_ptr<LogReader> reader;
+  ASSERT_OK(
+      LogReader::Open(fs_manager_->env(), NULL, kTestTablet, tablet_wal_path_, fs_manager_->uuid(),
+                      NULL, &reader));
   ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
 
   ASSERT_TRUE(segments.back()->HasFooter());
 
+  size_t total_read = 0;
   for (const scoped_refptr<ReadableLogSegment>& entry : segments) {
-    Status s = entry->ReadEntries(&entries_);
-    if (!s.ok()) {
+    auto read_entries = entry->ReadEntries();
+    if (!read_entries.status.ok()) {
       FAIL() << "Failed to read entries in segment: " << entry->path()
-          << ". Status: " << s.ToString()
+          << ". Status: " << read_entries.status
           << ".\nSegments: " << DumpSegmentsToString(segments);
     }
+    total_read += read_entries.entries.size();
   }
 
-  ASSERT_EQ(num_entries, entries_.size());
+  ASSERT_EQ(num_entries, total_read);
 }
 
 TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
@@ -406,17 +490,17 @@ TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
   ASSERT_GT(header_size, 0);
   readable_segment->UpdateReadableToOffset(header_size);
 
-  LogEntries entries;
-
   // Reading the readable segment now should return OK but yield no
   // entries.
-  ASSERT_OK(readable_segment->ReadEntries(&entries));
-  ASSERT_EQ(entries.size(), 0);
+  auto read_entries = readable_segment->ReadEntries();
+  ASSERT_OK(read_entries.status);
+  ASSERT_EQ(read_entries.entries.size(), 0);
 
   // Dummy add_entry to help us estimate the size of what
   // gets written to disk.
   LogEntryBatchPB batch;
   OpId op_id = MakeOpId(1, 1);
+  batch.set_mono_time(1);
   LogEntryPB* log_entry = batch.add_entry();
   log_entry->set_type(REPLICATE);
   ReplicateMsg* repl = log_entry->mutable_replicate();
@@ -429,24 +513,24 @@ TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
 
   int written_entries_size = header_size;
   ASSERT_OK(AppendNoOps(&op_id, kNumEntries, &written_entries_size));
-  ASSERT_EQ(single_entry_size * kNumEntries + header_size, written_entries_size);
   ASSERT_EQ(written_entries_size, log_->active_segment_->written_offset());
+  ASSERT_EQ(single_entry_size * kNumEntries, written_entries_size - header_size);
 
   // Updating the readable segment with the offset of the first entry should
   // make it read a single entry even though there are several in the log.
   readable_segment->UpdateReadableToOffset(header_size + single_entry_size);
-  ASSERT_OK(readable_segment->ReadEntries(&entries));
-  ASSERT_EQ(entries.size(), 1);
-  entries.clear();
+  read_entries = readable_segment->ReadEntries();
+  ASSERT_OK(read_entries.status);
+  ASSERT_EQ(read_entries.entries.size(), 1);
 
   // Now append another entry so that the Log sets the correct readable offset
   // on the reader.
   ASSERT_OK(AppendNoOps(&op_id, 1, &written_entries_size));
 
   // Now the reader should be able to read all 5 entries.
-  ASSERT_OK(readable_segment->ReadEntries(&entries));
-  ASSERT_EQ(entries.size(), 5);
-  entries.clear();
+  read_entries = readable_segment->ReadEntries();
+  ASSERT_OK(read_entries.status);
+  ASSERT_EQ(read_entries.entries.size(), 5);
 
   // Offset should get updated for an additional entry.
   ASSERT_EQ(single_entry_size * (kNumEntries + 1) + header_size,
@@ -463,9 +547,9 @@ TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
   ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(segments.size(), 2);
   readable_segment = segments[0];
-  ASSERT_OK(readable_segment->ReadEntries(&entries));
-  ASSERT_EQ(entries.size(), 5);
-  entries.clear();
+  read_entries = readable_segment->ReadEntries();
+  ASSERT_OK(read_entries.status);
+  ASSERT_EQ(read_entries.entries.size(), 5);
 
   // Offset should get updated for an additional entry, again.
   ASSERT_OK(AppendNoOp(&op_id, &written_entries_size));
@@ -601,7 +685,7 @@ TEST_F(LogTest, TestGCOfIndexChunks) {
 TEST_F(LogTest, TestWaitUntilAllFlushed) {
   BuildLog();
   // Append 2 replicate pairs asynchronously
-  AppendReplicateBatchToLog(2, kTableType, APPEND_ASYNC);
+  AppendReplicateBatchToLog(2, APPEND_ASYNC);
 
   ASSERT_OK(log_->WaitUntilAllFlushed());
 
@@ -609,10 +693,11 @@ TEST_F(LogTest, TestWaitUntilAllFlushed) {
   vector<scoped_refptr<ReadableLogSegment> > segments;
   ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
 
-  ASSERT_OK(segments[0]->ReadEntries(&entries_));
-  ASSERT_EQ(entries_.size(), 2);
-  for (int i = 0; i < entries_.size(); i++) {
-    ASSERT_TRUE(entries_[i]->has_replicate());
+  auto read_entries = segments[0]->ReadEntries();
+  ASSERT_OK(read_entries.status);
+  ASSERT_EQ(read_entries.entries.size(), 2);
+  for (int i = 0; i < read_entries.entries.size(); i++) {
+    ASSERT_TRUE(read_entries.entries[i]->has_replicate());
   }
 }
 
@@ -671,6 +756,7 @@ TEST_F(LogTest, TestLogReopenAndGC) {
   // Turn off the time-based retention and try GCing again. This time
   // we should succeed.
   FLAGS_log_min_seconds_to_retain = 0;
+  log_->set_wal_retention_secs(0);
   ASSERT_OK(log_->GC(anchored_index, &num_gced_segments));
   ASSERT_EQ(2, num_gced_segments);
 
@@ -696,7 +782,7 @@ TEST_F(LogTest, TestWriteManyBatches) {
 
   LOG(INFO)<< "Starting to write " << num_batches << " to log";
   LOG_TIMING(INFO, "Wrote all batches to log") {
-    AppendReplicateBatchToLog(num_batches, kTableType);
+    AppendReplicateBatchToLog(num_batches);
   }
   ASSERT_OK(log_->Close());
   LOG(INFO) << "Done writing";
@@ -705,17 +791,17 @@ TEST_F(LogTest, TestWriteManyBatches) {
     LOG(INFO) << "Starting to read log";
     uint32_t num_entries = 0;
 
-    vector<scoped_refptr<ReadableLogSegment> > segments;
+    std::unique_ptr<LogReader> reader;
+    ASSERT_OK(LogReader::Open(fs_manager_->env(), nullptr, kTestTablet, tablet_wal_path_,
+                              fs_manager_->uuid(), nullptr, &reader));
 
-    gscoped_ptr<LogReader> reader;
-    ASSERT_OK(LogReader::Open(fs_manager_.get(), NULL, kTestTablet, tablet_wal_path_, NULL,
-                              &reader));
+    std::vector<scoped_refptr<ReadableLogSegment> > segments;
     ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
 
-    for (const scoped_refptr<ReadableLogSegment> entry : segments) {
-      entries_.clear();
-      ASSERT_OK(entry->ReadEntries(&entries_));
-      num_entries += entries_.size();
+    for (const scoped_refptr<ReadableLogSegment>& entry : segments) {
+      auto read_entries = entry->ReadEntries();
+      ASSERT_OK(read_entries.status);
+      num_entries += read_entries.entries.size();
     }
     ASSERT_EQ(num_entries, num_batches);
     LOG(INFO) << "End readfile";
@@ -729,9 +815,10 @@ TEST_F(LogTest, TestWriteManyBatches) {
 // seg003: 0.20 through 0.29
 // seg004: 0.30 through 0.39
 TEST_F(LogTest, TestLogReader) {
-  LogReader reader(fs_manager_.get(),
+  LogReader reader(fs_manager_->env(),
                    scoped_refptr<LogIndex>(),
                    kTestTablet,
+                   fs_manager_->uuid(),
                    nullptr);
   ASSERT_OK(reader.InitEmptyReaderForTests());
   ASSERT_OK(AppendNewEmptySegmentToReader(2, 10, &reader));
@@ -797,9 +884,9 @@ TEST_F(LogTest, TestLogReaderReturnsLatestSegmentIfIndexEmpty) {
   ASSERT_OK(log_->GetLogReader()->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(segments.size(), 1);
 
-  LogEntries entries;
-  ASSERT_OK(segments[0]->ReadEntries(&entries));
-  ASSERT_EQ(1, entries.size());
+  auto read_entries = segments[0]->ReadEntries();
+  ASSERT_OK(read_entries.status);
+  ASSERT_EQ(1, read_entries.entries.size());
 }
 
 TEST_F(LogTest, TestOpIdUtils) {
@@ -816,9 +903,6 @@ std::ostream& operator<<(std::ostream& os, const TestLogSequenceElem& elem) {
       break;
     case TestLogSequenceElem::REPLICATE:
       os << "R" << elem.id;
-      break;
-    case TestLogSequenceElem::COMMIT:
-      os << "C" << elem.id;
       break;
   }
   return os;
@@ -866,17 +950,6 @@ void LogTest::GenerateTestSequence(Random* rng, int seq_len,
     ops->push_back(op);
     (*terms_by_index)[id.index()] = id.term();
     max_repl_index = std::max(max_repl_index, id.index());
-
-    // Advance the commit index sometimes
-    if (rng->OneIn(5)) {
-      while (committed_index < id.index()) {
-        committed_index++;
-        TestLogSequenceElem op;
-        op.type = TestLogSequenceElem::COMMIT;
-        op.id = MakeOpId((*terms_by_index)[committed_index], committed_index);
-        ops->push_back(op);
-      }
-    }
   }
   terms_by_index->resize(max_repl_index + 1);
 }
@@ -889,16 +962,6 @@ void LogTest::AppendTestSequence(const vector<TestLogSequenceElem>& seq) {
       {
         OpId id(e.id);
         ASSERT_OK(AppendNoOp(&id));
-        break;
-      }
-      case TestLogSequenceElem::COMMIT:
-      {
-        gscoped_ptr<CommitMsg> commit(new CommitMsg);
-        commit->set_op_type(NO_OP);
-        commit->mutable_commited_op_id()->CopyFrom(e.id);
-        Synchronizer s;
-        ASSERT_OK(log_->AsyncAppendCommit(commit.Pass(), s.AsStatusCallback()));
-        ASSERT_OK(s.Wait());
         break;
       }
       case TestLogSequenceElem::ROLL:
@@ -1058,5 +1121,25 @@ TEST_F(LogTest, TestGetMaxIndexesToSegmentSizeMap) {
   log_->GetMaxIndexesToSegmentSizeMap(10, &max_idx_to_segment_size);
   ASSERT_EQ(0, max_idx_to_segment_size.size());
 }
+
+// Ensure that we can read replicate messages from the LogReader with a very
+// high (> 32 bit) log index and term. Regression test for KUDU-1933.
+TEST_F(LogTest, TestReadReplicatesHighIndex) {
+  const int64_t first_log_index = std::numeric_limits<int32_t>::max() - 3;
+  const int kSequenceLength = 10;
+
+  BuildLog();
+  OpId op_id;
+  op_id.set_term(first_log_index);
+  op_id.set_index(first_log_index);
+  ASSERT_OK(AppendNoOps(&op_id, kSequenceLength));
+
+  auto* reader = log_->GetLogReader();
+  ReplicateMsgs repls;
+  ASSERT_OK(reader->ReadReplicatesInRange(first_log_index, first_log_index + kSequenceLength - 1,
+                                          LogReader::kNoSizeLimit, &repls));
+  ASSERT_EQ(kSequenceLength, repls.size());
+}
+
 } // namespace log
 } // namespace yb

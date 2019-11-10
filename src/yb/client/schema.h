@@ -52,19 +52,17 @@
 #include "yb/client/client_fwd.h"
 #include "yb/client/value.h"
 #include "yb/common/schema.h"
-#include "yb/common/ql_value.h"
 
 #include "yb/util/status.h"
 
 namespace yb {
 
 // the types used internally and sent over the wire to the tserver
-typedef QLValue::InternalType InternalType;
+typedef QLValuePB::ValueCase InternalType;
 
 class ColumnSchema;
 class YBPartialRow;
 class Schema;
-class TestWorkload;
 class TableProperties;
 
 namespace tools {
@@ -88,34 +86,6 @@ class YBSchema;
 class YBSchemaBuilder;
 class YBOperation;
 
-class YBColumnStorageAttributes {
- public:
-  // NOTE: this constructor is deprecated for external use, and will
-  // be made private in a future release.
-  YBColumnStorageAttributes(EncodingType encoding = AUTO_ENCODING,
-                              CompressionType compression = DEFAULT_COMPRESSION,
-                              int32_t block_size = 0)
-      : encoding_(encoding),
-      compression_(compression),
-      block_size_(block_size) {
-  }
-
-  const EncodingType encoding() const {
-    return encoding_;
-  }
-
-  const CompressionType compression() const {
-    return compression_;
-  }
-
-  std::string ToString() const;
-
- private:
-  EncodingType encoding_;
-  CompressionType compression_;
-  int32_t block_size_;
-};
-
 class YBColumnSchema {
  public:
   static InternalType ToInternalDataType(const std::shared_ptr<QLType>& ql_type) {
@@ -128,6 +98,10 @@ class YBColumnSchema {
         return InternalType::kInt32Value;
       case INT64:
         return InternalType::kInt64Value;
+      case UINT32:
+        return InternalType::kUint32Value;
+      case UINT64:
+        return InternalType::kUint64Value;
       case FLOAT:
         return InternalType::kFloatValue;
       case DOUBLE:
@@ -138,8 +112,14 @@ class YBColumnSchema {
         return InternalType::kStringValue;
       case TIMESTAMP:
         return InternalType::kTimestampValue;
+      case DATE:
+        return InternalType::kDateValue;
+      case TIME:
+        return InternalType::kTimeValue;
       case INET:
         return InternalType::kInetaddressValue;
+      case JSONB:
+        return InternalType::kJsonbValue;
       case UUID:
         return InternalType::kUuidValue;
       case TIMEUUID:
@@ -166,12 +146,8 @@ class YBColumnSchema {
         return InternalType::VALUE_NOT_SET;
 
       case TYPEARGS: FALLTHROUGH_INTENDED;
-      case DATE: FALLTHROUGH_INTENDED;
-      case TIME: FALLTHROUGH_INTENDED;
       case UINT8: FALLTHROUGH_INTENDED;
-      case UINT16: FALLTHROUGH_INTENDED;
-      case UINT32: FALLTHROUGH_INTENDED;
-      case UINT64:
+      case UINT16:
         break;
     }
     LOG(FATAL) << "Internal error: unsupported type " << ql_type->ToString();
@@ -189,9 +165,8 @@ class YBColumnSchema {
                  bool is_hash_key = false,
                  bool is_static = false,
                  bool is_counter = false,
-                 ColumnSchema::SortingType sorting_type = ColumnSchema::SortingType::kNotSpecified,
-                 const void* default_value = NULL,
-                 YBColumnStorageAttributes attributes = YBColumnStorageAttributes());
+                 int32_t order = 0,
+                 ColumnSchema::SortingType sorting_type = ColumnSchema::SortingType::kNotSpecified);
   YBColumnSchema(const YBColumnSchema& other);
   ~YBColumnSchema();
 
@@ -208,9 +183,8 @@ class YBColumnSchema {
   bool is_nullable() const;
   bool is_static() const;
   bool is_counter() const;
-  yb::ColumnSchema::SortingType sorting_type() const;
-
-  // TODO: Expose default column value and attributes?
+  int32_t order() const;
+  ColumnSchema::SortingType sorting_type() const;
 
  private:
   friend class YBColumnSpec;
@@ -233,40 +207,9 @@ class YBColumnSchema {
 // TODO(KUDU-861): this API will also be used for an improved AlterTable API.
 class YBColumnSpec {
  public:
-  // Set the default value for this column.
-  //
-  // When adding a new column to a table, this default value will be used to
-  // fill the new column in all existing rows.
-  //
-  // When a user inserts data, if the user does not specify any value for
-  // this column, the default will also be used.
-  //
-  // The YBColumnSpec takes ownership over 'value'.
-  YBColumnSpec* Default(YBValue* value);
+  explicit YBColumnSpec(const std::string& col_name);
 
-  // Set the preferred compression for this column.
-  YBColumnSpec* Compression(CompressionType compression);
-
-  // Set the preferred encoding for this column.
-  // Note that not all encodings are supported for all column types.
-  YBColumnSpec* Encoding(EncodingType encoding);
-
-  // Set the target block size for this column.
-  //
-  // This is the number of bytes of user data packed per block on disk, and
-  // represents the unit of IO when reading this column. Larger values
-  // may improve scan performance, particularly on spinning media. Smaller
-  // values may improve random access performance, particularly for workloads
-  // that have high cache hit rates or operate on fast storage such as SSD.
-  //
-  // Note that the block size specified here corresponds to uncompressed data.
-  // The actual size of the unit read from disk may be smaller if
-  // compression is enabled.
-  //
-  // It's recommended that this not be set any lower than 4096 (4KB) or higher
-  // than 1048576 (1MB).
-  // TODO(KUDU-1107): move above info to docs
-  YBColumnSpec* BlockSize(int32_t block_size);
+  ~YBColumnSpec();
 
   // Operations only relevant for Create Table
   // ------------------------------------------------------------
@@ -315,12 +258,12 @@ class YBColumnSpec {
   // Identify this column as counter.
   YBColumnSpec* Counter();
 
-    // Operations only relevant for Alter Table
-  // ------------------------------------------------------------
+  // Add JSON operation.
+  YBColumnSpec* JsonOp(JsonOperatorPB op, const std::string& str_value);
+  YBColumnSpec* JsonOp(JsonOperatorPB op, int32_t int_value);
 
-  // Remove the default value for this column. Without a default, clients must
-  // always specify a value for this column when inserting data.
-  YBColumnSpec* RemoveDefault();
+  // Operations only relevant for Alter Table
+  // ------------------------------------------------------------
 
   // Rename this column.
   YBColumnSpec* RenameTo(const std::string& new_name);
@@ -330,13 +273,9 @@ class YBColumnSpec {
   friend class YBSchemaBuilder;
   friend class YBTableAlterer;
 
-  // This class should always be owned and deleted by one of its friends,
-  // not the user.
-  ~YBColumnSpec();
-
-  explicit YBColumnSpec(const std::string& col_name);
-
   CHECKED_STATUS ToColumnSchema(YBColumnSchema* col) const;
+
+  YBColumnSpec* JsonOp(JsonOperatorPB op, const QLValuePB& value);
 
   // Owned.
   Data* data_;
@@ -349,14 +288,14 @@ class YBColumnSpec {
 // SQL:
 //   CREATE TABLE t (
 //     my_key int not null primary key,
-//     a float default 1.5
+//     a float
 //   );
 //
 // is represented as:
 //
 //   YBSchemaBuilder t;
 //   t.AddColumn("my_key")->Type(YBColumnSchema::INT32)->NotNull()->PrimaryKey();
-//   t.AddColumn("a")->Type(YBColumnSchema::FLOAT)->Default(YBValue::FromFloat(1.5));
+//   t.AddColumn("a")->Type(YBColumnSchema::FLOAT);
 //   YBSchema schema;
 //   t.Build(&schema);
 class YBSchemaBuilder {
@@ -395,10 +334,13 @@ class YBSchema {
   explicit YBSchema(const Schema& schema);
 
   YBSchema(const YBSchema& other);
+  YBSchema(YBSchema&& other);
   ~YBSchema();
 
   YBSchema& operator=(const YBSchema& other);
+  YBSchema& operator=(YBSchema&& other);
   void CopyFrom(const YBSchema& other);
+  void MoveFrom(YBSchema&& other);
 
   // DEPRECATED: will be removed soon.
   CHECKED_STATUS Reset(const std::vector<YBColumnSchema>& columns, int key_columns,
@@ -407,6 +349,8 @@ class YBSchema {
   void Reset(std::unique_ptr<Schema> schema);
 
   bool Equals(const YBSchema& other) const;
+
+  Result<bool> Equals(const SchemaPB& pb_schema) const;
 
   const TableProperties& table_properties() const;
 
@@ -418,6 +362,9 @@ class YBSchema {
 
   // Returns the number of columns in hash primary keys.
   size_t num_hash_key_columns() const;
+
+  // Number of range key columns.
+  size_t num_range_key_columns() const;
 
   // Returns the number of columns in primary keys.
   size_t num_key_columns() const;
@@ -443,6 +390,12 @@ class YBSchema {
   YBPartialRow* NewRow() const;
 
   const std::vector<ColumnSchema>& columns() const;
+
+  int FindColumn(const GStringPiece& name) const {
+    return schema_->find_column(name);
+  }
+
+  string ToString() const;
 
  private:
   friend YBSchema YBSchemaFromSchema(const Schema& schema);

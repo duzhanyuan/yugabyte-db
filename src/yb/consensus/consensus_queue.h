@@ -47,7 +47,6 @@
 #include "yb/consensus/log_cache.h"
 #include "yb/consensus/log_util.h"
 #include "yb/consensus/opid_util.h"
-#include "yb/consensus/ref_counted_replicate.h"
 
 #include "yb/server/clock.h"
 
@@ -62,7 +61,7 @@ template<class T>
 class AtomicGauge;
 class MemTracker;
 class MetricEntity;
-class ThreadPool;
+class ThreadPoolToken;
 
 namespace log {
 class Log;
@@ -93,7 +92,7 @@ class PeerMessageQueue {
         : uuid(std::move(uuid)),
           last_received(MinimumOpId()),
           last_known_committed_idx(MinimumOpId().index()),
-          last_successful_communication_time(MonoTime::Now(MonoTime::FINE)) {}
+          last_successful_communication_time(MonoTime::Now()) {}
 
     // Check that the terms seen from a given peer only increase monotonically.
     void CheckMonotonicTerms(int64_t term) {
@@ -102,6 +101,8 @@ class PeerMessageQueue {
     }
 
     std::string ToString() const;
+
+    void ResetLeaderLeases();
 
     // UUID of the peer.
     const std::string uuid;
@@ -132,12 +133,12 @@ class PeerMessageQueue {
     // timestamp. This is not actually sent to the follower: what we're sending is the lease
     // duration, not an expiration timestamp, because the timestamp is specific to the leader's
     // monotonic clock.
-    MonoTime last_leader_lease_expiration_sent_to_follower;
+    CoarseTimePoint last_leader_lease_expiration_sent_to_follower;
 
     // The last leader lease expiration timestamp received by the follower described by this
     // TrackedPeer. We set this to the value of what we sent to that follower
     // (last_leader_lease_expiration_sent_to_follower) when we receive the follower's response.
-    MonoTime last_leader_lease_expiration_received_by_follower;
+    CoarseTimePoint last_leader_lease_expiration_received_by_follower;
 
     MicrosTime last_ht_lease_expiration_sent_to_follower =
         HybridTime::kMin.GetPhysicalValueMicros();
@@ -151,6 +152,8 @@ class PeerMessageQueue {
     // Member type of this peer in the config.
     RaftPeerPB::MemberType member_type = RaftPeerPB::UNKNOWN_MEMBER_TYPE;
 
+    uint64_t num_sst_files = 0;
+
    private:
     // The last term we saw from a given peer.
     // This is only used for sanity checking that a peer doesn't
@@ -160,9 +163,12 @@ class PeerMessageQueue {
 
   PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_entity,
                    const scoped_refptr<log::Log>& log,
+                   const std::shared_ptr<MemTracker>& server_tracker,
                    const RaftPeerPB& local_peer_pb,
                    const std::string& tablet_id,
-                   const server::ClockPtr& clock);
+                   const server::ClockPtr& clock,
+                   ConsensusContext* context,
+                   std::unique_ptr<ThreadPoolToken> raft_pool_observers_token);
 
   // Initialize the queue.
   virtual void Init(const OpId& last_locally_replicated);
@@ -200,7 +206,7 @@ class PeerMessageQueue {
   //
   // This is thread-safe against all of the read methods, but not thread-safe with concurrent Append
   // calls.
-  CHECKED_STATUS AppendOperation(const ReplicateMsgPtr& msg);
+  CHECKED_STATUS TEST_AppendOperation(const ReplicateMsgPtr& msg);
 
   // Appends a vector of messages to be replicated to the peers.  Returns OK unless the message
   // could not be added to the queue for some reason (e.g. the queue reached max size). Calls
@@ -210,9 +216,12 @@ class PeerMessageQueue {
   //
   // This is thread-safe against all of the read methods, but not thread-safe with concurrent Append
   // calls.
+  //
+  // It is possible that this method will be invoked with empty list of messages, when
+  // we update committed op id.
   virtual CHECKED_STATUS AppendOperations(
-      const ReplicateMsgs& msgs,
-      const StatusCallback& log_append_callback);
+      const ReplicateMsgs& msgs, const yb::OpId& committed_op_id,
+      RestartSafeCoarseTimePoint batch_mono_time);
 
   // Assembles a request for a peer, adding entries past 'op_id' up to
   // 'consensus_max_batch_size_bytes'.
@@ -232,7 +241,7 @@ class PeerMessageQueue {
   virtual CHECKED_STATUS RequestForPeer(
       const std::string& uuid,
       ConsensusRequestPB* request,
-      ReplicateMsgs* msg_refs,
+      ReplicateMsgsHolder* msgs_holder,
       bool* needs_remote_bootstrap,
       RaftPeerPB::MemberType* member_type = nullptr,
       bool* last_exchange_successful = nullptr);
@@ -267,6 +276,9 @@ class PeerMessageQueue {
   // Returns the current majority replicated OpId, for tests.
   OpId GetMajorityReplicatedOpIdForTests() const;
 
+  // Returns true if specified peer accepted our lease request.
+  bool PeerAcceptedOurLease(const std::string& uuid) const;
+
   // Returns a copy of the TrackedPeer with 'uuid' or crashes if the peer is not being tracked.
   TrackedPeer GetTrackedPeerForTests(std::string uuid);
 
@@ -292,8 +304,35 @@ class PeerMessageQueue {
 
   virtual ~PeerMessageQueue();
 
+  void NotifyObserversOfFailedFollower(const std::string& uuid,
+                                       const std::string& reason);
+
+  void SetContext(ConsensusContext* context) {
+    context_ = context;
+  }
+
+  const CloudInfoPB& local_cloud_info() const {
+    return local_peer_pb_.cloud_info();
+  }
+
+  // Read replicated log records starting from the OpId immediately after last_op_id.
+  CHECKED_STATUS ReadReplicatedMessagesForCDC(const OpId& last_op_id, ReplicateMsgs *msgs,
+                                              bool* have_more_messages);
+
+  void UpdateCDCConsumerOpId(const OpId& op_id);
+
+  // Get the maximum op ID that can be evicted for CDC consumer from log cache.
+  OpId GetCDCConsumerOpIdToEvict();
+
+  size_t LogCacheSize();
+  size_t EvictLogCache(size_t bytes_to_evict);
+
+  // Start memory tracking of following operations in case they are still present in our caches.
+  void TrackOperationsMemory(const OpIds& op_ids);
+
  private:
   FRIEND_TEST(ConsensusQueueTest, TestQueueAdvancesCommittedIndex);
+  FRIEND_TEST(ConsensusQueueTest, TestReadReplicatedMessagesForCDC);
 
   // Mode specifies how the queue currently behaves:
   //
@@ -390,7 +429,7 @@ class PeerMessageQueue {
   // is empty.
   const OpId& GetLastOp() const;
 
-  void TrackPeerUnlocked(const std::string& uuid);
+  TrackedPeer* TrackPeerUnlocked(const std::string& uuid);
 
   // Checks that if the queue is in LEADER mode then all registered peers are in the active config.
   // Crashes with a FATAL log message if this invariant does not hold. If the queue is in NON_LEADER
@@ -399,7 +438,6 @@ class PeerMessageQueue {
 
   // Callback when a REPLICATE message has finished appending to the local log.
   void LocalPeerAppendFinished(const OpId& id,
-                               const StatusCallback& callback,
                                const Status& status);
 
   // Updates op id replicated on each node.
@@ -411,18 +449,27 @@ class PeerMessageQueue {
   template <class Policy>
   typename Policy::result_type GetWatermark();
 
-  MonoTime LeaderLeaseExpirationWatermark();
+  CoarseTimePoint LeaderLeaseExpirationWatermark();
   MicrosTime HybridTimeLeaseExpirationWatermark();
   OpId OpIdWatermark();
+  uint64_t NumSSTFilesWatermark();
+
+  CHECKED_STATUS ReadFromLogCache(int64_t from_index,
+                                  int64_t to_index,
+                                  int max_batch_size,
+                                  const std::string& peer_uuid,
+                                  ReplicateMsgs* messages,
+                                  OpId* preceding_id,
+                                  bool* have_more_messages);
 
   std::vector<PeerMessageQueueObserver*> observers_;
 
-  // The pool which executes observer notifications.
-  // TODO consider reusing a another pool.
-  gscoped_ptr<ThreadPool> observers_pool_;
+  // The pool token which executes observer notifications.
+  std::unique_ptr<ThreadPoolToken> raft_pool_observers_token_;
 
   // PB containing identifying information about the local peer.
   const RaftPeerPB local_peer_pb_;
+  const yb::PeerId local_peer_uuid_;
 
   const TabletId tablet_id_;
 
@@ -430,6 +477,7 @@ class PeerMessageQueue {
 
   // The currently tracked peers.
   PeersMap peers_map_;
+  TrackedPeer* local_peer_ = nullptr;
 
   using LockType = simple_spinlock;
   using LockGuard = std::lock_guard<LockType>;
@@ -444,6 +492,13 @@ class PeerMessageQueue {
   Metrics metrics_;
 
   server::ClockPtr clock_;
+
+  ConsensusContext* context_ = nullptr;
+
+  // Used to protect cdc_consumer_op_id_ and cdc_consumer_op_id_last_updated_.
+  mutable rw_spinlock cdc_consumer_lock_;
+  OpId cdc_consumer_op_id_ = MaximumOpId();
+  CoarseTimePoint cdc_consumer_op_id_last_updated_ = ToCoarse(MonoTime::kMin);
 };
 
 inline std::ostream& operator <<(std::ostream& out, PeerMessageQueue::Mode mode) {
@@ -456,8 +511,9 @@ inline std::ostream& operator <<(std::ostream& out, PeerMessageQueue::State stat
 
 struct MajorityReplicatedData {
   OpId op_id;
-  MonoTime leader_lease_expiration;
+  CoarseTimePoint leader_lease_expiration;
   MicrosTime ht_lease_expiration;
+  uint64_t num_sst_files;
 };
 
 // The interface between RaftConsensus and the PeerMessageQueue.

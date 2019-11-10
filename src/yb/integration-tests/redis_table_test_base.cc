@@ -16,11 +16,15 @@
 #include <glog/logging.h>
 
 #include "yb/client/client.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/yb_op.h"
+
 #include "yb/common/redis_protocol.pb.h"
 #include "yb/integration-tests/yb_table_test_base.h"
 
-#include "yb/redisserver/redis_constants.h"
-#include "yb/redisserver/redis_parser.h"
+#include "yb/yql/redis/redisserver/redis_constants.h"
+#include "yb/yql/redis/redisserver/redis_parser.h"
 
 using std::string;
 using std::vector;
@@ -49,7 +53,7 @@ YBTableName RedisTableTestBase::table_name() {
 
 void RedisTableTestBase::CreateTable() {
   if (!table_exists_) {
-    CreateRedisTable(client_, table_name());
+    CreateRedisTable(table_name());
     client::YBSchema schema;
     PartitionSchema partition_schema;
     CHECK_OK(client_->GetTableSchema(RedisTableTestBase::table_name(), &schema, &partition_schema));
@@ -67,14 +71,13 @@ RedisClientCommand SlicesFromString(const vector<string>& args) {
 }
 
 void RedisTableTestBase::PutKeyValue(string key, string value) {
-  auto set_op = std::make_shared<YBRedisWriteOp>(table_);
+  auto set_op = std::make_shared<YBRedisWriteOp>(table_->shared_from_this());
   ASSERT_OK(ParseSet(set_op.get(), SlicesFromString({"set", key, value})));
-  ASSERT_OK(session_->Apply(set_op));
-  ASSERT_OK(session_->Flush());
+  ASSERT_OK(session_->ApplyAndFlush(set_op));
 }
 
 void RedisTableTestBase::PutKeyValueWithTtlNoFlush(string key, string value, int64_t ttl_msec) {
-  auto set_op = std::make_shared<YBRedisWriteOp>(table_);
+  auto set_op = std::make_shared<YBRedisWriteOp>(table_->shared_from_this());
   ASSERT_OK(ParseSet(set_op.get(),
       SlicesFromString({"set", key, value, "PX", std::to_string(ttl_msec)})));
   ASSERT_OK(session_->Apply(set_op));
@@ -82,11 +85,11 @@ void RedisTableTestBase::PutKeyValueWithTtlNoFlush(string key, string value, int
 
 void RedisTableTestBase::GetKeyValue(
     const string& key, const string& value, bool expect_not_found) {
-  auto get_op = std::make_shared<YBRedisReadOp>(table_);
+  auto get_op = std::make_shared<YBRedisReadOp>(table_->shared_from_this());
   ASSERT_OK(ParseGet(get_op.get(), SlicesFromString({"get", key})));
   ASSERT_OK(session_->ReadSync(get_op));
   if (expect_not_found) {
-    ASSERT_EQ(RedisResponsePB_RedisStatusCode_NOT_FOUND, get_op->response().code());
+    ASSERT_EQ(RedisResponsePB_RedisStatusCode_NIL, get_op->response().code());
   } else {
     ASSERT_EQ(RedisResponsePB_RedisStatusCode_OK, get_op->response().code());
     ASSERT_EQ(value, get_op->response().string_response());
@@ -94,14 +97,14 @@ void RedisTableTestBase::GetKeyValue(
 }
 
 void RedisTableTestBase::RedisSimpleSetCommands() {
-  session_ = NewSession(/* read_only = */ false);
+  session_ = NewSession();
   PutKeyValue("key123", "value123");
   PutKeyValue("key200", "value200");
   PutKeyValue("key300", "value300");
 }
 
 void RedisTableTestBase::RedisSimpleGetCommands() {
-  session_ = NewSession(/* read_only = */ true);
+  session_ = NewSession();
   GetKeyValue("key123", "value123");
   GetKeyValue("key200", "value200");
   GetKeyValue("key300", "value300");
@@ -109,7 +112,7 @@ void RedisTableTestBase::RedisSimpleGetCommands() {
 }
 
 void RedisTableTestBase::RedisTtlSetCommands() {
-  session_ = NewSession(/* read_only = */ false);
+  session_ = NewSession();
   PutKeyValueWithTtlNoFlush("key456", "value456", 10000);
   PutKeyValueWithTtlNoFlush("key567", "value567", 500);
   PutKeyValue("key678", "value678");
@@ -117,7 +120,7 @@ void RedisTableTestBase::RedisTtlSetCommands() {
 }
 
 void RedisTableTestBase::RedisTtlGetCommands() {
-  session_ = NewSession(/* read_only = */ true);
+  session_ = NewSession();
   GetKeyValue("key456", "value456", false);
   GetKeyValue("key567", "value567", true);
   GetKeyValue("key678", "value678", false);

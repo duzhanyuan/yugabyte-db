@@ -34,9 +34,11 @@
 
 #include <glog/logging.h>
 
-#include "yb/common/iterator.h"
+#include "yb/client/table.h"
+
 #include "yb/common/row.h"
-#include "yb/common/scan_spec.h"
+#include "yb/common/ql_rowwise_iterator_interface.h"
+
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
 #include "yb/tablet/local_tablet_writer.h"
@@ -56,15 +58,9 @@ using std::unordered_set;
 namespace yb {
 namespace tablet {
 
-using fs::ReadableBlock;
-using yb::util::to_underlying;
-
 DEFINE_int32(testiterator_num_inserts, 1000,
              "Number of rows inserted in TestRowIterator/TestInsert");
 
-static_assert(to_underlying(TableType::KUDU_COLUMNAR_TABLE_TYPE) ==
-                  to_underlying(client::YBTableType::KUDU_COLUMNAR_TABLE_TYPE),
-              "Numeric code for KUDU_COLUMNAR_TABLE_TYPE table type must be consistent");
 static_assert(to_underlying(TableType::YQL_TABLE_TYPE) ==
                   to_underlying(client::YBTableType::YQL_TABLE_TYPE),
               "Numeric code for YQL_TABLE_TYPE table type must be consistent");
@@ -75,84 +71,13 @@ static_assert(to_underlying(TableType::REDIS_TABLE_TYPE) ==
 template<class SETUP>
 class TestTablet : public TabletTestBase<SETUP> {
   typedef SETUP Type;
-
- public:
-  // Verify that iteration doesn't fail
-  void CheckCanIterate() {
-    vector<string> out_rows;
-    ASSERT_OK(this->IterateToStringList(&out_rows));
-  }
 };
 TYPED_TEST_CASE(TestTablet, TabletTestHelperTypes);
-
-// Test that historical data for a row is maintained even after the row
-// is flushed.
-TYPED_TEST(TestTablet, TestInsertsAndMutationsAreUndoneWithMVCCAfterFlush) {
-  // Insert 5 rows, after the first one, each time we insert a new row we mutate
-  // the previous one.
-
-  // Take snapshots after each operation
-  vector<MvccSnapshot> snaps;
-  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
-
-  LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
-  for (int i = 0; i < 5; i++) {
-    this->InsertTestRows(i, 1, 0);
-    DVLOG(1) << "Inserted row=" << i << ", row_idx=" << i << ", val=0";
-    MvccSnapshot ins_snaphsot(*this->tablet()->mvcc_manager());
-    snaps.push_back(ins_snaphsot);
-    LOG(INFO) << "After Insert Snapshot: " <<  ins_snaphsot.ToString();
-    if (i > 0) {
-      ASSERT_OK(this->UpdateTestRow(&writer, i - 1, i));
-      DVLOG(1) << "Mutated row=" << i - 1 << ", row_idx=" << i - 1 << ", val=" << i;
-      MvccSnapshot mut_snaphsot(*this->tablet()->mvcc_manager());
-      snaps.push_back(mut_snaphsot);
-      DVLOG(1) << "After Mutate Snapshot: " <<  mut_snaphsot.ToString();
-    }
-  }
-
-  // Collect the expected rows from the snapshots.
-  vector<vector<string>*> expected_rows;
-  CollectRowsForSnapshots(this->tablet().get(), this->client_schema_,
-                          snaps, &expected_rows);
-
-  // Now verify that we get the same thing.
-  VerifySnapshotsHaveSameResult(this->tablet().get(), this->client_schema_,
-                                snaps, expected_rows);
-
-  // Take a snapshot and mutate the rows again.
-  snaps.push_back(MvccSnapshot(*this->tablet()->mvcc_manager()));
-
-  for (int i = 0; i < 4; i++) {
-    ASSERT_OK(this->UpdateTestRow(&writer, i, i + 10));
-    DVLOG(1) << "Mutated row=" << i << ", row_idx=" << i << ", val=" << i + 10;
-    MvccSnapshot mut_snaphsot(*this->tablet()->mvcc_manager());
-    snaps.push_back(mut_snaphsot);
-    DVLOG(1) << "After Mutate Snapshot: " <<  mut_snaphsot.ToString();
-  }
-
-  // also throw a delete in there.
-  ASSERT_OK(this->DeleteTestRow(&writer, 4));
-  MvccSnapshot delete_snaphsot(*this->tablet()->mvcc_manager());
-  snaps.push_back(delete_snaphsot);
-  DVLOG(1) << "After Delete Snapshot: " <<  delete_snaphsot.ToString();
-
-  // Collect the expected rows now that we have undos and redos
-  STLDeleteElements(&expected_rows);
-  CollectRowsForSnapshots(this->tablet().get(), this->client_schema_,
-                          snaps, &expected_rows);
-
-  // Now verify that with undos and redos we get the same thing.
-  VerifySnapshotsHaveSameResult(this->tablet().get(), this->client_schema_,
-                                snaps, expected_rows);
-
-  STLDeleteElements(&expected_rows);
-}
 
 // Test that inserting a row which already exists causes an AlreadyPresent
 // error
 TYPED_TEST(TestTablet, TestInsertDuplicateKey) {
-  LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
+  LocalTabletWriter writer(this->tablet().get());
 
   CHECK_OK(this->InsertTestRow(&writer, 12345, 0));
 
@@ -188,7 +113,7 @@ TYPED_TEST(TestTablet, TestRowIteratorComplex) {
   uint64_t max_rows = this->ClampRowCount(FLAGS_testiterator_num_inserts);
 
   // Put a row in (insert and flush).
-  LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
+  LocalTabletWriter writer(this->tablet().get());
   for (int32_t i = 0; i < max_rows; i++) {
     ASSERT_OK_FAST(this->InsertTestRow(&writer, i, 0));
   }
@@ -207,25 +132,17 @@ TYPED_TEST(TestTablet, TestRowIteratorComplex) {
     }
   }
 
-  // Now iterate over the tablet and make sure the rows show up.
-  gscoped_ptr<RowwiseIterator> iter;
-  const Schema& schema = this->client_schema_;
-  ASSERT_OK(this->tablet()->NewRowIterator(schema, boost::none, &iter));
-  ScanSpec scan_spec;
-  ASSERT_OK(iter->Init(&scan_spec));
-  LOG(INFO) << "Created iter: " << iter->ToString();
-
   // Collect the expected rows.
   vector<string> rows;
   ASSERT_OK(yb::tablet::DumpTablet(*this->tablet(), this->client_schema_, &rows));
-  ASSERT_EQ(rows.size(), max_rows);
+  ASSERT_EQ(max_rows, rows.size());
 }
 
 // Test that when a row has been updated many times, it always yields
 // the most recent value.
 TYPED_TEST(TestTablet, TestMultipleUpdates) {
   // Insert and update same row several times.
-  LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
+  LocalTabletWriter writer(this->tablet().get());
   ASSERT_OK(this->InsertTestRow(&writer, 0, 0));
   ASSERT_OK(this->UpdateTestRow(&writer, 0, 1));
   ASSERT_OK(this->UpdateTestRow(&writer, 0, 2));
@@ -262,43 +179,39 @@ TYPED_TEST(TestTablet, TestMetricsInit) {
   std::stringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
   ASSERT_OK(registry->WriteAsJson(&writer, { "*" }, MetricJsonOptions()));
-  // Open tablet, should still work
+  // Open tablet, should still work. Need a new writer though, as we should not overwrite an already
+  // existing root.
   ASSERT_OK(this->harness()->Open());
-  ASSERT_OK(registry->WriteAsJson(&writer, { "*" }, MetricJsonOptions()));
+  JsonWriter new_writer(&out, JsonWriter::PRETTY);
+  ASSERT_OK(registry->WriteAsJson(&new_writer, { "*" }, MetricJsonOptions()));
 }
 
-// Test that we find the correct log segment size for different indexes.
-TEST(TestTablet, TestGetLogRetentionSizeForIndex) {
-  std::map<int64_t, int64_t> idx_size_map;
-  // We build a map that represents 3 logs. The key is the index where that log ends, and the value
-  // is its size.
-  idx_size_map[3] = 1;
-  idx_size_map[6] = 10;
-  idx_size_map[9] = 100;
+TYPED_TEST(TestTablet, TestFlushedOpId) {
+  auto tablet = this->tablet().get();
+  LocalTabletWriter writer(tablet);
+  const int64_t kCount = 1000;
 
-  // The default value should return a size of 0.
-  int64_t min_log_index = -1;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 0);
+  // Insert & flush one row to start index counting.
+  ASSERT_OK(this->InsertTestRow(&writer, 0, 333));
+  ASSERT_OK(tablet->Flush(FlushMode::kSync));
+  OpId id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
+  const int64_t start_index = id.index;
 
-  // A value at the beginning of the first segment retains all the logs.
-  min_log_index = 1;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 111);
+  this->InsertTestRows(1, kCount, 555);
+  id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
+  ASSERT_EQ(id.index, start_index);
 
-  // A value at the end of the first segment also retains everything.
-  min_log_index = 3;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 111);
+  ASSERT_OK(tablet->Flush(FlushMode::kSync));
+  id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
+  ASSERT_EQ(id.index, start_index + kCount);
 
-  // Beginning of second segment, only retain that one and the next.
-  min_log_index = 4;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 110);
+  this->InsertTestRows(1, kCount, 777);
+  id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
+  ASSERT_EQ(id.index, start_index + kCount);
 
-  // Beginning of third segment, only retain that one.
-  min_log_index = 7;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 100);
-
-  // A value after all the passed segments, doesn't retain anything.
-  min_log_index = 10;
-  ASSERT_EQ(Tablet::GetLogRetentionSizeForIndex(min_log_index, idx_size_map), 0);
+  ASSERT_OK(tablet->Flush(FlushMode::kSync));
+  id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
+  ASSERT_EQ(id.index, start_index + 2*kCount);
 }
 
 } // namespace tablet

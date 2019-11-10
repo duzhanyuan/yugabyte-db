@@ -47,7 +47,9 @@
 #include <boost/utility.hpp>
 
 #include "yb/gutil/ref_counted.h"
-#include "yb/rpc/connection.h"
+
+#include "yb/rpc/outbound_call.h"
+
 #include "yb/util/thread.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
@@ -82,32 +84,53 @@ struct ReactorMetrics {
   int32_t num_server_connections_;
 };
 
+// ------------------------------------------------------------------------------------------------
 // A task which can be enqueued to run on the reactor thread.
+
 class ReactorTask : public std::enable_shared_from_this<ReactorTask> {
  public:
-  ReactorTask();
+  // source_location - location of code that initiated this task.
+  explicit ReactorTask(const SourceLocation& source_location);
+
   ReactorTask(const ReactorTask&) = delete;
   void operator=(const ReactorTask&) = delete;
 
   // Run the task. 'reactor' is guaranteed to be the current thread.
   virtual void Run(Reactor *reactor) = 0;
 
-  // Abort the task, in the case that the reactor shut down before the
-  // task could be processed. This may or may not run on the reactor thread
-  // itself.
-  // If this is run not on reactor thread, then reactor thread should be already shut down.
+  // Abort the task, in the case that the reactor shut down before the task could be processed. This
+  // may or may not run on the reactor thread itself.  If this is run not on the reactor thread,
+  // then reactor thread should have already been shut down. It is guaranteed that Abort() will be
+  // called at most once.
   //
-  // The Reactor guarantees that the Reactor lock is free when this
-  // method is called.
-  virtual void Abort(const Status &abort_status) {}
+  // The Reactor guarantees that the Reactor lock is free when this method is called.
+  void Abort(const Status& abort_status);
+
+  virtual std::string ToString() const;
 
   virtual ~ReactorTask();
+
+ protected:
+  const SourceLocation source_location_;
+
+ private:
+  // To be overridden by subclasses.
+  virtual void DoAbort(const Status &abort_status) {}
+
+  // Used to prevent Abort() from being called twice from multiple threads.
+  std::atomic<bool> abort_called_{false};
 };
+
+typedef std::shared_ptr<ReactorTask> ReactorTaskPtr;
+
+// ------------------------------------------------------------------------------------------------
+// A task that runs the given user functor on success. Abort is ignored.
 
 template <class F>
 class FunctorReactorTask : public ReactorTask {
  public:
-  explicit FunctorReactorTask(const F& f) : f_(f) {}
+  explicit FunctorReactorTask(const F& f, const SourceLocation& source_location)
+      : ReactorTask(source_location), f_(f) {}
 
   void Run(Reactor* reactor) override  {
     f_(reactor);
@@ -117,15 +140,46 @@ class FunctorReactorTask : public ReactorTask {
 };
 
 template <class F>
-std::shared_ptr<ReactorTask> MakeFunctorReactorTask(const F& f) {
-  return std::make_shared<FunctorReactorTask<F>>(f);
+ReactorTaskPtr MakeFunctorReactorTask(const F& f, const SourceLocation& source_location) {
+  return std::make_shared<FunctorReactorTask<F>>(f, source_location);
 }
+
+// ------------------------------------------------------------------------------------------------
+// A task that runs the given user functor on success or abort.
+
+template <class F>
+class FunctorReactorTaskWithAbort : public ReactorTask {
+ public:
+  FunctorReactorTaskWithAbort(const F& f, const SourceLocation& source_location)
+      : ReactorTask(source_location), f_(f) {}
+
+  void Run(Reactor* reactor) override  {
+    f_(reactor, Status::OK());
+  }
+
+ private:
+  void DoAbort(const Status &abort_status) override {
+    f_(nullptr, abort_status);
+  }
+
+  F f_;
+};
+
+template <class F>
+ReactorTaskPtr MakeFunctorReactorTaskWithAbort(const F& f, const SourceLocation& source_location) {
+  return std::make_shared<FunctorReactorTaskWithAbort<F>>(f, source_location);
+}
+
+// ------------------------------------------------------------------------------------------------
+// A task that runs the user functor if the given weak pointer is still valid by the time the
+// reactor runs the task.
 
 template <class F, class Object>
 class FunctorReactorTaskWithWeakPtr : public ReactorTask {
  public:
-  explicit FunctorReactorTaskWithWeakPtr(const F& f, const std::weak_ptr<Object>& ptr)
-      : f_(f), ptr_(ptr) {}
+  FunctorReactorTaskWithWeakPtr(const F& f, const std::weak_ptr<Object>& ptr,
+                                const SourceLocation& source_location)
+      : ReactorTask(source_location), f_(f), ptr_(ptr) {}
 
   void Run(Reactor* reactor) override  {
     auto shared_ptr = ptr_.lock();
@@ -133,53 +187,65 @@ class FunctorReactorTaskWithWeakPtr : public ReactorTask {
       f_(reactor);
     }
   }
+
  private:
   F f_;
   std::weak_ptr<Object> ptr_;
 };
 
 template <class F, class Object>
-std::shared_ptr<ReactorTask> MakeFunctorReactorTask(const F& f,
-                                                    const std::weak_ptr<Object>& ptr) {
-  return std::make_shared<FunctorReactorTaskWithWeakPtr<F, Object>>(f, ptr);
+ReactorTaskPtr MakeFunctorReactorTask(
+    const F& f, const std::weak_ptr<Object>& ptr,
+    const SourceLocation& source_location) {
+  return std::make_shared<FunctorReactorTaskWithWeakPtr<F, Object>>(f, ptr, source_location);
 }
 
 template <class F, class Object>
-std::shared_ptr<ReactorTask> MakeFunctorReactorTask(const F& f,
-                                                    const std::shared_ptr<Object>& ptr) {
-  return std::make_shared<FunctorReactorTaskWithWeakPtr<F, Object>>(f, ptr);
+ReactorTaskPtr MakeFunctorReactorTask(
+    const F& f, const std::shared_ptr<Object>& ptr, const SourceLocation& source_location) {
+  return std::make_shared<FunctorReactorTaskWithWeakPtr<F, Object>>(f, ptr, source_location);
 }
+
+YB_DEFINE_ENUM(MarkAsDoneResult,
+    // Successfully marked as done with this call to MarkAsDone.
+    (kSuccess)
+    // Task already marked as done by another caller to MarkAsDone.
+    (kAlreadyDone)
+    // We've switched the done_ flag to true, but the task is not scheduled on a reactor thread and
+    // reactor_ is nullptr. Next calls to MarkAsDone will return kAlreadyDone.
+    (kNotScheduled))
 
 // A ReactorTask that is scheduled to run at some point in the future.
 //
 // Semantically it works like RunFunctionTask with a few key differences:
-// 1. The user function is called during Abort. Put another way, the
-//    user function is _always_ invoked, even during reactor shutdown.
-// 2. To differentiate between Abort and non-Abort, the user function
-//    receives a Status as its first argument.
+// 1. The user function is called during Abort. Put another way, the user function is _always_
+//    invoked, even during reactor shutdown.
+// 2. To differentiate between Abort and non-Abort, the user function receives a Status as its first
+//    argument.
 class DelayedTask : public ReactorTask {
  public:
-  DelayedTask(std::function<void(const Status&)> func, MonoDelta when, int64_t id,
-              const std::shared_ptr<Messenger> messenger);
+  DelayedTask(StatusFunctor func, MonoDelta when, int64_t id,
+              const SourceLocation& source_location, Messenger* messenger);
 
   // Schedules the task for running later but doesn't actually run it yet.
-  virtual void Run(Reactor* reactor) override;
-
-  // Behaves like ReactorTask::Abort.
-  virtual void Abort(const Status& abort_status) override;
+  void Run(Reactor* reactor) override;
 
   // Could be called from non-reactor thread even before reactor thread shutdown.
   void AbortTask(const Status& abort_status);
 
+  std::string ToString() const override;
+
  private:
-  // Set done_ to true if not set and return true. If done_ is already set, return false;
-  bool MarkAsDone();
+  void DoAbort(const Status& abort_status) override;
+
+  // Set done_ to true if not set and return true. If done_ is already set, return false.
+  MarkAsDoneResult MarkAsDone();
 
   // libev callback for when the registered timer fires.
-  void TimerHandler(ev::timer& watcher, int revents); // NOLINT
+  void TimerHandler(ev::timer& rwatcher, int revents); // NOLINT
 
   // User function to invoke when timer fires or when task is aborted.
-  const std::function<void(const Status&)> func_;
+  StatusFunctor func_;
 
   // Delay to apply to this task.
   const MonoDelta when_;
@@ -193,7 +259,7 @@ class DelayedTask : public ReactorTask {
   // This task's id.
   const int64_t id_;
 
-  std::shared_ptr<Messenger> messenger_;
+  Messenger* const messenger_;
 
   // Set to true whenever a Run or Abort methods are called.
   // Guarded by lock_.
@@ -203,14 +269,20 @@ class DelayedTask : public ReactorTask {
   mutable LockType lock_;
 };
 
+typedef std::vector<ReactorTaskPtr> ReactorTasks;
+
+YB_DEFINE_ENUM(ReactorState, (kRunning)(kClosing)(kClosed));
+
 class Reactor {
  public:
   // Client-side connection map.
   typedef std::unordered_map<const ConnectionId, ConnectionPtr, ConnectionIdHash> ConnectionMap;
 
-  Reactor(const std::shared_ptr<Messenger>& messenger,
+  Reactor(Messenger* messenger,
           int index,
           const MessengerBuilder &bld);
+
+  ~Reactor();
 
   Reactor(const Reactor&) = delete;
   void operator=(const Reactor&) = delete;
@@ -237,36 +309,36 @@ class Reactor {
   // libev callback for handling timer events in our epoll thread.
   void TimerHandler(ev::timer &watcher, int revents); // NOLINT
 
-  // Register an epoll timer watcher with our event loop.
-  // Does not set a timeout or start it.
-  void RegisterTimeout(ev::timer *watcher);
-
   // This may be called from another thread.
   const std::string &name() const { return name_; }
 
-  Messenger *messenger() const { return messenger_.get(); }
+  const std::string& LogPrefix() { return log_prefix_; }
 
-  MonoTime cur_time() const { return cur_time_; }
+  Messenger *messenger() const { return messenger_; }
+
+  CoarseTimePoint cur_time() const { return cur_time_; }
 
   // Drop all connections with remote address. Used in tests with broken connectivity.
+  void DropIncomingWithRemoteAddress(const IpAddress& address);
+  void DropOutgoingWithRemoteAddress(const IpAddress& address);
   void DropWithRemoteAddress(const IpAddress& address);
 
   // Return true if this reactor thread is the thread currently
   // running. Should be used in DCHECK assertions.
   bool IsCurrentThread() const;
 
-  // Indicates whether the reactor is shutting down.
+  // Return true if this reactor thread is the thread currently running, or the reactor is closing.
+  // This is the condition under which the Abort method can be called for tasks. Should be used in
+  // DCHECK assertions.
+  bool IsCurrentThreadOrStartedClosing() const;
+
+  // Shut down the given connection, removing it from the connection tracking
+  // structures of this reactor.
   //
-  // This method is thread-safe.
-  bool closing() const;
-
-  // Begin the process of connection negotiation.
-  // Must be called from the reactor thread.
-  CHECKED_STATUS StartConnection(const ConnectionPtr& conn);
-
-  // Transition back from negotiating to processing requests.
-  // Must be called from the reactor thread.
-  void CompleteConnectionNegotiation(const ConnectionPtr& conn, const Status& status);
+  // The connection is not explicitly deleted -- shared_ptr reference counting
+  // may hold on to the object after this, but callers should assume that it
+  // _may_ be deleted by this call.
+  void DestroyConnection(Connection *conn, const Status &conn_status);
 
   // Queue a new call to be sent. If the reactor is already shut down, marks
   // the call as failed.
@@ -276,25 +348,29 @@ class Reactor {
   // Must be called from the reactor thread.
   CHECKED_STATUS GetMetrics(ReactorMetrics *metrics);
 
-  void Join() { thread_->Join(); }
+  void Join();
 
   // Queues a server event on all the connections, such that every client receives it.
-  void QueueEventOnAllConnections(ServerEventListPtr server_event);
+  void QueueEventOnAllConnections(
+      ServerEventListPtr server_event, const SourceLocation& source_location);
 
   // Queue a new incoming connection. Takes ownership of the underlying fd from
   // 'socket', but not the Socket object itself.
   // If the reactor is already shut down, takes care of closing the socket.
-  void RegisterInboundSocket(Socket *socket, const Endpoint& remote);
+  void RegisterInboundSocket(
+      Socket *socket, const Endpoint& remote, std::unique_ptr<ConnectionContext> connection_context,
+      const MemTrackerPtr& mem_tracker);
 
-  // Schedule the given task's Run() method to be called on the
-  // reactor thread.
-  // If the reactor shuts down before it is run, the Abort method will be
-  // called.
-  void ScheduleReactorTask(std::shared_ptr<ReactorTask> task);
+  // Schedule the given task's Run() method to be called on the reactor thread. If the reactor shuts
+  // down before it is run, the Abort method will be called.
+  // Returns true if task was scheduled.
+  MUST_USE_RESULT bool ScheduleReactorTask(ReactorTaskPtr task) {
+    return ScheduleReactorTask(std::move(task), false /* schedule_even_closing */);
+  }
 
   template<class F>
-  void ScheduleReactorFunctor(const F& f) {
-    ScheduleReactorTask(MakeFunctorReactorTask(f));
+  bool ScheduleReactorFunctor(const F& f, const SourceLocation& source_location) {
+    return ScheduleReactorTask(MakeFunctorReactorTask(f, source_location));
   }
 
  private:
@@ -305,30 +381,21 @@ class Reactor {
   // Run the main event loop of the reactor.
   void RunThread();
 
+  MUST_USE_RESULT bool ScheduleReactorTask(ReactorTaskPtr task, bool schedule_even_closing);
+
   // Find or create a new connection to the given remote.
   // If such a connection already exists, returns that, otherwise creates a new one.
   // May return a bad Status if the connect() call fails.
   // The resulting connection object is managed internally by the reactor thread.
   // Deadline specifies latest time allowed for initializing the connection.
   CHECKED_STATUS FindOrStartConnection(const ConnectionId &conn_id,
+                                       const std::string& hostname,
                                        const MonoTime &deadline,
                                        ConnectionPtr* conn);
-
-  // Shut down the given connection, removing it from the connection tracking
-  // structures of this reactor.
-  //
-  // The connection is not explicitly deleted -- shared_ptr reference counting
-  // may hold on to the object after this, but callers should assume that it
-  // _may_ be deleted by this call.
-  void DestroyConnection(Connection *conn, const Status &conn_status);
 
   // Scan any open connections for idle ones that have been idle longer than
   // connection_keepalive_time_
   void ScanIdleConnections();
-
-  // Initiate a new connection on the given socket, setting *in_progress
-  // to true if the connection is still pending upon return.
-  static CHECKED_STATUS StartConnect(Socket *sock, const Endpoint& remote, bool *in_progress);
 
   // Assign a new outbound call to the appropriate connection object.
   // If this fails, the call is marked failed and completed.
@@ -345,29 +412,38 @@ class Reactor {
 
   void CheckReadyToStop();
 
-  // If the Reactor is closing, returns false.
-  // Otherwise, drains the pending_tasks_ queue into the provided list.
-  bool DrainTaskQueue(std::vector<std::shared_ptr<ReactorTask>> *tasks);
+  // Drains the pending_tasks_ queue into async_handler_tasks_. Returns true if the reactor is
+  // closing.
+  bool DrainTaskQueueAndCheckIfClosing();
 
   template<class F>
-  CHECKED_STATUS RunOnReactorThread(const F& f);
+  CHECKED_STATUS RunOnReactorThread(const F& f, const SourceLocation& source_location);
 
-  void CleanWaitingConnections();
+  void ShutdownConnection(const ConnectionPtr& conn);
 
   // parent messenger
-  std::shared_ptr<Messenger> messenger_;
+  Messenger* const messenger_;
 
   const std::string name_;
 
-  mutable simple_spinlock pending_tasks_lock_;
+  const std::string log_prefix_;
 
-  // Whether the reactor is shutting down.
-  // Guarded by pending_tasks_lock_.
-  bool closing_ = false;
+  mutable simple_spinlock pending_tasks_mtx_;
+
+  // Reactor status, mostly used when shutting down. Guarded by pending_tasks_mtx_, but also read
+  // without a lock for sanity checking.
+  std::atomic<ReactorState> state_{ReactorState::kRunning};
+
+  // This mutex is used to make sure that multiple threads that end up running Abort() in case the
+  // reactor has already shut down will not have data races accessing data that is normally only
+  // accessed from the reactor thread. We are using a recursive mutex because Abort() could try to
+  // submit another reactor task, which will result in Abort() being called on that other task
+  // as well.
+  std::recursive_mutex final_abort_mutex_;
 
   // Tasks to be run within the reactor thread.
-  // Guarded by lock_.
-  std::vector<std::shared_ptr<ReactorTask>> pending_tasks_;
+  // Guarded by pending_tasks_mtx_.
+  ReactorTasks pending_tasks_;
 
   scoped_refptr<yb::Thread> thread_;
 
@@ -381,18 +457,15 @@ class Reactor {
   ev::timer timer_;
 
   // Scheduled (but not yet run) delayed tasks.
-  //
-  // Each task owns its own memory and must be freed by its TaskRun and
-  // Abort members, provided it was allocated on the heap.
   std::set<std::shared_ptr<DelayedTask>> scheduled_tasks_;
 
-  std::vector<std::shared_ptr<ReactorTask>> async_handler_tasks_;
+  ReactorTasks async_handler_tasks_;
 
   // The current monotonic time.  Updated every coarse_timer_granularity_.
-  MonoTime cur_time_;
+  CoarseTimePoint cur_time_;
 
   // last time we did TCP timeouts.
-  MonoTime last_unused_tcp_scan_;
+  CoarseTimePoint last_unused_tcp_scan_;
 
   // Map of sockaddrs to Connection objects for outbound (client) connections.
   ConnectionMap client_conns_;
@@ -400,23 +473,35 @@ class Reactor {
   // List of current connections coming into the server.
   ConnectionList server_conns_;
 
-  // List of connections that should be completed before we could stop this thread.
-  ConnectionList waiting_conns_;
+  // Set of connections that should be completed before we can stop this thread.
+  std::unordered_set<ConnectionPtr> waiting_conns_;
 
   // If a connection has been idle for this much time, it is torn down.
-  const MonoDelta connection_keepalive_time_;
+  CoarseMonoClock::Duration connection_keepalive_time_;
 
   // Scan for idle connections on this granularity.
-  const MonoDelta coarse_timer_granularity_;
+  CoarseMonoClock::Duration coarse_timer_granularity_;
 
   simple_spinlock outbound_queue_lock_;
   bool outbound_queue_stopped_ = false;
-  // We found that should shutdown, but not all connections are ready for it.
+
+  // We found that we should shut down, but not all connections are ready for it.  Only accessed in
+  // the reactor thread.
   bool stopping_ = false;
+
+  CoarseTimePoint stop_start_time_;
+
   std::vector<OutboundCallPtr> outbound_queue_;
+
+  // Outbound calls currently being processed. Only accessed on the reactor thread. Could be a local
+  // variable, but implemented as a member field as an optimization to avoid memory allocation.
   std::vector<OutboundCallPtr> processing_outbound_queue_;
+
   std::vector<ConnectionPtr> processing_connections_;
-  std::shared_ptr<ReactorTask> process_outbound_queue_task_;
+  ReactorTaskPtr process_outbound_queue_task_;
+
+  // Number of outbound connections to create per each destination server address.
+  int num_connections_to_server_;
 };
 
 }  // namespace rpc

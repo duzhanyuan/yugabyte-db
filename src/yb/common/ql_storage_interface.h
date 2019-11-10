@@ -17,32 +17,53 @@
 #include <boost/optional.hpp>
 
 #include "yb/common/hybrid_time.h"
+#include "yb/common/read_hybrid_time.h"
 #include "yb/common/schema.h"
 #include "yb/common/ql_rowwise_iterator_interface.h"
 
 namespace yb {
 namespace common {
 
-// An interface to support various different storage backends for a QL table.
-class QLStorageIf {
- public:
-  virtual ~QLStorageIf() {}
+class PgsqlScanSpec;
+class QLScanSpec;
 
-  virtual CHECKED_STATUS GetIterator(
+// An interface to support various different storage backends for a QL table.
+class YQLStorageIf {
+ public:
+  typedef std::unique_ptr<YQLStorageIf> UniPtr;
+  typedef std::shared_ptr<YQLStorageIf> SharedPtr;
+
+  virtual ~YQLStorageIf() {}
+
+  //------------------------------------------------------------------------------------------------
+  // CQL Support.
+  virtual CHECKED_STATUS GetIterator(const QLReadRequestPB& request,
+                                     const Schema& projection,
+                                     const Schema& schema,
+                                     const TransactionOperationContextOpt& txn_op_context,
+                                     CoarseTimePoint deadline,
+                                     const ReadHybridTime& read_time,
+                                     const QLScanSpec& spec,
+                                     std::unique_ptr<YQLRowwiseIteratorIf>* iter) const = 0;
+
+  virtual CHECKED_STATUS BuildYQLScanSpec(
       const QLReadRequestPB& request,
-      const Schema& projection,
+      const ReadHybridTime& read_time,
       const Schema& schema,
-      const TransactionOperationContextOpt& txn_op_context,
-      HybridTime req_hybrid_time,
-      std::unique_ptr<QLRowwiseIteratorIf>* iter) const = 0;
-  virtual CHECKED_STATUS BuildQLScanSpec(const QLReadRequestPB& request,
-                                          const HybridTime& hybrid_time,
-                                          const Schema& schema,
-                                          bool include_static_columns,
-                                          const Schema& static_projection,
-                                          std::unique_ptr<common::QLScanSpec>* spec,
-                                          std::unique_ptr<common::QLScanSpec>* static_row_spec,
-                                          HybridTime* req_hybrid_time) const = 0;
+      bool include_static_columns,
+      const Schema& static_projection,
+      std::unique_ptr<common::QLScanSpec>* spec,
+      std::unique_ptr<common::QLScanSpec>* static_row_spec) const = 0;
+
+  //------------------------------------------------------------------------------------------------
+  // PGSQL Support.
+  virtual CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+                                     const Schema& projection,
+                                     const Schema& schema,
+                                     const TransactionOperationContextOpt& txn_op_context,
+                                     CoarseTimePoint deadline,
+                                     const ReadHybridTime& read_time,
+                                     YQLRowwiseIteratorIf::UniPtr* iter) const = 0;
 };
 
 }  // namespace common

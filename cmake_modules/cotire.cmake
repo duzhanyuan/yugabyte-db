@@ -3417,7 +3417,8 @@ endfunction()
 
 function (cotire)
   # As of 08/10/2017, We're only enabling cotire if YB_USE_COTIRE is set.
-  if (${YB_USE_COTIRE} OR $ENV{YB_USE_COTIRE})
+  if ("${YB_USE_COTIRE}" STREQUAL "1" OR
+      "$ENV{YB_USE_COTIRE}" STREQUAL "1")
     set(_options "")
     set(_oneValueArgs "")
     set(_multiValueArgs LANGUAGES CONFIGURATIONS)
@@ -3441,7 +3442,7 @@ function (cotire)
     GET_PROPERTY(COTIRE_REPORTED_SKIP_REASON GLOBAL PROPERTY COTIRE_REPORTED_SKIP_REASON_PROPERTY)
     if ("${COTIRE_REPORTED_SKIP_REASON}" STREQUAL "")
       SET_PROPERTY(GLOBAL PROPERTY COTIRE_REPORTED_SKIP_REASON_PROPERTY 1)
-      message("YB_USE_COTIRE CMake/environment variable not set, skipping cotire")
+      message("YB_USE_COTIRE CMake/environment variable not set to '1', skipping cotire")
     endif()
   endif()
 endfunction()

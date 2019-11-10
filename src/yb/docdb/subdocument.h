@@ -20,7 +20,7 @@
 #include <initializer_list>
 
 #include "yb/docdb/primitive_value.h"
-#include "yb/common/yql_expression.h"
+#include "yb/common/ql_expr.h"
 
 namespace yb {
 namespace docdb {
@@ -35,11 +35,17 @@ class SubDocument : public PrimitiveValue {
 
   ~SubDocument();
 
+  explicit SubDocument(ListExtendOrder extend_order) : SubDocument(ValueType::kArray) {
+    extend_order_ = extend_order;
+  }
+
   // Copy constructor. This is potentially very expensive!
   SubDocument(const SubDocument& other);
 
-  explicit SubDocument(const std::vector<PrimitiveValue> &elements) {
+  explicit SubDocument(const std::vector<PrimitiveValue> &elements,
+                       ListExtendOrder extend_order = ListExtendOrder::APPEND) {
     type_ = ValueType::kArray;
+    extend_order_ = extend_order;
     complex_data_structure_ = new ArrayContainer();
     array_container().reserve(elements.size());
     for (auto& elt : elements) {
@@ -111,9 +117,20 @@ class SubDocument : public PrimitiveValue {
   // Assume current subdocument is of map type (kObject type)
   CHECKED_STATUS ConvertToRedisTS();
 
+  // Interpret the SubDocument as a RedisSortedSet.
+  // Assume current subdocument is of map type (kObject type)
+  CHECKED_STATUS ConvertToRedisSortedSet();
+
+  // Interpret the SubDocument as a RedisSortedSet.
+  // Assume current subdocument is of map type (kObject type)
+  CHECKED_STATUS ConvertToRedisList();
+
   // @return The child subdocument of an object at the given key, or nullptr if this subkey does not
   //         exist or this subdocument is not an object.
   SubDocument* GetChild(const PrimitiveValue& key);
+
+  // Returns the number of children for this subdocument.
+  CHECKED_STATUS NumChildren(size_t *num_children);
 
   const SubDocument* GetChild(const PrimitiveValue& key) const;
 
@@ -146,7 +163,7 @@ class SubDocument : public PrimitiveValue {
   bool DeleteChild(const PrimitiveValue& key);
 
   int object_num_keys() const {
-    DCHECK_EQ(ValueType::kObject, type_);
+    DCHECK(IsObjectType(type_));
     if (!has_valid_object_container()) {
       return 0;
     }
@@ -157,31 +174,12 @@ class SubDocument : public PrimitiveValue {
   // Construct a SubDocument from a QLValuePB.
   static SubDocument FromQLValuePB(const QLValuePB& value,
                                    ColumnSchema::SortingType sorting_type,
-                                   WriteAction write_action);
+                                   yb::bfql::TSOpcode write_instr = bfql::TSOpcode::kScalarInsert);
 
   // Construct a QLValuePB from a SubDocument.
-  static void ToQLValuePB(SubDocument doc,
+  static void ToQLValuePB(const SubDocument& doc,
                           const std::shared_ptr<QLType>& ql_type,
                           QLValuePB* v);
-
-  // Construct a QLExpressionPB from a SubDocument.
-  static void ToQLExpressionPB(SubDocument doc,
-                               const std::shared_ptr<QLType>& ql_type,
-                               QLExpressionPB* ql_expr);
-
-
-
-  // Construct a SubDocument from a QLExpressionPB.
-  static CHECKED_STATUS FromQLExpressionPB(const QLExpressionPB& ql_expr,
-                                           const ColumnSchema& column_schema,
-                                           const QLTableRow& table_row,
-                                           SubDocument* subdoc,
-                                           WriteAction* write_action);
-
-  // Evaluate tablet server operators.
-  static CHECKED_STATUS EvalQLBFCallTServerPB(const QLBCallPB& tscall,
-                                              const QLTableRow& table_row,
-                                              QLValueWithPB *result);
 
  private:
 
@@ -193,7 +191,7 @@ class SubDocument : public PrimitiveValue {
   void EnsureContainerAllocated();
 
   bool container_allocated() const {
-    CHECK(IsObjectType(type_) || type_ == ValueType::kArray);
+    CHECK(IsCollectionType(type_));
     return complex_data_structure_ != nullptr;
   }
 

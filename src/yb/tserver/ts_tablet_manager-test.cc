@@ -39,8 +39,9 @@
 
 #include "yb/common/partition.h"
 #include "yb/common/schema.h"
-#include "yb/consensus/metadata.pb.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/metadata.pb.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/master/master.pb.h"
 #include "yb/tablet/tablet_peer.h"
@@ -79,11 +80,17 @@ class TsTabletManagerTest : public YBTest {
     : schema_({ ColumnSchema("key", UINT32) }, 1) {
   }
 
+  void CreateMiniTabletServer() {
+    auto mini_ts = MiniTabletServer::CreateMiniTabletServer(test_data_root_, 0);
+    ASSERT_OK(mini_ts);
+    mini_server_ = std::move(*mini_ts);
+  }
+
   void SetUp() override {
     YBTest::SetUp();
 
     test_data_root_ = GetTestPath("TsTabletManagerTest-fsroot");
-    mini_server_.reset(new MiniTabletServer(test_data_root_, 0));
+    CreateMiniTabletServer();
     ASSERT_OK(mini_server_->Start());
     mini_server_->FailHeartbeats();
 
@@ -93,16 +100,23 @@ class TsTabletManagerTest : public YBTest {
     fs_manager_ = mini_server_->server()->fs_manager();
   }
 
+  void TearDown() override {
+    if (mini_server_) {
+      mini_server_->Shutdown();
+    }
+  }
+
   Status CreateNewTablet(const std::string& tablet_id,
                          const Schema& schema,
-                         scoped_refptr<tablet::TabletPeer>* out_tablet_peer) {
+                         std::shared_ptr<tablet::TabletPeer>* out_tablet_peer) {
     Schema full_schema = SchemaBuilder(schema).Build();
     std::pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(full_schema);
 
-    scoped_refptr<tablet::TabletPeer> tablet_peer;
+    std::shared_ptr<tablet::TabletPeer> tablet_peer;
     RETURN_NOT_OK(
       tablet_manager_->CreateNewTablet(tablet_id, tablet_id, partition.second, tablet_id,
-        TableType::DEFAULT_TABLE_TYPE, full_schema, partition.first, config_, &tablet_peer));
+        TableType::DEFAULT_TABLE_TYPE, full_schema, partition.first, boost::none /* index_info */,
+        config_, &tablet_peer));
     if (out_tablet_peer) {
       (*out_tablet_peer) = tablet_peer;
     }
@@ -113,7 +127,7 @@ class TsTabletManagerTest : public YBTest {
   }
 
  protected:
-  gscoped_ptr<MiniTabletServer> mini_server_;
+  std::unique_ptr<MiniTabletServer> mini_server_;
   FsManager* fs_manager_;
   TSTabletManager* tablet_manager_;
 
@@ -125,7 +139,7 @@ class TsTabletManagerTest : public YBTest {
 
 TEST_F(TsTabletManagerTest, TestCreateTablet) {
   // Create a new tablet.
-  scoped_refptr<TabletPeer> peer;
+  std::shared_ptr<TabletPeer> peer;
   ASSERT_OK(CreateNewTablet(kTabletId, schema_, &peer));
   ASSERT_EQ(kTabletId, peer->tablet()->tablet_id());
   peer.reset();
@@ -134,7 +148,7 @@ TEST_F(TsTabletManagerTest, TestCreateTablet) {
   LOG(INFO) << "Shutting down tablet manager";
   mini_server_->Shutdown();
   LOG(INFO) << "Restarting tablet manager";
-  mini_server_.reset(new MiniTabletServer(test_data_root_, 0));
+  CreateMiniTabletServer();
   ASSERT_OK(mini_server_->Start());
   ASSERT_OK(mini_server_->WaitStarted());
   tablet_manager_ = mini_server_->server()->tablet_manager();
@@ -155,7 +169,7 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
   std::vector<ConsensusRoundPtr> consensus_rounds;
 
   for (int i = 0; i < kNumTablets; ++i) {
-    scoped_refptr<TabletPeer> peer;
+    std::shared_ptr<TabletPeer> peer;
     const auto tablet_id = Format("my-tablet-$0", i + 1);
     tablet_ids.emplace_back(tablet_id);
     ASSERT_OK(CreateNewTablet(tablet_id, schema_, &peer));
@@ -166,21 +180,21 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
     replicate_ptr->set_hybrid_time(peer->clock().Now().ToUint64());
     ConsensusRoundPtr round(new ConsensusRound(peer->consensus(), std::move(replicate_ptr)));
     consensus_rounds.emplace_back(round);
-    ASSERT_OK(peer->consensus()->Replicate(round));
+    ASSERT_OK(peer->consensus()->TEST_Replicate(round));
   }
 
   for (int i = 0; i < kNumRestarts; ++i) {
     LOG(INFO) << "Shutting down tablet manager";
     mini_server_->Shutdown();
     LOG(INFO) << "Restarting tablet manager";
-    mini_server_.reset(new MiniTabletServer(test_data_root_, 0));
+    CreateMiniTabletServer();
     ASSERT_OK(mini_server_->Start());
     auto* tablet_manager = mini_server_->server()->tablet_manager();
     ASSERT_NE(nullptr, tablet_manager);
     tablet_manager->MaybeFlushTablet();
     ASSERT_OK(mini_server_->WaitStarted());
     for (auto& tablet_id : tablet_ids) {
-      scoped_refptr<TabletPeer> peer;
+      std::shared_ptr<TabletPeer> peer;
       ASSERT_TRUE(tablet_manager->LookupTablet(tablet_id, &peer));
       ASSERT_EQ(tablet_id, peer->tablet()->tablet_id());
     }
@@ -273,7 +287,7 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
   // initial configuration change, so there is also a window for tablet-1 to
   // have been marked dirty since the last report.
   MonoDelta timeout(MonoDelta::FromSeconds(10));
-  MonoTime start(MonoTime::Now(MonoTime::FINE));
+  MonoTime start(MonoTime::Now());
   report.Clear();
   while (true) {
     bool found_tablet_2 = false;
@@ -287,7 +301,7 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
       }
     }
     if (found_tablet_2) break;
-    MonoDelta elapsed(MonoTime::Now(MonoTime::FINE).GetDeltaSince(start));
+    MonoDelta elapsed(MonoTime::Now().GetDeltaSince(start));
     ASSERT_TRUE(elapsed.LessThan(timeout)) << "Waited too long for tablet-2 to be marked dirty: "
                                            << elapsed.ToString() << ". "
                                            << "Latest report: " << report.ShortDebugString();

@@ -39,8 +39,17 @@
 
 #include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
-#include "yb/client/row_result.h"
+#include "yb/client/error.h"
 #include "yb/client/schema.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
+
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
@@ -52,6 +61,7 @@
 #include "yb/master/master.pb.h"
 #include "yb/master/master-test-util.h"
 #include "yb/server/hybrid_clock.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
@@ -62,13 +72,16 @@
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_util.h"
 
+using namespace std::literals;
+
 DECLARE_bool(enable_data_block_fsync);
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(flush_rocksdb_on_shutdown);
 DECLARE_int32(heartbeat_interval_ms);
-DECLARE_int32(flush_threshold_mb);
 DECLARE_bool(use_hybrid_clock);
 DECLARE_int32(ht_lease_duration_ms);
+DECLARE_int32(replication_factor);
+DECLARE_int32(log_min_seconds_to_retain);
 
 namespace yb {
 
@@ -76,9 +89,6 @@ using client::YBClient;
 using client::YBClientBuilder;
 using client::YBColumnSchema;
 using client::YBError;
-using client::KuduInsert;
-using client::YBRowResult;
-using client::YBScanner;
 using client::YBSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
@@ -87,7 +97,6 @@ using client::YBTableAlterer;
 using client::YBTableCreator;
 using client::YBTableName;
 using client::YBTableType;
-using client::KuduUpdate;
 using client::YBValue;
 using std::shared_ptr;
 using master::AlterTableRequestPB;
@@ -99,22 +108,21 @@ using std::vector;
 using tablet::TabletPeer;
 using tserver::MiniTabletServer;
 
-class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
+class AlterTableTest : public YBMiniClusterTestBase<MiniCluster>,
+                       public ::testing::WithParamInterface<int> {
  public:
   AlterTableTest()
     : stop_threads_(false),
       inserted_idx_(0) {
 
     YBSchemaBuilder b;
-    b.AddColumn("c0")->Type(INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("c0")->Type(INT32)->NotNull()->HashPrimaryKey();
     b.AddColumn("c1")->Type(INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
 
     FLAGS_enable_data_block_fsync = false; // Keep unit tests fast.
     FLAGS_use_hybrid_clock = false;
     FLAGS_ht_lease_duration_ms = 0;
-    ANNOTATE_BENIGN_RACE(&FLAGS_flush_threshold_mb,
-                         "safe to change at runtime");
     ANNOTATE_BENIGN_RACE(&FLAGS_enable_maintenance_manager,
                          "safe to change at runtime");
   }
@@ -127,14 +135,15 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
 
     MiniClusterOptions opts;
     opts.num_tablet_servers = num_replicas();
+    FLAGS_replication_factor = num_replicas();
     cluster_.reset(new MiniCluster(env_.get(), opts));
     ASSERT_OK(cluster_->Start());
     ASSERT_OK(cluster_->WaitForTabletServerCount(num_replicas()));
 
-    CHECK_OK(YBClientBuilder()
-             .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
-             .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
-             .Build(&client_));
+    client_ = CHECK_RESULT(YBClientBuilder()
+        .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
+        .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
+        .Build());
 
     CHECK_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
 
@@ -143,7 +152,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
     CHECK_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
              .table_type(YBTableType::YQL_TABLE_TYPE)
-             .num_replicas(num_replicas())
+             .num_tablets(1)
              .Create());
 
     if (num_replicas() == 1) {
@@ -153,14 +162,14 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   void DoTearDown() override {
+    client_.reset();
     tablet_peer_.reset();
     cluster_->Shutdown();
   }
 
-  scoped_refptr<TabletPeer> LookupTabletPeer() {
-    vector<scoped_refptr<TabletPeer> > peers;
+  std::shared_ptr<TabletPeer> LookupTabletPeer() {
+    vector<std::shared_ptr<TabletPeer> > peers;
     cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletPeers(&peers);
-    CHECK_EQ(1, peers.size());
     return peers[0];
   }
 
@@ -193,7 +202,8 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
     int wait_time = 1000;
     for (int i = 0; i < attempts; ++i) {
       bool in_progress;
-      RETURN_NOT_OK(client_->IsAlterTableInProgress(table_name, &in_progress));
+      string table_id;
+      RETURN_NOT_OK(client_->IsAlterTableInProgress(table_name, table_id, &in_progress));
       if (!in_progress) {
         return Status::OK();
       }
@@ -206,19 +216,15 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   Status AddNewI32Column(const YBTableName& table_name,
-                         const string& column_name,
-                         int32_t default_value) {
-    return AddNewI32Column(table_name, column_name, default_value,
-                           MonoDelta::FromSeconds(60));
+                         const string& column_name) {
+    return AddNewI32Column(table_name, column_name, MonoDelta::FromSeconds(60));
   }
 
   Status AddNewI32Column(const YBTableName& table_name,
                          const string& column_name,
-                         int32_t default_value,
                          const MonoDelta& timeout) {
     gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(table_name));
-    table_alterer->AddColumn(column_name)->Type(INT32)->
-      NotNull()->Default(YBValue::FromInt(default_value));
+    table_alterer->AddColumn(column_name)->Type(INT32)->NotNull();
     return table_alterer->timeout(timeout)->Alter();
   }
 
@@ -234,27 +240,18 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
 
   void UpdateRow(int32_t row_key, const map<string, int32_t>& updates);
 
-  void ScanToStrings(vector<string>* rows);
+  std::vector<std::string> ScanToStrings();
 
-  void InserterThread();
-  void UpdaterThread();
+  void WriteThread(QLWriteRequestPB::QLStmtType type);
   void ScannerThread();
 
-  Status CreateSplitTable(const YBTableName& table_name) {
-    vector<const YBPartialRow*> split_rows;
-    for (int32_t i = 1; i < 10; i++) {
-      YBPartialRow* row = schema_.NewRow();
-      CHECK_OK(row->SetInt32(0, i * 100));
-      split_rows.push_back(row);
-    }
-
+  Status CreateTable(const YBTableName& table_name) {
     RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name()));
 
     gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     return table_creator->table_name(table_name)
         .schema(&schema_)
-        .num_replicas(num_replicas())
-        .split_rows(split_rows)
+        .num_tablets(10)
         .Create();
   }
 
@@ -263,11 +260,11 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
 
   static const YBTableName kTableName;
 
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
 
   YBSchema schema_;
 
-  scoped_refptr<TabletPeer> tablet_peer_;
+  std::shared_ptr<TabletPeer> tablet_peer_;
 
   AtomicBool stop_threads_;
 
@@ -280,7 +277,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
 // Subclass which creates three servers and a replicated cluster.
 class ReplicatedAlterTableTest : public AlterTableTest {
  protected:
-  int num_replicas() const override { return 3; }
+  virtual int num_replicas() const override { return 3; }
 };
 
 const YBTableName AlterTableTest::kTableName("my_keyspace", "fake-table");
@@ -290,7 +287,7 @@ const YBTableName AlterTableTest::kTableName("my_keyspace", "fake-table");
 // TODO: create and verify multiple tablets when the client will support that.
 TEST_F(AlterTableTest, TestTabletReports) {
   ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
-  ASSERT_OK(AddNewI32Column(kTableName, "new-i32", 0));
+  ASSERT_OK(AddNewI32Column(kTableName, "new-i32"));
   ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
 }
 
@@ -299,35 +296,9 @@ TEST_F(AlterTableTest, TestAddExistingColumn) {
   ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
 
   {
-    Status s = AddNewI32Column(kTableName, "c1", 0);
+    Status s = AddNewI32Column(kTableName, "c1");
     ASSERT_TRUE(s.IsAlreadyPresent());
     ASSERT_STR_CONTAINS(s.ToString(), "The column already exists: c1");
-  }
-
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
-}
-
-// Verify that adding a NOT NULL column without defaults will return an error.
-//
-// This doesn't use the YBClient because it's trying to make an invalid request.
-// Our APIs for the client are designed such that it's impossible to send such
-// a request.
-TEST_F(AlterTableTest, TestAddNotNullableColumnWithoutDefaults) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
-
-  {
-    AlterTableRequestPB req;
-    kTableName.SetIntoTableIdentifierPB(req.mutable_table());
-
-    AlterTableRequestPB::Step *step = req.add_alter_schema_steps();
-    step->set_type(AlterTableRequestPB::ADD_COLUMN);
-    ColumnSchemaToPB(ColumnSchema("c2", INT32),
-                     step->mutable_add_column()->mutable_schema());
-    AlterTableResponsePB resp;
-    Status s = cluster_->mini_master()->master()->catalog_manager()->AlterTable(
-      &req, &resp, nullptr);
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "column `c2`: NOT NULL columns must have a default");
   }
 
   ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
@@ -347,11 +318,10 @@ TEST_F(AlterTableTest, TestAddNullableColumnWithoutDefault) {
 
   InsertRows(1, 1);
 
-  vector<string> rows;
-  ScanToStrings(&rows);
-  ASSERT_EQ(2, rows.size());
-  EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 new=NULL)", rows[0]);
-  EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 new=NULL)", rows[1]);
+  vector<string> rows = ScanToStrings();
+  EXPECT_EQ(2, rows.size());
+  EXPECT_EQ("{ int32:0, int32:0, null }", rows[0]);
+  EXPECT_EQ("{ int32:16777216, int32:1, null }", rows[1]);
 }
 
 // Verify that, if a tablet server is down when an alter command is issued,
@@ -363,8 +333,7 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
 
   // Send the Alter request
   {
-    Status s = AddNewI32Column(kTableName, "new-32", 10,
-                               MonoDelta::FromMilliseconds(500));
+    Status s = AddNewI32Column(kTableName, "new-32", MonoDelta::FromMilliseconds(500));
     ASSERT_TRUE(s.IsTimedOut());
   }
 
@@ -372,9 +341,10 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
   YBSchema schema;
   PartitionSchema partition_schema;
   bool alter_in_progress = false;
+  string table_id;
   ASSERT_OK(client_->GetTableSchema(kTableName, &schema, &partition_schema));
   ASSERT_TRUE(schema_.Equals(schema));
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, table_id, &alter_in_progress));
   ASSERT_TRUE(alter_in_progress);
 
   // Restart the TS and wait for the new schema
@@ -392,8 +362,7 @@ TEST_F(AlterTableTest, TestShutdownWithPendingTasks) {
 
   // Send the Alter request
   {
-    Status s = AddNewI32Column(kTableName, "new-i32", 10,
-                               MonoDelta::FromMilliseconds(500));
+    Status s = AddNewI32Column(kTableName, "new-i32", MonoDelta::FromMilliseconds(500));
     ASSERT_TRUE(s.IsTimedOut());
   }
 }
@@ -411,8 +380,7 @@ TEST_F(AlterTableTest, TestRestartTSDuringAlter) {
 
   ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
 
-  Status s = AddNewI32Column(kTableName, "new-i32", 10,
-                             MonoDelta::FromMilliseconds(1));
+  Status s = AddNewI32Column(kTableName, "new-i32", MonoDelta::FromMilliseconds(1));
   ASSERT_TRUE(s.IsTimedOut());
 
   // Restart the TS while alter is running
@@ -427,7 +395,7 @@ TEST_F(AlterTableTest, TestRestartTSDuringAlter) {
 }
 
 TEST_F(AlterTableTest, TestGetSchemaAfterAlterTable) {
-  ASSERT_OK(AddNewI32Column(kTableName, "new-i32", 10));
+  ASSERT_OK(AddNewI32Column(kTableName, "new-i32"));
 
   YBSchema s;
   PartitionSchema partition_schema;
@@ -436,104 +404,95 @@ TEST_F(AlterTableTest, TestGetSchemaAfterAlterTable) {
 
 void AlterTableTest::InsertRows(int start_row, int num_rows) {
   shared_ptr<YBSession> session = client_->NewSession();
-  shared_ptr<YBTable> table;
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(15 * 1000);
-  CHECK_OK(client_->OpenTable(kTableName, &table));
+  session->SetTimeout(15s);
+  client::TableHandle table;
+  ASSERT_OK(table.Open(kTableName, client_.get()));
+  std::vector<std::shared_ptr<client::YBqlOp>> ops;
 
   // Insert a bunch of rows with the current schema
   for (int i = start_row; i < start_row + num_rows; i++) {
-    shared_ptr<KuduInsert> insert(table->NewInsert());
+    auto op = table.NewInsertOp();
     // Endian-swap the key so that we spew inserts randomly
     // instead of just a sequential write pattern. This way
     // compactions may actually be triggered.
     int32_t key = bswap_32(i);
-    CHECK_OK(insert->mutable_row()->SetInt32(0, key));
+    auto req = op->mutable_request();
+    QLAddInt32HashValue(req, key);
 
-    if (table->schema().num_columns() > 1) {
-      CHECK_OK(insert->mutable_row()->SetInt32(1, i));
+    if (table.schema().num_columns() > 1) {
+      table.AddInt32ColumnValue(req, table.schema().columns()[1].name(), i);
     }
 
-    CHECK_OK(session->Apply(insert));
+    ops.push_back(op);
+    ASSERT_OK(session->Apply(op));
 
-    if (i % 50 == 0) {
-      FlushSessionOrDie(session);
+    if (ops.size() >= 50) {
+      FlushSessionOrDie(session, ops);
+      ops.clear();
     }
   }
 
-  FlushSessionOrDie(session);
+  FlushSessionOrDie(session, ops);
 }
 
 void AlterTableTest::UpdateRow(int32_t row_key,
                                const map<string, int32_t>& updates) {
   shared_ptr<YBSession> session = client_->NewSession();
-  shared_ptr<YBTable> table;
-  CHECK_OK(client_->OpenTable(kTableName, &table));
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(15 * 1000);
-  shared_ptr<KuduUpdate> update(table->NewUpdate());
+  session->SetTimeout(15s);
+
+  client::TableHandle table;
+  ASSERT_OK(table.Open(kTableName, client_.get()));
+
+  auto update = table.NewUpdateOp();
   int32_t key = bswap_32(row_key); // endian swap to match 'InsertRows'
-  CHECK_OK(update->mutable_row()->SetInt32(0, key));
-  typedef map<string, int32_t>::value_type entry;
-  for (const entry& e : updates) {
-    CHECK_OK(update->mutable_row()->SetInt32(e.first, e.second));
+  QLAddInt32HashValue(update->mutable_request(), key);
+  for (const auto& e : updates) {
+    table.AddInt32ColumnValue(update->mutable_request(), e.first, e.second);
   }
   CHECK_OK(session->Apply(update));
   FlushSessionOrDie(session);
 }
 
-void AlterTableTest::ScanToStrings(vector<string>* rows) {
-  shared_ptr<YBTable> table;
-  CHECK_OK(client_->OpenTable(kTableName, &table));
-  ScanTableToStrings(table.get(), rows);
-  std::sort(rows->begin(), rows->end());
+std::vector<string> AlterTableTest::ScanToStrings() {
+  client::TableHandle table;
+  EXPECT_OK(table.Open(kTableName, client_.get()));
+  auto result = ScanTableToStrings(table);
+  std::sort(result.begin(), result.end());
+  return result;
 }
 
 // Verify that the 'num_rows' starting with 'start_row' fit the given pattern.
 // Note that the 'start_row' here is not a row key, but the pre-transformation row
 // key (InsertRows swaps endianness so that we random-write instead of sequential-write)
 void AlterTableTest::VerifyRows(int start_row, int num_rows, VerifyPattern pattern) {
-  shared_ptr<YBTable> table;
-  CHECK_OK(client_->OpenTable(kTableName, &table));
-  YBScanner scanner(table.get());
-  CHECK_OK(scanner.SetSelection(YBClient::LEADER_ONLY));
-  CHECK_OK(scanner.Open());
+  client::TableHandle table;
+  ASSERT_OK(table.Open(kTableName, client_.get()));
 
   int verified = 0;
-  vector<YBRowResult> results;
-  while (scanner.HasMoreRows()) {
-    CHECK_OK(scanner.NextBatch(&results));
+  for (const auto& row : client::TableRange(table)) {
+    int32_t key = row.column(0).int32_value();
+    int32_t row_idx = bswap_32(key);
+    if (row_idx < start_row || row_idx >= start_row + num_rows) {
+      // Outside the range we're verifying
+      continue;
+    }
+    verified++;
 
-    for (const YBRowResult& row : results) {
-      int32_t key = 0;
-      CHECK_OK(row.GetInt32(0, &key));
-      int32_t row_idx = bswap_32(key);
-      if (row_idx < start_row || row_idx >= start_row + num_rows) {
-        // Outside the range we're verifying
+    switch (pattern) {
+      case C1_MATCHES_INDEX:
+        ASSERT_EQ(row_idx, row.column(1).int32_value());
+        break;
+      case C1_IS_DEADBEEF:
+        ASSERT_TRUE(row.column(1).IsNull());
+        break;
+      case C1_DOESNT_EXIST:
         continue;
-      }
-      verified++;
-
-      if (pattern == C1_DOESNT_EXIST) {
-        continue;
-      }
-
-      int32_t c1 = 0;
-      CHECK_OK(row.GetInt32(1, &c1));
-
-      switch (pattern) {
-        case C1_MATCHES_INDEX:
-          CHECK_EQ(row_idx, c1);
-          break;
-        case C1_IS_DEADBEEF:
-          CHECK_EQ(0xdeadbeef, c1);
-          break;
-        default:
-          LOG(FATAL);
-      }
+      default:
+        ASSERT_TRUE(false) << "Invalid pattern: " << pattern;
+        break;
     }
   }
-  CHECK_EQ(verified, num_rows);
+  ASSERT_EQ(verified, num_rows);
 }
 
 // Test inserting/updating some data, dropping a column, and adding a new one
@@ -544,8 +503,6 @@ TEST_F(AlterTableTest, TestDropAndAddNewColumn) {
   // Reduce flush threshold so that we get both on-disk data
   // for the alter as well as in-MRS data.
   // This also increases chances of a race.
-  FLAGS_flush_threshold_mb = 3;
-
   const int kNumRows = AllowSlowTests() ? 100000 : 1000;
   InsertRows(0, kNumRows);
 
@@ -554,22 +511,19 @@ TEST_F(AlterTableTest, TestDropAndAddNewColumn) {
 
   LOG(INFO) << "Dropping and adding back c1";
   gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-  ASSERT_OK(table_alterer->DropColumn("c1")
-            ->Alter());
+  ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
-  ASSERT_OK(AddNewI32Column(kTableName, "c1", 0xdeadbeef));
+  ASSERT_OK(AddNewI32Column(kTableName, "c1"));
 
   LOG(INFO) << "Verifying that the new default shows up";
   VerifyRows(0, kNumRows, C1_IS_DEADBEEF);
-
-
 }
 
-TEST_F(AlterTableTest, TestCompactionAfterDrop) {
+TEST_F(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   LOG(INFO) << "Inserting rows";
   InsertRows(0, 3);
 
-  std::string docdb_dump = tablet_peer_->tablet()->DocDBDumpStrInTest();
+  std::string docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
   // DocDB should not be empty right now.
   ASSERT_NE(0, docdb_dump.length());
 
@@ -580,10 +534,10 @@ TEST_F(AlterTableTest, TestCompactionAfterDrop) {
   LOG(INFO) << "Forcing compaction";
   tablet_peer_->tablet()->ForceRocksDBCompactInTest();
 
-  docdb_dump = tablet_peer_->tablet()->DocDBDumpStrInTest();
+  docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
 
   LOG(INFO) << "Checking that docdb is empty";
-  ASSERT_EQ(0, docdb_dump.length());
+  ASSERT_EQ("", docdb_dump);
 
   ASSERT_OK(cluster_->RestartSync());
   tablet_peer_ = LookupTabletPeer();
@@ -592,9 +546,7 @@ TEST_F(AlterTableTest, TestCompactionAfterDrop) {
 // This tests the scenario where the log entries immediately after last RocksDB flush are for a
 // different schema than the one that was last flushed to the superblock.
 TEST_F(AlterTableTest, TestLogSchemaReplay) {
-  vector<string> rows;
-
-  ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
+  ASSERT_OK(AddNewI32Column(kTableName, "c2"));
   InsertRows(0, 2);
   UpdateRow(1, { {"c1", 0} });
 
@@ -609,10 +561,10 @@ TEST_F(AlterTableTest, TestLogSchemaReplay) {
 
   UpdateRow(1, { {"c2", 10002} });
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  auto rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=10001)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c2=10002)", rows[1]);
+  ASSERT_EQ("{ int32:0, int32:10001 }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, int32:10002 }", rows[1]);
 
   google::FlagSaver flag_saver;
   // Restart without flushing RocksDB
@@ -620,10 +572,10 @@ TEST_F(AlterTableTest, TestLogSchemaReplay) {
   LOG(INFO) << "Restarting tablet";
   ASSERT_NO_FATALS(RestartTabletServer());
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=10001)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c2=10002)", rows[1]);
+  ASSERT_EQ("{ int32:0, int32:10001 }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, int32:10002 }", rows[1]);
 }
 
 // Tests that a renamed table can still be altered. This is a regression test, we used to not carry
@@ -634,16 +586,14 @@ TEST_F(AlterTableTest, TestRenameTableAndAdd) {
   ASSERT_OK(table_alterer->RenameTo(new_name)
             ->Alter());
 
-  ASSERT_OK(AddNewI32Column(new_name, "new", 0xdeadbeef));
+  ASSERT_OK(AddNewI32Column(new_name, "new"));
 }
 
 // Test restarting a tablet server several times after various
 // schema changes.
 // This is a regression test for KUDU-462.
 TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
-  vector<string> rows;
-
-  ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
+  ASSERT_OK(AddNewI32Column(kTableName, "c2"));
   InsertRows(0, 1);
   ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
   InsertRows(1, 1);
@@ -651,41 +601,67 @@ TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
   UpdateRow(0, { {"c1", 10001} });
   UpdateRow(1, { {"c1", 10002} });
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  auto rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c1=10001, int32 c2=12345)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c1=10002, int32 c2=12345)", rows[1]);
+  ASSERT_EQ("{ int32:0, int32:10001, null }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, int32:10002, null }", rows[1]);
 
   LOG(INFO) << "Dropping c1";
   gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=12345)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c2=12345)", rows[1]);
+  ASSERT_EQ("{ int32:0, null }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, null }", rows[1]);
 
   // Test that restart doesn't fail when trying to replay updates or inserts
   // with the dropped column.
   ASSERT_NO_FATALS(RestartTabletServer());
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=12345)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c2=12345)", rows[1]);
+  ASSERT_EQ("{ int32:0, null }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, null }", rows[1]);
 
   // Add back a column called 'c2', but should not materialize old data.
-  ASSERT_OK(AddNewI32Column(kTableName, "c1", 20000));
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  ASSERT_OK(AddNewI32Column(kTableName, "c1"));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=12345, int32 c1=20000)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c2=12345, int32 c1=20000)", rows[1]);
+  ASSERT_EQ("{ int32:0, null, null }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, null, null }", rows[1]);
 
   ASSERT_NO_FATALS(RestartTabletServer());
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=12345, int32 c1=20000)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c2=12345, int32 c1=20000)", rows[1]);
+  ASSERT_EQ("{ int32:0, null, null }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, null, null }", rows[1]);
+}
+
+INSTANTIATE_TEST_CASE_P(TestAlterWalRetentionSecs,
+                        AlterTableTest,
+                        ::testing::Values(FLAGS_log_min_seconds_to_retain / 2,
+                                          FLAGS_log_min_seconds_to_retain * 2));
+
+TEST_P(AlterTableTest, TestAlterWalRetentionSecs) {
+  InsertRows(1, 1000);
+  int kWalRetentionSecs = GetParam();
+
+  LOG(INFO) << "Modifying wal retention time";
+  std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+
+  ASSERT_OK(table_alterer->SetWalRetentionSecs(kWalRetentionSecs)->Alter());
+
+  int expected_wal_retention_secs = max(FLAGS_log_min_seconds_to_retain, kWalRetentionSecs);
+
+  ASSERT_EQ(kWalRetentionSecs, tablet_peer_->tablet()->metadata()->wal_retention_secs());
+  ASSERT_EQ(expected_wal_retention_secs, tablet_peer_->log()->wal_retention_secs());
+
+  // Test that the wal retention time gets set correctly in the metadata and in the log objects.
+  ASSERT_NO_FATALS(RestartTabletServer());
+
+  ASSERT_EQ(kWalRetentionSecs, tablet_peer_->tablet()->metadata()->wal_retention_secs());
+  ASSERT_EQ(expected_wal_retention_secs, tablet_peer_->log()->wal_retention_secs());
 }
 
 TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
@@ -695,17 +671,17 @@ TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
 
   vector<string> rows;
 
-  ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
+  ASSERT_OK(AddNewI32Column(kTableName, "c2"));
   InsertRows(0, 1);
   ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
   InsertRows(1, 1);
   ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
 
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c1=0, int32 c2=12345)", rows[0]);
-  ASSERT_EQ("(int32 c0=16777216, int32 c1=1, int32 c2=12345)", rows[1]);
+  ASSERT_EQ("{ int32:0, int32:0, null }", rows[0]);
+  ASSERT_EQ("{ int32:16777216, int32:1, null }", rows[1]);
 
   // Add a delta for c1.
   UpdateRow(0, { {"c1", 54321} });
@@ -715,104 +691,116 @@ TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
   gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
-  ASSERT_NO_FATALS(ScanToStrings(&rows));
+  rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
-  ASSERT_EQ("(int32 c0=0, int32 c2=12345)", rows[0]);
-
-  // Compact
-  ASSERT_OK(tablet_peer_->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
+  ASSERT_EQ("{ int32:0, null }", rows[0]);
 }
 
+typedef std::vector<std::shared_ptr<client::YBqlOp>> Ops;
+
+std::pair<bool, int> AnalyzeResponse(const Ops& ops) {
+  std::pair<bool, int> result = { false, 0 };
+  for (const auto& op : ops) {
+    if (op->response().status() == QLResponsePB::YQL_STATUS_OK) {
+      ++result.second;
+    } else {
+      EXPECT_EQ(QLResponsePB::YQL_STATUS_SCHEMA_VERSION_MISMATCH, op->response().status());
+      result.first = true;
+    }
+  }
+  return result;
+}
 
 // Thread which inserts rows into the table.
 // After each batch of rows is inserted, inserted_idx_ is updated
 // to communicate how much data has been written (and should now be
 // updateable)
-void AlterTableTest::InserterThread() {
+void AlterTableTest::WriteThread(QLWriteRequestPB::QLStmtType type) {
   shared_ptr<YBSession> session = client_->NewSession();
-  shared_ptr<YBTable> table;
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(15 * 1000);
+  session->SetTimeout(15s);
 
-  CHECK_OK(client_->OpenTable(kTableName, &table));
+  client::TableHandle table;
+  ASSERT_OK(table.Open(kTableName, client_.get()));
+  Ops ops;
+  int32_t processed = 0;
   int32_t i = 0;
-  while (!stop_threads_.Load()) {
-    shared_ptr<KuduInsert> insert(table->NewInsert());
-    // Endian-swap the key so that we spew inserts randomly
-    // instead of just a sequential write pattern. This way
-    // compactions may actually be triggered.
-    int32_t key = bswap_32(i++);
-    CHECK_OK(insert->mutable_row()->SetInt32(0, key));
-    CHECK_OK(insert->mutable_row()->SetInt32(1, i));
-    CHECK_OK(session->Apply(insert));
-
-    if (i % 50 == 0) {
-      FlushSessionOrDie(session);
-      inserted_idx_.Store(i);
-    }
-  }
-
-  FlushSessionOrDie(session);
-  inserted_idx_.Store(i);
-}
-
-// Thread which follows behind the InserterThread and generates random
-// updates across the previously inserted rows.
-void AlterTableTest::UpdaterThread() {
-  shared_ptr<YBSession> session = client_->NewSession();
-  shared_ptr<YBTable> table;
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(15 * 1000);
-
-  CHECK_OK(client_->OpenTable(kTableName, &table));
-
   Random rng(1);
-  int32_t i = 0;
-  while (!stop_threads_.Load()) {
-    shared_ptr<KuduUpdate> update(table->NewUpdate());
+  for (;;) {
+    bool should_stop = stop_threads_.Load();
+    if (!should_stop) {
+      auto op = table.NewWriteOp(type);
+      auto req = op->mutable_request();
+      // Endian-swap the key so that we spew inserts randomly
+      // instead of just a sequential write pattern. This way
+      // compactions may actually be triggered.
 
-    int32_t max = inserted_idx_.Load();
-    if (max == 0) {
-      // Inserter hasn't inserted anything yet, so we have nothing to update.
-      SleepFor(MonoDelta::FromMicroseconds(100));
-      continue;
+      if (type == QLWriteRequestPB::QL_STMT_INSERT) {
+        int32_t key = bswap_32(i++);
+        QLAddInt32HashValue(req, key);
+        table.AddInt32ColumnValue(req, table.schema().columns()[1].name(), i);
+      } else {
+        int32_t max = inserted_idx_.Load();
+        if (max == 0) {
+          // Inserter hasn't inserted anything yet, so we have nothing to update.
+          SleepFor(MonoDelta::FromMicroseconds(100));
+          continue;
+        }
+        // Endian-swap the key to match the way the insert generates keys.
+        int32_t key = bswap_32(rng.Uniform(max));
+        QLAddInt32HashValue(req, key);
+        table.AddInt32ColumnValue(req, table.schema().columns()[1].name(), i);
+      }
+
+      ops.push_back(op);
+      ASSERT_OK(session->Apply(op));
     }
-    // Endian-swap the key to match the way the InserterThread generates
-    // keys to insert.
-    int32_t key = bswap_32(rng.Uniform(max));
-    CHECK_OK(update->mutable_row()->SetInt32(0, key));
-    CHECK_OK(update->mutable_row()->SetInt32(1, i));
-    CHECK_OK(session->Apply(update));
 
-    if (i++ % 50 == 0) {
+    if (should_stop || ops.size() >= 50) {
       FlushSessionOrDie(session);
+      auto result = AnalyzeResponse(ops);
+      ops.clear();
+      processed += result.second;
+      if (type == QLWriteRequestPB::QL_STMT_INSERT) {
+        inserted_idx_.Store(processed);
+        i = processed;
+      }
+      if (result.first) {
+        ASSERT_OK(table.Open(kTableName, client_.get()));
+      }
+    }
+
+    if (should_stop) {
+      break;
     }
   }
 
-  FlushSessionOrDie(session);
+  ASSERT_GT(processed, 0);
+  LOG(INFO) << "Processed: " << processed << " of type " << QLWriteRequestPB::QLStmtType_Name(type);
 }
 
 // Thread which loops reading data from the table.
 // No verification is performed.
 void AlterTableTest::ScannerThread() {
-  shared_ptr<YBTable> table;
-  CHECK_OK(client_->OpenTable(kTableName, &table));
+  client::TableHandle table;
+  ASSERT_OK(table.Open(kTableName, client_.get()));
   while (!stop_threads_.Load()) {
-    YBScanner scanner(table.get());
     int inserted_at_scanner_start = inserted_idx_.Load();
-    CHECK_OK(scanner.Open());
-    int count = 0;
-    vector<YBRowResult> results;
-    while (scanner.HasMoreRows()) {
-      CHECK_OK(scanner.NextBatch(&results));
-      count += results.size();
+    client::TableIteratorOptions options;
+    bool failed = false;
+    options.error_handler = [&failed](const Status& status) {
+      LOG(WARNING) << "Scan failed: " << status;
+      failed = true;
+    };
+    size_t count = boost::size(client::TableRange(table, options));
+    if (failed) {
+      continue;
     }
 
     LOG(INFO) << "Scanner saw " << count << " rows";
     // We may have gotten more rows than we expected, because inserts
     // kept going while we set up the scan. But, we should never get
     // fewer.
-    CHECK_GE(count, inserted_at_scanner_start)
+    ASSERT_GE(count, inserted_at_scanner_start)
       << "We didn't get as many rows as expected";
   }
 }
@@ -820,16 +808,15 @@ void AlterTableTest::ScannerThread() {
 // Test altering a table while also sending a lot of writes,
 // checking for races between the two.
 TEST_F(AlterTableTest, TestAlterUnderWriteLoad) {
-  // Increase chances of a race between flush and alter.
-  FLAGS_flush_threshold_mb = 3;
-
   scoped_refptr<Thread> writer;
   CHECK_OK(Thread::Create(
-      "test", "inserter", std::bind(&AlterTableTest::InserterThread, this), &writer));
+      "test", "inserter",
+      std::bind(&AlterTableTest::WriteThread, this, QLWriteRequestPB::QL_STMT_INSERT), &writer));
 
   scoped_refptr<Thread> updater;
-  CHECK_OK(
-      Thread::Create("test", "updater", std::bind(&AlterTableTest::UpdaterThread, this), &updater));
+  CHECK_OK(Thread::Create(
+      "test", "updater",
+      std::bind(&AlterTableTest::WriteThread, this, QLWriteRequestPB::QL_STMT_UPDATE), &updater));
 
   scoped_refptr<Thread> scanner;
   CHECK_OK(
@@ -844,9 +831,7 @@ TEST_F(AlterTableTest, TestAlterUnderWriteLoad) {
       SleepFor(MonoDelta::FromSeconds(3));
     }
 
-    ASSERT_OK(AddNewI32Column(kTableName,
-                                     strings::Substitute("c$0", i),
-                                     i));
+    ASSERT_OK(AddNewI32Column(kTableName, strings::Substitute("c$0", i)));
   }
 
   stop_threads_.Store(true);
@@ -862,20 +847,20 @@ TEST_F(AlterTableTest, TestInsertAfterAlterTable) {
   //
   // With more tablets, there's a greater chance that the TS will heartbeat
   // after some but not all tablets have finished altering.
-  ASSERT_OK(CreateSplitTable(kSplitTableName));
+  ASSERT_OK(CreateTable(kSplitTableName));
 
   // Add a column, and immediately try to insert a row including that
   // new column.
-  ASSERT_OK(AddNewI32Column(kSplitTableName, "new-i32", 10));
-  shared_ptr<YBTable> table;
-  ASSERT_OK(client_->OpenTable(kSplitTableName, &table));
-  shared_ptr<KuduInsert> insert(table->NewInsert());
-  ASSERT_OK(insert->mutable_row()->SetInt32("c0", 1));
-  ASSERT_OK(insert->mutable_row()->SetInt32("c1", 1));
-  ASSERT_OK(insert->mutable_row()->SetInt32("new-i32", 1));
+  ASSERT_OK(AddNewI32Column(kSplitTableName, "new-i32"));
+  client::TableHandle table;
+  ASSERT_OK(table.Open(kSplitTableName, client_.get()));
+  auto insert = table.NewInsertOp();
+  auto req = insert->mutable_request();
+  QLAddInt32HashValue(req, 1);
+  table.AddInt32ColumnValue(req, "c1", 1);
+  table.AddInt32ColumnValue(req, "new-i32", 1);
   shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(15000);
+  session->SetTimeout(15s);
   ASSERT_OK(session->Apply(insert));
   Status s = session->Flush();
   if (!s.ok()) {
@@ -892,20 +877,18 @@ TEST_F(AlterTableTest, TestInsertAfterAlterTable) {
 TEST_F(AlterTableTest, TestMultipleAlters) {
   YBTableName kSplitTableName("my_keyspace", "split-table");
   const size_t kNumNewCols = 10;
-  const int32_t kDefaultValue = 10;
 
   // Create a new table with 10 tablets.
   //
   // With more tablets, there's a greater chance that the TS will heartbeat
   // after some but not all tablets have finished altering.
-  ASSERT_OK(CreateSplitTable(kSplitTableName));
+  ASSERT_OK(CreateTable(kSplitTableName));
 
   // Issue a bunch of new alters without waiting for them to finish.
   for (int i = 0; i < kNumNewCols; i++) {
     gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kSplitTableName));
     table_alterer->AddColumn(strings::Substitute("new_col$0", i))
-      ->Type(INT32)->NotNull()
-      ->Default(YBValue::FromInt(kDefaultValue));
+                 ->Type(INT32)->NotNull();
     ASSERT_OK(table_alterer->wait(false)->Alter());
   }
 
@@ -930,10 +913,11 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
-  ASSERT_OK(AddNewI32Column(kTableName, "c1", 0xdeadbeef));
+  ASSERT_OK(AddNewI32Column(kTableName, "c1"));
 
   bool alter_in_progress;
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
+  string table_id;
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, table_id, &alter_in_progress));
   ASSERT_FALSE(alter_in_progress);
 
   LOG(INFO) << "Verifying that the new default shows up";

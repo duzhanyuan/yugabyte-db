@@ -38,6 +38,7 @@
 
 #include "yb/gutil/once.h"
 #include "yb/util/debug/leakcheck_disabler.h"
+#include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
@@ -63,28 +64,14 @@ void InitRandom() {
 
 void DoMaybeFault(const char* fault_str, double fraction) {
   GoogleOnceInit(&g_random_once, InitRandom);
-  if (PREDICT_TRUE(g_random->NextDoubleFraction() >= fraction)) {
+  if (fraction == 0.0 || PREDICT_TRUE(g_random->NextDoubleFraction() >= fraction)) {
     return;
   }
 
-  // Disable core dumps -- it's not useful to get a core dump when we're
-  // purposefully crashing, and some tests cause lots of server crashes
-  // in a loop. This avoids filling up the disk with useless cores.
-  struct rlimit lim;
-  PCHECK(getrlimit(RLIMIT_CORE, &lim) == 0);
-  lim.rlim_cur = 0;
-  PCHECK(setrlimit(RLIMIT_CORE, &lim) == 0);
-
-  // Set coredump_filter to not dump any parts of the address space.
-  // Although the above disables core dumps to files, if core_pattern
-  // is set to a pipe rather than a file, it's not sufficient. Setting
-  // this pattern results in piping a very minimal dump into the core
-  // processor (eg abrtd), thus speeding up the crash.
-  int f = open("/proc/self/coredump_filter", O_WRONLY);
-  if (f >= 0) {
-    write(f, "00000000", 8);
-    close(f);
-  }
+  // Disable core dumps -- it's not useful to get a core dump when we're purposefully crashing, and
+  // some tests cause lots of server crashes in a loop. This avoids filling up the disk with useless
+  // cores.
+  DisableCoreDumps();
 
   LOG(FATAL) << "Injected fault: " << fault_str;
 }
@@ -95,4 +82,5 @@ void DoInjectRandomLatency(double max_ms) {
 }
 
 } // namespace fault_injection
+
 } // namespace yb

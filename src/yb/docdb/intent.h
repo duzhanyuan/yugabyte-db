@@ -20,75 +20,55 @@
 namespace yb {
 namespace docdb {
 
-// Decodes intent RocksDB key. intent_prefix should point to slice to hold intent prefix
-// (kIntentPrefix + SubDocKey (no HT).
-// intent_type and doc_ht are optional parameters (could be nullptr) to store decoded
-// intent type and intent doc hybrid time.
-CHECKED_STATUS DecodeIntentKey(const Slice &encoded_intent_key, Slice* intent_prefix,
-                               IntentType* intent_type, DocHybridTime* doc_ht);
+// DecodeIntentKey result.
+// intent_prefix - intent prefix (SubDocKey (no HT)).
+struct DecodedIntentKey {
+  Slice intent_prefix;
+  IntentTypeSet intent_types;
+  DocHybridTime doc_ht;
+};
+
+// Decodes intent RocksDB key.
+Result<DecodedIntentKey> DecodeIntentKey(const Slice &encoded_intent_key);
+
+CHECKED_STATUS DecodeIntentValue(
+    const Slice& encoded_intent_value, const Slice& transaction_id_slice, IntraTxnWriteId* write_id,
+    Slice* body);
 
 // Decodes transaction ID from intent value. Consumes it from intent_value slice.
 Result<TransactionId> DecodeTransactionIdFromIntentValue(Slice* intent_value);
 
-enum class IntentKind {
-  // "Weak" intents are written for ancecstor keys of a key that's being modified. For example, if
-  // we're writing a.b.c with snapshot isolation, we'll write weak snapshot isolation intents for
-  // keys "a" and "a.b".
-  kWeak,
+// "Weak" intents are written for ancestor keys of a key that's being modified. For example, if
+// we're writing a.b.c with snapshot isolation, we'll write weak snapshot isolation intents for
+// keys "a" and "a.b".
+//
+// "Strong" intents are written for keys that are being modified. In the example above, we will
+// write a strong snapshot isolation intent for the key a.b.c itself.
+YB_DEFINE_ENUM(IntentStrength, (kWeak)(kStrong));
 
-  // "Strong" intents are written for keys that are being modified. In the example above, we will
-  // write a strong snapshot isolation intent for the key a.b.c itself.
-  kStrong
-};
+YB_DEFINE_ENUM(OperationKind, (kRead)(kWrite));
 
-struct IntentTypePair {
-  docdb::IntentType strong;
-  docdb::IntentType weak;
+IntentTypeSet GetStrongIntentTypeSet(IsolationLevel level, OperationKind operation_kind);
 
-  docdb::IntentType operator[](IntentKind kind) {
-    return kind == IntentKind::kWeak ? weak : strong;
-  }
-};
-
-IntentTypePair GetWriteIntentsForIsolationLevel(IsolationLevel level);
-
-inline void AppendIntentKeySuffix(
-    docdb::IntentType intent_type, const DocHybridTime& doc_ht, KeyBytes* key) {
-  AppendIntentType(intent_type, key);
-  AppendDocHybridTime(doc_ht, key);
+inline IntentTypeSet StrongToWeak(IntentTypeSet inp) {
+  IntentTypeSet result(inp.ToUIntPtr() >> kStrongIntentFlag);
+  DCHECK((inp & result).None());
+  return result;
 }
 
-// The intent class is a wrapper around transaction id, (optional value) and
-// type of intent (which includes isolation level)
-class Intent {
- public:
-  Intent() {}
-  Intent(
-      SubDocKey subdoc_key, IntentType intent_type, const Uuid& transaction_id, Value&& value)
-      : subdoc_key_(subdoc_key),
-        intent_type_(intent_type),
-        transaction_id_(transaction_id),
-        value_(std::move(value)) {}
+inline IntentTypeSet WeakToStrong(IntentTypeSet inp) {
+  IntentTypeSet result(inp.ToUIntPtr() << kStrongIntentFlag);
+  DCHECK((inp & result).None());
+  return result;
+}
 
-  std::string ToString() const;
+bool HasStrong(IntentTypeSet inp);
 
-  // Encode the intent into the rocksdb-key and rocksdb-value:
-  // respectively (SubDocKey, IntentType) in key, and (TransactionId, Value) in value.
-  // The EncodeKey() function changes the internal state only temporarily.
-  std::string EncodeKey();
-  std::string EncodeValue() const;
+IntentTypeSet ObsoleteIntentTypeToSet(uint8_t obsolete_intent_type);
+IntentTypeSet ObsoleteIntentTypeSetToNew(uint8_t obsolete_intent_type_set);
 
-  // DecodeFromKey only partially decodes the Intent, the fields (SubDocKey, IntentType).
-  CHECKED_STATUS DecodeFromKey(const Slice &encoded_intent);
-  // DecodeFromValue only partially decodes the Intent, the fields (TransactionId, Value).
-  CHECKED_STATUS DecodeFromValue(const Slice &encoded_intent);
- private:
-
-  SubDocKey subdoc_key_;
-  IntentType intent_type_;
-  Uuid transaction_id_;
-  Value value_;
-};
+// Returns true if ch is value type of one of intent types, obsolete or not.
+bool IntentValueType(char ch);
 
 }  // namespace docdb
 }  // namespace yb

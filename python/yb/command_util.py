@@ -18,6 +18,8 @@ This module provides utilities for running commands.
 """
 
 import os
+import platform
+import shutil
 import subprocess
 import logging
 
@@ -44,7 +46,7 @@ def run_program(args, error_ok=False, max_error_lines=100, cwd=None):
     """
     Run the given program identified by its argument list, and return a ProgramResult object.
 
-    @param error_ok True to raise an exception on errors.
+    @param error_ok False to raise an exception on errors.
     """
     if not isinstance(args, list):
         args = [args]
@@ -61,8 +63,9 @@ def run_program(args, error_ok=False, max_error_lines=100, cwd=None):
     program_stdout, program_stderr = program_subprocess.communicate()
     error_msg = None
     if program_subprocess.returncode != 0:
-        error_msg = "Non-zero exit code {} from: {}, stdout: '{}', stderr: '{}'".format(
-                program_subprocess.returncode, args,
+        from pipes import quote
+        error_msg = "Non-zero exit code {} from: {} ; stdout: '{}' stderr: '{}'".format(
+                program_subprocess.returncode, ' '.join([quote(arg) for arg in args]),
                 trim_output(program_stdout.strip(), max_error_lines),
                 trim_output(program_stderr.strip(), max_error_lines))
         if not error_ok:
@@ -88,3 +91,37 @@ def mkdir_p(d):
         if os.path.isdir(d):
             return
         raise e
+
+
+def copy_deep(src, dst, create_dst_dir=False):
+    """
+    Does recursive copy of src path to dst path. Copies symlinks as symlinks. Doesn't overwrite
+    existing files and symlinks (even if they are broken) in Linux.
+    In Darwin, it overwrite the files if the source mtime is newer than the destination mtime.
+    """
+    system_is_darwin = platform.system().lower() == "darwin"
+    if create_dst_dir:
+        mkdir_p(os.path.dirname(dst))
+    src_is_link = os.path.islink(src)
+    dst_exists = os.path.lexists(dst)
+    if os.path.isdir(src) and not src_is_link:
+        logging.debug("Copying directory {} to {}".format(src, dst))
+        mkdir_p(dst)
+        for name in os.listdir(src):
+            copy_deep(os.path.join(src, name), os.path.join(dst, name))
+    elif src_is_link:
+        if dst_exists:
+            return
+        target = os.readlink(src)
+        logging.debug("Creating symlink {} -> {}".format(dst, target))
+        os.symlink(target, dst)
+    else:
+        if dst_exists:
+            if not system_is_darwin:
+                return
+            # Only overwrite the file if the source is newer than the destination.
+            if os.path.getmtime(src) <= os.path.getmtime(dst):
+                return
+        logging.debug("Copying file {} to {}".format(src, dst))
+        # Preserve the file attributes.
+        shutil.copy2(src, dst)

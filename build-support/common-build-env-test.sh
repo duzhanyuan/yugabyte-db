@@ -28,6 +28,14 @@ assert_equals() {
   fi
 }
 
+pretend_we_are_on_jenkins() {
+  if [[ -z ${JOB_NAME:-} ]]; then
+    JOB_NAME=some-jenkins-job-name
+  fi
+  BUILD_ID=12345
+  USER=jenkins
+}
+
 # -------------------------------------------------------------------------------------------------
 # Testing detecting build type by Jenkins job name.
 # -------------------------------------------------------------------------------------------------
@@ -131,6 +139,7 @@ test_set_cmake_build_type_and_compiler_type() {
     assert_equals "$expected_compiler_type" "$YB_COMPILER_TYPE"
   )
   local exit_code=$?
+  set -e
   assert_equals "$expected_exit_code" "$exit_code"
 }
 
@@ -162,5 +171,7 @@ test_set_cmake_build_type_and_compiler_type release    darwin    gcc        N/A 
 test_set_cmake_build_type_and_compiler_type release    linux-gnu auto       release    gcc    0
 test_set_cmake_build_type_and_compiler_type release    linux-gnu clang      release    clang  0
 test_set_cmake_build_type_and_compiler_type release    linux-gnu gcc        release    gcc    0
+
+# -------------------------------------------------------------------------------------------------
 
 echo "${0##/*} succeeded"

@@ -10,6 +10,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+syntax = "proto2";
 
 package yb;
 
@@ -35,6 +36,8 @@ message RedisWriteRequestPB {
     RedisInsertRequestPB insert_request = 9;
     RedisPopRequestPB pop_request = 10;
     RedisAddRequestPB add_request = 11;
+    RedisSetTtlRequestPB set_ttl_request = 12;
+    RedisNoOpRequestPB no_op_request = 14;
   }
 
   optional RedisKeyValuePB key_value = 13;
@@ -48,15 +51,30 @@ message RedisReadRequestPB {
     RedisExistsRequestPB exists_request = 4;
     RedisGetRangeRequestPB get_range_request = 5;
     RedisCollectionGetRangeRequestPB get_collection_range_request = 9;
+    RedisGetTtlRequestPB get_ttl_request = 11;
+    RedisKeysRequestPB keys_request = 12;
+    RedisGetForRenameRequestPB get_for_rename_request = 13;
   }
 
   optional RedisKeyValuePB key_value = 6;
   optional RedisSubKeyRangePB subkey_range = 7;
+  optional RedisIndexRangePB index_range = 8;
+  // The maximum number of entries to retrieve for a range request.
+  optional int32 range_request_limit = 10 [default = 0];
 }
 
 message RedisSubKeyRangePB {
   optional RedisSubKeyBoundPB lower_bound = 1;
   optional RedisSubKeyBoundPB upper_bound = 2;
+}
+
+message RedisIndexRangePB {
+  optional RedisIndexBoundPB lower_bound = 1;
+  optional RedisIndexBoundPB upper_bound = 2;
+}
+
+message RedisIndexBoundPB {
+  required int64 index = 1;
 }
 
 // Wrapper for a subkey which denotes an upper/lower bound for a range request.
@@ -103,6 +121,7 @@ message RedisKeyValueSubKeyPB {
   oneof subkey {
     bytes string_subkey = 1;
     int64 timestamp_subkey = 2; // Timestamp used in the redis timeseries datatype.
+    double double_subkey = 3; // Double used in redis sorted set datatype.
   }
 }
 
@@ -118,27 +137,43 @@ message RedisKeyValueSubKeyPB {
 //   - SortedSet : Set key, subkey, value (value is interpreted as score).
 //   - Timeseries: Set key, subkey, value (timestamp_subkey in RedisKeyValueSubKeyPB is interpreted
 //                 as timestamp).
-// - Value is not present in case of an append, get, exists, etc. For multiple inserts into
-//   a container, the subkey and value fields have one or more items.
+// - Value is not present in case of an append, get, exists, etc. For multiple inserts into a
+// container, the subkey and value fields have one or more items.
 message RedisKeyValuePB {
-  // Note: the hash_code is the hash of the 'key' below. Technically, this can be
-  // recomputed by tserver also, but since the client already calculates this to look up the
-  // correct tablet server, it is passed in.
+  // Note: the hash_code is the hash of the 'key' below. Technically, this can be recomputed by
+  // tserver also, but since the client already calculates this to look up the correct tablet
+  // server, it is passed in.
   optional uint32 hash_code = 1;
+
   optional bytes key = 2;                   // Required
   optional RedisDataType type = 3 [ default = REDIS_TYPE_NONE ];
-  // It is assumed that all subkeys are distinct for HMSET and SADD.
-  // For collection range requests, we would have exactly two subkeys denoting the lower bound
-  // and upper bound for the range request.
+
+  // It is assumed that all subkeys are distinct for HMSET and SADD.  For collection range requests,
+  // we would have exactly two subkeys denoting the lower bound and upper bound for the range
+  // request.
   repeated RedisKeyValueSubKeyPB subkey = 4;
   optional int32 index = 5;
   repeated bytes value = 6;
 }
 
+message SortedSetOptionsPB {
+  enum UpdateOptions {
+    NX = 1;
+    XX = 2;
+    NONE = 3;
+  }
+
+  optional UpdateOptions update_options = 4 [ default = NONE ];
+  optional bool ch = 5 [ default = false ];
+  optional bool incr = 6 [ default = false ];
+}
+
 // SET, SETNX, SETXX, HSET, HSETNX, LSET, MSET, HMSET, MSETNX
 message RedisSetRequestPB {
-  optional int64 ttl = 2;                  // Expiry time in milliseconds.
+  optional bool expect_ok_response = 1 [ default = false ];
+  optional int64 ttl = 2 [ default = -1]; // Expiration time in milliseconds.
   optional RedisWriteMode mode = 3 [ default = REDIS_WRITEMODE_UPSERT ];
+  optional SortedSetOptionsPB sorted_set_options = 14;
 }
 
 // GET, HGET, MGET, HMGET, HGETALL, SMEMBERS
@@ -159,22 +194,59 @@ message RedisGetRequestPB {
     SMEMBERS = 6;
     SISMEMBER = 12;
     SCARD = 13;
+    ZCARD = 15;
     TSGET = 14;
+    TSCARD = 16;
+    ZSCORE = 17;
+    LLEN = 18;
     UNKNOWN = 99;
   }
 
   optional GetRequestType request_type = 1 [ default = GET ];
-
 }
 
 message RedisCollectionGetRangeRequestPB {
 
   enum GetRangeRequestType {
     TSRANGEBYTIME = 1;
+    ZRANGEBYSCORE = 2;
+    ZREVRANGE = 3;
+    ZRANGE = 4;
+    TSREVRANGEBYTIME = 5;
     UNKNOWN = 99;
   }
 
   optional GetRangeRequestType request_type = 1 [ default = TSRANGEBYTIME ];
+  optional bool with_scores = 2 [ default = false ]; // Used only with ZRANGEBYSCORE, ZREVRANGE.
+}
+
+// No operation.
+message RedisNoOpRequestPB {
+}
+
+// PERSIST, (P)EXPIRE, (P)EXPIREAT
+message RedisSetTtlRequestPB {
+  // Expiration time in milliseconds.
+  oneof expiration {
+    int64 ttl = 1 [default = -1]; // For (P)EXPIRE
+    int64 absolute_time = 2; // For (P)EXPIREAT
+  }
+}
+
+// TTL, PTTL
+message RedisGetTtlRequestPB {
+  // By default, the return value is in milliseconds.
+  optional bool return_seconds = 1 [default = false];
+}
+
+// KEYS
+message RedisKeysRequestPB {
+  optional string pattern = 1;
+  optional int32 threshold = 2;
+}
+
+// RENAME
+message RedisGetForRenameRequestPB {
 }
 
 // GETSET
@@ -216,8 +288,8 @@ message RedisIncrRequestPB {
 
 // RPUSH, RPUSHX, LPUSH, LPUSHX
 message RedisPushRequestPB {
-  optional RedisSide side = 2 [ default = REDIS_SIDE_RIGHT ];
-  optional bool assume_exists = 3 [ default = false];
+  optional RedisSide side = 2 [ default = REDIS_SIDE_LEFT ];
+  optional bool check_existence = 3 [ default = false];
 }
 
 // LINSERT
@@ -227,11 +299,11 @@ message RedisInsertRequestPB {
 
 // LPOP, RPOP, SPOP; blocking versions BLPOP etc. currently not supported.
 message RedisPopRequestPB {
-  optional RedisSide side = 2 [ default = REDIS_SIDE_RIGHT ];
+  optional RedisSide side = 2 [ default = REDIS_SIDE_LEFT ];
   optional int32 count = 3;                  // Count is allowed only when popping from a set.
 }
 
-// SADD, ZADD
+// SADD
 message RedisAddRequestPB {
   // Following options are for ZADD only.
   optional RedisWriteMode mode = 2 [ default = REDIS_WRITEMODE_UPSERT ];
@@ -244,15 +316,18 @@ message RedisResponsePB {
 
   enum RedisStatusCode {
     OK = 1;
+    // Nil is when value is not found, but isn't an error case, eg. GET key when key has no value.
     NIL = 2;
+    // Not found is an error when an existing value is needed for the command, eg. RENAME.
+    NOT_FOUND = 5;
     UNKNOWN_COMMAND = 3;
     WRONG_TYPE = 4;
-    NOT_FOUND = 5;
     // This code is set in the client to mark commands for which no response was received.
     // This happens when the batch RPC fails somewhere and the individual requests don't
     // get processed.
     SERVER_ERROR = 6;
     INDEX_OUT_OF_BOUNDS = 7;
+    PARSING_ERROR = 8;
   }
 
   optional RedisStatusCode code = 1;
@@ -261,9 +336,12 @@ message RedisResponsePB {
     int64 int_response = 2;
     bytes string_response = 3;
     RedisArrayPB array_response = 4;
+    bytes status_response = 5;
+    bytes encoded_response = 7;
   }
 
   optional bytes error_message = 6;
+  optional RedisDataType type = 8;
 }
 
 message RedisArrayPB {

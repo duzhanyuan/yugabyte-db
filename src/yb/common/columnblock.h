@@ -74,7 +74,7 @@ class ColumnBlock {
   }
 
 #ifndef NDEBUG
-  void OverwriteWithPattern(size_t idx, StringPiece pattern) {
+  void OverwriteWithPattern(size_t idx, GStringPiece pattern) {
     char *col_data = reinterpret_cast<char *>(mutable_cell_ptr(idx));
     yb::OverwriteWithPattern(col_data, type_->size(), pattern);
   }
@@ -182,7 +182,7 @@ class ColumnDataView {
     return row_offset_;
   }
 
-  // Set 'nrows' bits of the the null-bitmap to "value"
+  // Set 'nrows' bits of the null-bitmap to "value"
   // true if not null, false if null.
   void SetNullBits(size_t nrows, bool value) {
     BitmapChangeBits(column_block_->null_bitmap(), row_offset_, nrows, value);

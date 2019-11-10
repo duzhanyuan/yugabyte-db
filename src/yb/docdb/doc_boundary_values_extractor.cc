@@ -15,6 +15,7 @@
 
 #include "yb/rocksdb/db/dbformat.h"
 
+#include "yb/docdb/consensus_frontier.h"
 #include "yb/docdb/doc_key.h"
 
 namespace yb {
@@ -154,9 +155,8 @@ class DocBoundaryValuesExtractor : public rocksdb::BoundaryValuesExtractor {
   }
 
   Status Extract(Slice user_key, Slice value, rocksdb::UserBoundaryValues* values) override {
-    if (user_key.size() >= 2 &&
-        static_cast<ValueType>(user_key[0]) == ValueType::kIntentPrefix &&
-        static_cast<ValueType>(user_key[1]) == ValueType::kTransactionId) {
+    if (user_key.size() >= 1 &&
+        static_cast<ValueType>(user_key[0]) == ValueType::kTransactionId) {
       // Skipping reverse index from transaction id to keys of write intents belonging to that
       // transaction.
       return Status::OK();
@@ -185,6 +185,10 @@ class DocBoundaryValuesExtractor : public rocksdb::BoundaryValuesExtractor {
     DCHECK(PerformSanityCheck(user_key, slices, *values));
 
     return Status::OK();
+  }
+
+  rocksdb::UserFrontierPtr CreateFrontier() override {
+    return new docdb::ConsensusFrontier();
   }
 
   bool PerformSanityCheck(Slice user_key,

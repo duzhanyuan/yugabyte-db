@@ -32,7 +32,6 @@
 package org.yb.client;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
@@ -45,17 +44,18 @@ import org.yb.Type;
 import org.yb.minicluster.BaseMiniClusterTest;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.fail;
 
 /**
  * A base class for tests using the the Java YB client.
  */
 public class BaseYBClientTest extends BaseMiniClusterTest {
+
+    // Default keyspace name.
+  public static final String DEFAULT_KEYSPACE_NAME = "default_keyspace";
 
   private static final Logger LOG = LoggerFactory.getLogger(BaseYBClientTest.class);
 
@@ -63,10 +63,9 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
   protected static AsyncYBClient client;
   protected static YBClient syncClient;
   protected static Schema basicSchema = getBasicSchema();
+  protected static Schema hashKeySchema = getHashKeySchema();
   protected static Schema allTypesSchema = getSchemaWithAllTypes();
   protected static Schema redisSchema = getRedisSchema();
-
-  private static List<String> tableNames = new ArrayList<>();
 
   @Override
   protected void afterStartingMiniCluster() throws Exception {
@@ -76,15 +75,16 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
         .defaultAdminOperationTimeoutMs(DEFAULT_SLEEP)
         .defaultOperationTimeoutMs(DEFAULT_SLEEP)
         .defaultSocketReadTimeoutMs(DEFAULT_SLEEP)
+        .sslCertFile(certFile)
         .build();
+
     syncClient = new YBClient(client);
+    syncClient.createKeyspace(DEFAULT_KEYSPACE_NAME);
   }
 
   private static void destroyClient() throws Exception {
     if (client != null) {
-      Deferred<ArrayList<Void>> d = client.shutdown();
-      d.addErrback(defaultErrorCB);
-      d.join(DEFAULT_SLEEP);
+      client.shutdown();
       // No need to explicitly shutdown the sync client,
       // shutting down the async client effectively does that.
       client = null;
@@ -107,9 +107,9 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
   }
 
   protected static YBTable createTable(String tableName, Schema schema,
-                                         CreateTableOptions builder) {
+                                       CreateTableOptions builder) {
     LOG.info("Creating table: {}", tableName);
-    Deferred<YBTable> d = client.createTable(tableName, schema, builder);
+    Deferred<YBTable> d = client.createTable(DEFAULT_KEYSPACE_NAME, tableName, schema, builder);
     final AtomicBoolean gotError = new AtomicBoolean(false);
     d.addErrback(arg -> {
       gotError.set(true);
@@ -125,75 +125,6 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
     if (gotError.get()) {
       fail("Got error during table creation, is the YB master running at " + masterAddresses + "?");
     }
-    tableNames.add(tableName);
-    return table;
-  }
-
-  /**
-   * Counts the rows from the {@code scanner} until exhaustion. It doesn't require the scanner to
-   * be new, so it can be used to finish scanning a previously-started scan.
-   */
-  protected static int countRowsInScan(AsyncYBScanner scanner)
-      throws Exception {
-    final AtomicInteger counter = new AtomicInteger();
-
-    Callback<Object, RowResultIterator> cb = arg -> {
-      if (arg == null) return null;
-      counter.addAndGet(arg.getNumRows());
-      return null;
-    };
-
-    while (scanner.hasMoreRows()) {
-      Deferred<RowResultIterator> data = scanner.nextRows();
-      data.addCallbacks(cb, defaultErrorCB);
-      data.join(DEFAULT_SLEEP);
-    }
-
-    Deferred<RowResultIterator> closer = scanner.close();
-    closer.addCallbacks(cb, defaultErrorCB);
-    closer.join(DEFAULT_SLEEP);
-    return counter.get();
-  }
-
-  protected List<String> scanTableToStrings(YBTable table) throws Exception {
-    List<String> rowStrings = Lists.newArrayList();
-    YBScanner scanner = syncClient.newScannerBuilder(table).build();
-    while (scanner.hasMoreRows()) {
-      RowResultIterator rows = scanner.nextRows();
-      for (RowResult r : rows) {
-        rowStrings.add(r.rowToString());
-      }
-    }
-    Collections.sort(rowStrings);
-    return rowStrings;
-  }
-
-  private static final int[] KEYS = new int[] {10, 20, 30};
-  protected static YBTable createFourTabletsTableWithNineRows(String tableName) throws
-      Exception {
-    CreateTableOptions builder = new CreateTableOptions();
-    for (int i : KEYS) {
-      PartialRow splitRow = basicSchema.newPartialRow();
-      splitRow.addInt(0, i);
-      builder.addSplitRow(splitRow);
-    }
-    YBTable table = createTable(tableName, basicSchema, builder);
-    AsyncYBSession session = client.newSession();
-
-    // create a table with on empty tablet and 3 tablets of 3 rows each
-    for (int key1 : KEYS) {
-      for (int key2 = 1; key2 <= 3; key2++) {
-        Insert insert = table.newInsert();
-        PartialRow row = insert.getRow();
-        row.addInt(0, key1 + key2);
-        row.addInt(1, key1);
-        row.addInt(2, key2);
-        row.addString(3, "a string");
-        row.addBoolean(4, true);
-        session.apply(insert).join(DEFAULT_SLEEP);
-      }
-    }
-    session.close().join(DEFAULT_SLEEP);
     return table;
   }
 
@@ -227,23 +158,22 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column2_i", Type.INT32).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column3_s", Type.STRING)
         .nullable(true)
-        .desiredBlockSize(4096)
-        .encoding(ColumnSchema.Encoding.DICT_ENCODING)
-        .compressionAlgorithm(ColumnSchema.CompressionAlgorithm.LZ4)
         .build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column4_b", Type.BOOL).build());
     return new Schema(columns);
   }
 
-  protected Insert createBasicSchemaInsert(YBTable table, int key) {
-    Insert insert = table.newInsert();
-    PartialRow row = insert.getRow();
-    row.addInt(0, key);
-    row.addInt(1, 2);
-    row.addInt(2, 3);
-    row.addString(3, "a string");
-    row.addBoolean(4, true);
-    return insert;
+  public static Schema getHashKeySchema() {
+    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(5);
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.INT32).key(true).hashKey(true)
+        .build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("column1_i", Type.INT32).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("column2_i", Type.INT32).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("column3_s", Type.STRING)
+        .nullable(true)
+        .build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("column4_b", Type.BOOL).build());
+    return new Schema(columns);
   }
 
   static Callback<Object, Object> defaultErrorCB = arg -> {
@@ -265,7 +195,7 @@ public class BaseYBClientTest extends BaseMiniClusterTest {
    * @throws Exception MasterErrorException if the table doesn't exist
    */
   protected static YBTable openTable(String name) throws Exception {
-    Deferred<YBTable> d = client.openTable(name);
+    Deferred<YBTable> d = client.openTable(DEFAULT_KEYSPACE_NAME, name);
     return d.join(DEFAULT_SLEEP);
   }
 

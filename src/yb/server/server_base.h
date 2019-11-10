@@ -52,14 +52,14 @@ class MemTracker;
 class MetricEntity;
 class MetricRegistry;
 class NodeInstancePB;
-class RpcServer;
 class ScopedGLogMetrics;
 class Thread;
 class Webserver;
 
 namespace server {
-class Clock;
 
+class Clock;
+class RpcServer;
 class ServerBaseOptions;
 class ServerStatusPB;
 
@@ -68,7 +68,8 @@ class ServerStatusPB;
 class RpcServerBase {
  public:
   const RpcServer *rpc_server() const { return rpc_server_.get(); }
-  const std::shared_ptr<rpc::Messenger>& messenger() const { return messenger_; }
+  rpc::Messenger* messenger() const { return messenger_.get(); }
+  rpc::ProxyCache& proxy_cache() { return *proxy_cache_; }
 
   // Return the first RPC address that this server has bound to.
   // FATALs if the server is not started.
@@ -92,28 +93,44 @@ class RpcServerBase {
   // Return a PB describing the status of the server (version info, bound ports, etc)
   virtual void GetStatusPB(ServerStatusPB* status) const;
 
+  CloudInfoPB MakeCloudInfoPB() const {
+    return options_.MakeCloudInfoPB();
+  }
+
+  const ServerBaseOptions& options() const {
+    return options_;
+  }
+  // Return the hostname of this server
+  const std::string get_hostname() const;
+
+  // Return the current user logged in to this server
+  const std::string get_current_user() const;
+
  protected:
   RpcServerBase(std::string name,
                 const ServerBaseOptions& options,
-                const std::string& metrics_namespace);
+                const std::string& metrics_namespace,
+                std::shared_ptr<MemTracker> mem_tracker);
   virtual ~RpcServerBase();
 
   CHECKED_STATUS Init();
-  CHECKED_STATUS RegisterService(size_t queue_limit, std::unique_ptr<rpc::ServiceIf> rpc_impl);
+  CHECKED_STATUS RegisterService(
+      size_t queue_limit, rpc::ServiceIfPtr rpc_impl,
+      rpc::ServicePriority priority = rpc::ServicePriority::kNormal);
   CHECKED_STATUS Start();
   CHECKED_STATUS StartRpcServer();
   void Shutdown();
+  void SetConnectionContextFactory(rpc::ConnectionContextFactoryPtr connection_context_factory);
+  virtual CHECKED_STATUS SetupMessengerBuilder(rpc::MessengerBuilder* builder);
 
   const std::string name_;
-
   std::shared_ptr<MemTracker> mem_tracker_;
   gscoped_ptr<MetricRegistry> metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
   gscoped_ptr<RpcServer> rpc_server_;
-  std::shared_ptr<rpc::Messenger> messenger_;
+  std::unique_ptr<rpc::Messenger> messenger_;
+  std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   bool is_first_run_;
-
-  const rpc::ConnectionContextFactory connection_context_factory_;
 
   scoped_refptr<Clock> clock_;
 
@@ -138,6 +155,8 @@ class RpcServerBase {
   DISALLOW_COPY_AND_ASSIGN(RpcServerBase);
 };
 
+YB_STRONGLY_TYPED_BOOL(RpcOnly);
+
 // Base class for tablet server and master.
 // Handles starting and stopping the RPC server and web server,
 // and provides a common interface for server-type-agnostic functions.
@@ -155,12 +174,24 @@ class RpcAndWebServerBase : public RpcServerBase {
   void GetStatusPB(ServerStatusPB* status) const override;
 
   // Centralized method to get the Registration information for either the Master or Tserver.
-  CHECKED_STATUS GetRegistration(ServerRegistrationPB* reg) const;
+  CHECKED_STATUS GetRegistration(
+      ServerRegistrationPB* reg, RpcOnly rpc_only = RpcOnly::kFalse) const;
 
  protected:
-  RpcAndWebServerBase(std::string name, const ServerBaseOptions& options,
-             const std::string& metrics_namespace);
+  RpcAndWebServerBase(
+      std::string name, const ServerBaseOptions& options,
+      const std::string& metrics_namespace,
+      std::shared_ptr<MemTracker> mem_tracker);
   virtual ~RpcAndWebServerBase();
+
+  virtual Status HandleDebugPage(const Webserver::WebRequest& req, std::stringstream* output);
+
+  virtual void DisplayGeneralInfoIcons(std::stringstream* output);
+
+  virtual void DisplayRpcIcons(std::stringstream* output);
+
+  static void DisplayIconTile(std::stringstream* output, const string icon, const string caption,
+                              const string url);
 
   CHECKED_STATUS Init();
   CHECKED_STATUS Start();
@@ -171,11 +202,27 @@ class RpcAndWebServerBase : public RpcServerBase {
 
  private:
   void GenerateInstanceID();
+  std::string GetEasterEggMessage() const;
   std::string FooterHtml() const;
 
   DISALLOW_COPY_AND_ASSIGN(RpcAndWebServerBase);
 };
 
+std::shared_ptr<MemTracker> CreateMemTrackerForServer();
+
+YB_STRONGLY_TYPED_BOOL(Private);
+
+// Returns public/private address for test server with specified index.
+std::string TEST_RpcAddress(int index, Private priv);
+// Returns bind endpoint for test server with specified index and specified port.
+std::string TEST_RpcBindEndpoint(int index, uint16_t port);
+
+// Sets up connectivity in test for specified messenger of server with index.
+void TEST_SetupConnectivity(rpc::Messenger* messenger, int index);
+// Isolates specific messenger, i.e. breaks connectivity with all other servers.
+void TEST_Isolate(rpc::Messenger* messenger);
+
 } // namespace server
 } // namespace yb
+
 #endif /* YB_SERVER_SERVER_BASE_H */

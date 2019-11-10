@@ -33,6 +33,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <gtest/gtest-spi.h>
 
 #include "yb/gutil/strings/strcat.h"
 #include "yb/gutil/strings/substitute.h"
@@ -52,9 +53,11 @@ DEFINE_string(test_leave_files, "on_failure",
 DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
 DECLARE_int64(memory_limit_hard_bytes);
 DECLARE_bool(enable_tracing);
+DECLARE_bool(running_test);
 
 using std::string;
 using strings::Substitute;
+using gflags::FlagSaver;
 
 namespace yb {
 
@@ -101,6 +104,18 @@ void YBTest::SetUp() {
   InitGoogleLoggingSafeBasic("yb_test");
   FLAGS_enable_tracing = true;
   FLAGS_memory_limit_hard_bytes = 8 * 1024 * 1024 * 1024L;
+  FLAGS_running_test = true;
+  for (const char* env_var_name : {
+      "ASAN_OPTIONS",
+      "LSAN_OPTIONS",
+      "UBSAN_OPTIONS",
+      "TSAN_OPTIONS"
+  }) {
+    const char* value = getenv(env_var_name);
+    if (value && value[0]) {
+      LOG(INFO) << "Environment variable " << env_var_name << ": " << value;
+    }
+  }
 }
 
 string YBTest::GetTestPath(const string& relative_path) {
@@ -196,35 +211,116 @@ string GetTestDataDirectory() {
   return dir;
 }
 
+void AssertEventually(const std::function<void(void)>& f,
+                      const MonoDelta& timeout) {
+  const MonoTime deadline = MonoTime::Now() + timeout;
+  {
+    FlagSaver flag_saver;
+    // Disable --gtest_break_on_failure, or else the assertion failures
+    // inside our attempts will cause the test to SEGV even though we
+    // would like to retry.
+    testing::FLAGS_gtest_break_on_failure = false;
+
+    for (int attempts = 0; MonoTime::Now() < deadline; attempts++) {
+      // Capture any assertion failures within this scope (i.e. from their function)
+      // into 'results'
+      testing::TestPartResultArray results;
+      testing::ScopedFakeTestPartResultReporter reporter(
+          testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+          &results);
+      f();
+
+      // Determine whether their function produced any new test failure results.
+      bool has_failures = false;
+      for (int i = 0; i < results.size(); i++) {
+        has_failures |= results.GetTestPartResult(i).failed();
+      }
+      if (!has_failures) {
+        return;
+      }
+
+      // If they had failures, sleep and try again.
+      int sleep_ms = (attempts < 10) ? (1 << attempts) : 1000;
+      SleepFor(MonoDelta::FromMilliseconds(sleep_ms));
+    }
+  }
+
+  // If we ran out of time looping, run their function one more time
+  // without capturing its assertions. This way the assertions will
+  // propagate back out to the normal test reporter. Of course it's
+  // possible that it will pass on this last attempt, but that's OK
+  // too, since we aren't trying to be that strict about the deadline.
+  f();
+  if (testing::Test::HasFatalFailure()) {
+    ADD_FAILURE() << "Timed out waiting for assertion to pass.";
+  }
+}
+
 Status Wait(std::function<Result<bool>()> condition,
-            const MonoTime& deadline,
-            const string& description) {
-  auto start = MonoTime::FineNow();
+            MonoTime deadline,
+            const std::string& description,
+            MonoDelta initial_delay,
+            double delay_multiplier,
+            MonoDelta max_delay) {
+  auto start = MonoTime::Now();
+  MonoDelta delay = initial_delay;
   for (;;) {
-    auto current = condition();
+    const auto current = condition();
     if (!current.ok()) {
       return current.status();
     }
     if (current.get()) {
       break;
     }
-    auto now = MonoTime::FineNow();
-    if (now > deadline) {
+    const auto now = MonoTime::Now();
+    const auto left = deadline - now;
+    if (left <= MonoDelta::kZero) {
       return STATUS_FORMAT(TimedOut,
                            "Operation '$0' didn't complete within $1ms",
                            description,
                            (now - start).ToMilliseconds());
     }
-    SleepFor(MonoDelta::FromMilliseconds(1));
+    delay = std::min(std::min(MonoDelta::FromSeconds(delay.ToSeconds() * delay_multiplier), left),
+                     max_delay);
+    SleepFor(delay);
   }
   return Status::OK();
 }
 
 // Waits for the given condition to be true or until the provided timeout has expired.
 Status WaitFor(std::function<Result<bool>()> condition,
-               const MonoDelta& timeout,
-               const string& description) {
-  return Wait(condition, MonoTime::FineNow() + timeout, description);
+               MonoDelta timeout,
+               const string& description,
+               MonoDelta initial_delay,
+               double delay_multiplier,
+               MonoDelta max_delay) {
+  return Wait(condition, MonoTime::Now() + timeout, description, initial_delay, delay_multiplier,
+              max_delay);
+}
+
+void AssertLoggedWaitFor(
+    std::function<Result<bool>()> condition,
+    MonoDelta timeout,
+    const string& description,
+    MonoDelta initial_delay,
+    double delay_multiplier,
+    MonoDelta max_delay) {
+  LOG(INFO) << description;
+  ASSERT_OK(WaitFor(condition, timeout, description, initial_delay));
+  LOG(INFO) << description << " - DONE";
+}
+
+Status LoggedWaitFor(
+    std::function<Result<bool>()> condition,
+    MonoDelta timeout,
+    const string& description,
+    MonoDelta initial_delay,
+    double delay_multiplier,
+    MonoDelta max_delay) {
+  LOG(INFO) << description << " - started";
+  auto status = WaitFor(condition, timeout, description, initial_delay);
+  LOG(INFO) << description << " - completed: " << yb::ToString(status);
+  return status;
 }
 
 string GetToolPath(const string& tool_name) {
@@ -244,6 +340,13 @@ int CalcNumTablets(int num_tablet_servers) {
 #else
   return num_tablet_servers * 3;
 #endif
+}
+
+void WaitStopped(const CoarseDuration& duration, std::atomic<bool>* stop) {
+  auto end = CoarseMonoClock::now() + duration;
+  while (!stop->load(std::memory_order_acquire) && CoarseMonoClock::now() < end) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
 }
 
 } // namespace yb

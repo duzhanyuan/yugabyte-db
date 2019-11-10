@@ -46,6 +46,7 @@
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/threading/thread_collision_warner.h"
 
+#include "yb/util/atomic.h"
 #include "yb/util/locks.h"
 #include "yb/util/memory/arena_fwd.h"
 
@@ -63,10 +64,10 @@ DECLARE_bool(enable_tracing);
 //  TRACE("Acquired timestamp $0", timestamp);
 #define TRACE(format, substitutions...) \
   do { \
-    if (FLAGS_enable_tracing) { \
+    if (GetAtomicFlag(&FLAGS_enable_tracing)) { \
       yb::Trace* _trace = Trace::CurrentTrace(); \
       if (_trace) { \
-        _trace->SubstituteAndTrace(__FILE__, __LINE__, (format),  \
+        _trace->SubstituteAndTrace(__FILE__, __LINE__, MonoTime::Now(), (format),  \
           ##substitutions); \
       } \
     } \
@@ -75,14 +76,24 @@ DECLARE_bool(enable_tracing);
 // Like the above, but takes the trace pointer as an explicit argument.
 #define TRACE_TO(trace, format, substitutions...) \
   do { \
-    if (FLAGS_enable_tracing) { \
-      (trace)->SubstituteAndTrace(__FILE__, __LINE__, (format), ##substitutions); \
+    if (GetAtomicFlag(&FLAGS_enable_tracing)) { \
+      (trace)->SubstituteAndTrace( \
+          __FILE__, __LINE__, MonoTime::Now(), (format), ##substitutions); \
+    } \
+  } while (0)
+
+// Like the above, but takes the trace pointer as an explicit argument.
+#define TRACE_TO_WITH_TIME(trace, time, format, substitutions...) \
+  do { \
+    if (GetAtomicFlag(&FLAGS_enable_tracing)) { \
+      (trace)->SubstituteAndTrace( \
+          __FILE__, __LINE__, (time), (format), ##substitutions); \
     } \
   } while (0)
 
 #define PLAIN_TRACE_TO(trace, message) \
   do { \
-    if (FLAGS_enable_tracing) { \
+    if (GetAtomicFlag(&FLAGS_enable_tracing)) { \
       (trace)->Trace(__FILE__, __LINE__, (message)); \
     } \
   } while (0)
@@ -110,7 +121,7 @@ class Trace : public RefCountedThreadSafe<Trace> {
   // N.B.: the file path passed here is not copied, so should be a static
   // constant (eg __FILE__).
   void SubstituteAndTrace(const char* file_path, int line_number,
-                          StringPiece format,
+                          MonoTime now, GStringPiece format,
                           const strings::internal::SubstituteArg& arg0,
                           const strings::internal::SubstituteArg& arg1 =
                             strings::internal::SubstituteArg::NoArg,
@@ -131,7 +142,7 @@ class Trace : public RefCountedThreadSafe<Trace> {
                           const strings::internal::SubstituteArg& arg9 =
                             strings::internal::SubstituteArg::NoArg);
 
-  void SubstituteAndTrace(const char* file_path, int line_number, StringPiece format);
+  void SubstituteAndTrace(const char* file_path, int line_number, MonoTime now, GStringPiece format);
 
   // Dump the trace buffer to the given output stream.
   //
@@ -169,7 +180,7 @@ class Trace : public RefCountedThreadSafe<Trace> {
 
   // Allocate a new entry from the arena, with enough space to hold a
   // message of length 'len'.
-  TraceEntry* NewEntry(int len, const char* file_path, int line_number);
+  TraceEntry* NewEntry(int len, const char* file_path, int line_number, MonoTime now);
 
   // Add the entry to the linked list of entries.
   void AddEntry(TraceEntry* entry);
@@ -179,9 +190,9 @@ class Trace : public RefCountedThreadSafe<Trace> {
   // Lock protecting the entries linked list.
   mutable simple_spinlock lock_;
   // The head of the linked list of entries (allocated inside arena_)
-  TraceEntry* entries_head_;
+  TraceEntry* entries_head_ = nullptr;
   // The tail of the linked list of entries (allocated inside arena_)
-  TraceEntry* entries_tail_;
+  TraceEntry* entries_tail_ = nullptr;
 
   int64_t trace_start_time_usec_ = 0;
 

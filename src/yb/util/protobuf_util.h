@@ -41,7 +41,7 @@
 
 namespace yb {
 
-bool AppendPBToString(const google::protobuf::MessageLite &msg, faststring *output) {
+inline bool AppendPBToString(const google::protobuf::MessageLite &msg, faststring *output) {
   int old_size = output->size();
   int byte_size = msg.ByteSize();
   output->resize(old_size + byte_size);
@@ -57,16 +57,19 @@ bool AppendPBToString(const google::protobuf::MessageLite &msg, faststring *outp
 } // namespace yb
 
 #define PB_ENUM_FORMATTERS(EnumType) \
-  inline std::string ToString(EnumType value) { \
+  inline std::string PBEnumToString(EnumType value) { \
     if (BOOST_PP_CAT(EnumType, _IsValid)(value)) { \
       return BOOST_PP_CAT(EnumType, _Name)(value); \
     } else { \
-      return Format("<unknown " BOOST_PP_STRINGIZE(EnumType) " : $0>", \
-          yb::util::to_underlying(value)); \
+      return ::yb::Format("<unknown " BOOST_PP_STRINGIZE(EnumType) " : $0>", \
+          ::yb::to_underlying(value)); \
     } \
   } \
+  inline std::string ToString(EnumType value) { \
+    return PBEnumToString(value); \
+  } \
   inline std::ostream& operator << (std::ostream& out, EnumType value) { \
-    return out << ToString(value); \
+    return out << PBEnumToString(value); \
   }
 
 #endif  // YB_UTIL_PROTOBUF_UTIL_H

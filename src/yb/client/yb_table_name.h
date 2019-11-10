@@ -24,10 +24,10 @@
 
 #include "yb/common/redis_constants_common.h"
 
-
 namespace yb {
 
 namespace master {
+class NamespaceIdentifierPB;
 class TableIdentifierPB;
 }
 
@@ -50,20 +50,30 @@ class YBTableName {
     set_table_name(table_name);
   }
 
+  YBTableName(const std::string& namespace_id, const std::string& namespace_name,
+              const std::string& table_name) {
+    set_namespace_id(namespace_id);
+    set_namespace_name(namespace_name);
+    set_table_name(table_name);
+  }
+
+  YBTableName(const std::string& namespace_id, const std::string& namespace_name,
+              const std::string& table_id, const std::string& table_name) {
+    set_namespace_id(namespace_id);
+    set_namespace_name(namespace_name);
+    set_table_id(table_id);
+    set_table_name(table_name);
+  }
+
   // Simple table name (no namespace provided at the moment of construction).
   // In this case the namespace has not been set yet and it MUST be set later.
   explicit YBTableName(const std::string& table_name) {
     set_table_name(table_name);
   }
 
-  // Copy constructor.
-  YBTableName(const YBTableName& name) {
-    *this = name;
+  bool empty() const {
+    return namespace_id_.empty() && namespace_name_.empty() && table_name_.empty();
   }
-
-  // Move constructor.
-  YBTableName(YBTableName&& name) : namespace_name_(std::move(name.namespace_name_)),
-      table_name_(std::move(name.table_name_)) {}
 
   bool has_namespace() const {
     return !namespace_name_.empty();
@@ -73,6 +83,10 @@ class YBTableName {
     return namespace_name_; // Can be empty.
   }
 
+  const std::string& namespace_id() const {
+    return namespace_id_; // Can be empty.
+  }
+
   const std::string& resolved_namespace_name() const {
     DCHECK(has_namespace()); // At the moment the namespace name must NEVER be empty.
                              // It must be set by set_namespace_name() before this call.
@@ -80,25 +94,41 @@ class YBTableName {
     return namespace_name_;
   }
 
+  bool has_table() const {
+    return !table_name_.empty();
+  }
+
   const std::string& table_name() const {
     return table_name_;
   }
 
-  bool is_system() const {
-    return IsSystemNamespace(resolved_namespace_name());
+  bool has_table_id() const {
+    return !table_id_.empty();
   }
+
+  const std::string& table_id() const {
+    return table_id_; // Can be empty
+  }
+
+  bool is_system() const;
 
   bool is_redis_namespace() const {
     return ((has_namespace() && resolved_namespace_name() == common::kRedisKeyspaceName));
   }
 
   bool is_redis_table() const {
-    return ((has_namespace() && resolved_namespace_name() == common::kRedisKeyspaceName) &&
-        table_name_ == common::kRedisTableName);
+    return (
+        (has_namespace() && resolved_namespace_name() == common::kRedisKeyspaceName) &&
+        table_name_.find(common::kRedisTableName) == 0);
   }
 
   std::string ToString() const {
     return (has_namespace() ? namespace_name_ + '.' + table_name_ : table_name_);
+  }
+
+  void set_namespace_id(const std::string& namespace_id) {
+    DCHECK(!namespace_id.empty());
+    namespace_id_ = namespace_id;
   }
 
   void set_namespace_name(const std::string& namespace_name) {
@@ -111,23 +141,27 @@ class YBTableName {
     table_name_ = table_name;
   }
 
-  YBTableName& operator =(const YBTableName& name) {
-    namespace_name_ = name.namespace_name_;
-    table_name_ = name.table_name_;
-    return *this;
+  void set_table_id(const std::string& table_id) {
+    DCHECK(!table_id.empty());
+    table_id_ = table_id;
   }
 
   // ProtoBuf helpers.
   void SetIntoTableIdentifierPB(master::TableIdentifierPB* id) const;
+  void GetFromTableIdentifierPB(const master::TableIdentifierPB& id);
 
-  static bool IsSystemNamespace(const std::string& namespace_name);
+  void SetIntoNamespaceIdentifierPB(master::NamespaceIdentifierPB* id) const;
+  void GetFromNamespaceIdentifierPB(const master::NamespaceIdentifierPB& id);
 
  private:
+  std::string namespace_id_; // Optional. Can be set when the client knows the namespace id also.
   std::string namespace_name_; // Can be empty, that means the namespace has not been set yet.
+  std::string table_id_; // Optional. Can be set when client knows the table id also.
   std::string table_name_;
 };
 
 inline bool operator ==(const YBTableName& lhs, const YBTableName& rhs) {
+  // Not comparing namespace_id and table_id because they are optional.
   return (lhs.namespace_name() == rhs.namespace_name() && lhs.table_name() == rhs.table_name());
 }
 

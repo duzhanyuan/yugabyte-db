@@ -37,7 +37,7 @@
 #include "yb/rocksdb/util/autovector.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 
 namespace rocksdb {
 const char CuckooTablePropertyNames::kEmptyKey[] =
@@ -90,6 +90,7 @@ CuckooTableBuilder::CuckooTableBuilder(
   // Data is in a huge block.
   properties_.num_data_blocks = 1;
   properties_.num_filter_blocks = 0;
+  properties_.num_data_index_blocks = 0;
   properties_.data_index_size = 0;
   properties_.filter_size = 0;
   properties_.filter_index_size = 0;
@@ -398,7 +399,7 @@ Status CuckooTableBuilder::Finish() {
   footer.set_metaindex_handle(meta_index_block_handle);
   footer.set_index_handle(BlockHandle::NullBlockHandle());
   std::string footer_encoding;
-  footer.EncodeTo(&footer_encoding);
+  footer.AppendEncodedTo(&footer_encoding);
   s = file_->Append(footer_encoding);
   return s;
 }

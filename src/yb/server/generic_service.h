@@ -49,6 +49,10 @@ class GenericServiceImpl : public GenericServiceIf {
                SetFlagResponsePB* resp,
                rpc::RpcContext rpc) override;
 
+  void GetFlag(const GetFlagRequestPB* req,
+               GetFlagResponsePB* resp,
+               rpc::RpcContext rpc) override;
+
   void FlushCoverage(const FlushCoverageRequestPB* req,
                      FlushCoverageResponsePB* resp,
                      rpc::RpcContext rpc) override;
@@ -56,10 +60,6 @@ class GenericServiceImpl : public GenericServiceIf {
   void ServerClock(const ServerClockRequestPB* req,
                    ServerClockResponsePB* resp,
                    rpc::RpcContext rpc) override;
-
-  void SetServerWallClockForTests(const SetServerWallClockForTestsRequestPB *req,
-                                  SetServerWallClockForTestsResponsePB *resp,
-                                  rpc::RpcContext rpc) override;
 
   void GetStatus(const GetStatusRequestPB* req,
                  GetStatusResponsePB* resp,

@@ -11,24 +11,32 @@
 // under the License.
 //
 
-#include "yb/docdb/doc_operation.h"
+#include "yb/common/ql_resultset.h"
+
+#include "yb/common/ql_value.h"
+
+#include "yb/docdb/cql_operation.h"
+#include "yb/docdb/pgsql_operation.h"
+
 #include "yb/tablet/abstract_tablet.h"
 #include "yb/util/trace.h"
+#include "yb/yql/pggate/util/pg_doc_data.h"
 
 namespace yb {
 namespace tablet {
 
-CHECKED_STATUS AbstractTablet::HandleQLReadRequest(
-    HybridTime timestamp, const QLReadRequestPB& ql_read_request,
-    const TransactionOperationContextOpt& txn_op_context, QLResponsePB* response,
-    gscoped_ptr<faststring>* rows_data) {
+Status AbstractTablet::HandleQLReadRequest(CoarseTimePoint deadline,
+                                           const ReadHybridTime& read_time,
+                                           const QLReadRequestPB& ql_read_request,
+                                           const TransactionOperationContextOpt& txn_op_context,
+                                           QLReadRequestResult* result) {
 
   // TODO(Robert): verify that all key column values are provided
   docdb::QLReadOperation doc_op(ql_read_request, txn_op_context);
 
   // Form a schema of columns that are referenced by this query.
   const Schema &schema = SchemaRef();
-  Schema query_schema;
+  Schema projection;
   const QLReferencedColumnsPB& column_pbs = ql_read_request.column_refs();
   vector<ColumnId> column_refs;
   for (int32_t id : column_pbs.static_ids()) {
@@ -37,32 +45,72 @@ CHECKED_STATUS AbstractTablet::HandleQLReadRequest(
   for (int32_t id : column_pbs.ids()) {
     column_refs.emplace_back(id);
   }
-  RETURN_NOT_OK(schema.CreateProjectionByIdsIgnoreMissing(column_refs, &query_schema));
+  RETURN_NOT_OK(schema.CreateProjectionByIdsIgnoreMissing(column_refs, &projection));
 
-  QLRSRowDesc rsrow_desc(ql_read_request.rsrow_desc());
-  QLResultSet resultset;
+  const QLRSRowDesc rsrow_desc(ql_read_request.rsrow_desc());
+  QLResultSet resultset(&rsrow_desc, &result->rows_data);
   TRACE("Start Execute");
-  const Status s = doc_op.Execute(QLStorage(), timestamp, schema, query_schema, &resultset);
+  const Status s = doc_op.Execute(
+      QLStorage(), deadline, read_time, schema, projection, &resultset, &result->restart_read_ht);
   TRACE("Done Execute");
   if (!s.ok()) {
-    response->set_status(QLResponsePB::YQL_STATUS_RUNTIME_ERROR);
-    response->set_error_message(s.message().ToString());
+    if (s.IsQLError()) {
+      result->response.set_status(QLResponsePB::YQL_STATUS_USAGE_ERROR);
+    } else {
+      result->response.set_status(QLResponsePB::YQL_STATUS_RUNTIME_ERROR);
+    }
+    result->response.set_error_message(s.message().cdata(), s.message().size());
     return Status::OK();
   }
-  *response = std::move(doc_op.response());
+  result->response.Swap(&doc_op.response());
 
-  RETURN_NOT_OK(CreatePagingStateForRead(ql_read_request, resultset.rsrow_count(), response));
+  RETURN_NOT_OK(CreatePagingStateForRead(
+      ql_read_request, resultset.rsrow_count(), &result->response));
+
+  result->response.set_status(QLResponsePB::YQL_STATUS_OK);
+  return Status::OK();
+}
+
+Status AbstractTablet::HandlePgsqlReadRequest(CoarseTimePoint deadline,
+                                              const ReadHybridTime& read_time,
+                                              const PgsqlReadRequestPB& pgsql_read_request,
+                                              const TransactionOperationContextOpt& txn_op_context,
+                                              PgsqlReadRequestResult* result) {
+
+  docdb::PgsqlReadOperation doc_op(pgsql_read_request, txn_op_context);
+
+  // Form a schema of columns that are referenced by this query.
+  const Schema &schema = SchemaRef(pgsql_read_request.table_id());
+  const Schema *index_schema = pgsql_read_request.has_index_request()
+                               ? &SchemaRef(pgsql_read_request.index_request().table_id())
+                               : nullptr;
+
+  PgsqlResultSet resultset;
+  TRACE("Start Execute");
+  const Status s = doc_op.Execute(QLStorage(), deadline, read_time, schema, index_schema,
+                                  &resultset, &result->restart_read_ht);
+  TRACE("Done Execute");
+  if (!s.ok()) {
+    result->response.set_status(PgsqlResponsePB::PGSQL_STATUS_RUNTIME_ERROR);
+    result->response.set_error_message(s.message().cdata(), s.message().size());
+    return Status::OK();
+  }
+  result->response.Swap(&doc_op.response());
+
+  RETURN_NOT_OK(CreatePagingStateForRead(
+      pgsql_read_request, resultset.rsrow_count(), &result->response));
 
   // TODO(neil) The clients' request should indicate what encoding method should be used. When
   // multi-shard is used to process more complicated queries, proxy-server might prefer a different
-  // encoding. For now, we'll call CQLSerialize() without checking encoding method.
-  response->set_status(QLResponsePB::YQL_STATUS_OK);
-  rows_data->reset(new faststring());
+  // encoding. For now, we'll call PgsqlSerialize() without checking encoding method.
+  result->response.set_status(PgsqlResponsePB::PGSQL_STATUS_OK);
+
+  // Serializing data for PgGate API.
+  CHECK(!pgsql_read_request.has_rsrow_desc()) << "Row description is not needed";
   TRACE("Start Serialize");
-  RETURN_NOT_OK(resultset.CQLSerialize(ql_read_request.client(),
-                                       rsrow_desc,
-                                       rows_data->get()));
+  RETURN_NOT_OK(pggate::PgDocData::WriteTuples(resultset, &result->rows_data));
   TRACE("Done Serialize");
+
   return Status::OK();
 }
 

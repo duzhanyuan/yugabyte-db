@@ -36,15 +36,27 @@
 #include <string>
 
 #include "yb/util/status.h"
+#include "yb/util/env.h"
 
 namespace yb {
 
 class Env;
 
-// Join two path segments with the appropriate path separator,
-// if necessary.
-std::string JoinPathSegments(const std::string &a,
-                             const std::string &b);
+// Appends path segments with the appropriate path separator, if necessary.
+void AppendPathSegments(std::string* out, const std::string &b);
+
+template <class... Args>
+void AppendPathSegments(std::string* out, const std::string& a, Args&&... args) {
+  AppendPathSegments(out, a);
+  AppendPathSegments(out, std::forward<Args>(args)...);
+}
+
+template <class... Args>
+std::string JoinPathSegments(const std::string& a, Args&&... args) {
+  std::string result = a;
+  AppendPathSegments(&result, std::forward<Args>(args)...);
+  return result;
+}
 
 // Return the enclosing directory of path.
 // This is like dirname(3) but for C++ strings.
@@ -60,11 +72,15 @@ std::string BaseName(const std::string& path);
 std::string GetYbDataPath(const std::string& root);
 std::string GetServerTypeDataPath(const std::string& root, const std::string& server_type);
 
-// For the user specified root dirs, setup the two level heirarchy below it and report the final
+// For the user specified root dirs, setup the two level hierarchy below it and report the final
 // path as well as whether we created the final path or not.
 Status SetupRootDir(
     Env* env, const std::string& root, const std::string& server_type, std::string* out_dir,
     bool* created);
+
+// Tests whether a given path allows creation of temporary files with O_DIRECT given a
+// environment variable.
+Status CheckODirectTempFileCreationInDir(Env* env, const std::string& dir_path);
 
 } // namespace yb
 #endif /* YB_UTIL_PATH_UTIL_H */

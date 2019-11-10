@@ -33,6 +33,7 @@
 #ifndef YB_TABLET_TABLET_PEER_H_
 #define YB_TABLET_TABLET_PEER_H_
 
+#include <atomic>
 #include <future>
 #include <map>
 #include <memory>
@@ -40,26 +41,34 @@
 #include <string>
 #include <vector>
 
-#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus_fwd.h"
+#include "yb/consensus/consensus_context.h"
+#include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/log.h"
 #include "yb/gutil/callback.h"
 #include "yb/gutil/ref_counted.h"
+#include "yb/gutil/strings/substitute.h"
 #include "yb/rpc/rpc_fwd.h"
 
-#include "yb/tablet/tablet.h"
 #include "yb/tablet/transaction_coordinator.h"
+#include "yb/tablet/transaction_participant.h"
 #include "yb/tablet/operation_order_verifier.h"
 #include "yb/tablet/operations/operation_tracker.h"
+#include "yb/tablet/operations/write_operation.h"
+#include "yb/tablet/preparer.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/tablet/tablet_fwd.h"
 
 #include "yb/util/metrics.h"
 #include "yb/util/semaphore.h"
-#include "yb/tablet/prepare_thread.h"
 
 using yb::consensus::StateChangeContext;
 
 namespace yb {
+
+namespace consensus {
+class RaftConsensus;
+}
 
 namespace log {
 class LogAnchorRegistry;
@@ -72,49 +81,58 @@ class UpdateTransactionResponsePB;
 
 class MaintenanceManager;
 class MaintenanceOp;
+class ThreadPool;
 
 namespace tablet {
-class LeaderOperationDriver;
-class ReplicaOperationDriver;
-class TabletPeer;
-class TabletStatusPB;
-class TabletStatusListener;
-class OperationDriver;
-class UpdateTxnOperationState;
+
+class Operation;
 
 // A peer in a tablet consensus configuration, which coordinates writes to tablets.
 // Each time Write() is called this class appends a new entry to a replicated
 // state machine through a consensus algorithm, which makes sure that other
 // peers see the same updates in the same order. In addition to this, this
 // class also splits the work and coordinates multi-threaded execution.
-class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
-                   public consensus::ReplicaOperationFactory,
+class TabletPeer : public consensus::ConsensusContext,
                    public TransactionParticipantContext,
-                   public TransactionCoordinatorContext {
+                   public TransactionCoordinatorContext,
+                   public WriteOperationContext {
  public:
   typedef std::map<int64_t, int64_t> MaxIdxToSegmentSizeMap;
 
-  TabletPeer(const scoped_refptr<TabletMetadata>& meta,
-             const consensus::RaftPeerPB& local_peer_pb, ThreadPool* apply_pool,
-             Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk);
+  TabletPeer(const RaftGroupMetadataPtr& meta,
+             const consensus::RaftPeerPB& local_peer_pb,
+             const scoped_refptr<server::Clock> &clock,
+             const std::string& permanent_uuid,
+             Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
+             MetricRegistry* metric_registry);
+
+  ~TabletPeer();
 
   // Initializes the TabletPeer, namely creating the Log and initializing
   // Consensus.
   CHECKED_STATUS InitTabletPeer(const std::shared_ptr<TabletClass> &tablet,
-                                const std::shared_future<client::YBClientPtr> &client_future,
-                                const scoped_refptr<server::Clock> &clock,
-                                const std::shared_ptr<rpc::Messenger> &messenger,
+                                const std::shared_future<client::YBClient*> &client_future,
+                                const std::shared_ptr<MemTracker>& server_mem_tracker,
+                                rpc::Messenger* messenger,
+                                rpc::ProxyCache* proxy_cache,
                                 const scoped_refptr<log::Log> &log,
-                                const scoped_refptr<MetricEntity> &metric_entity);
+                                const scoped_refptr<MetricEntity> &metric_entity,
+                                ThreadPool* raft_pool,
+                                ThreadPool* tablet_prepare_pool,
+                                consensus::RetryableRequests* retryable_requests);
 
   // Starts the TabletPeer, making it available for Write()s. If this
   // TabletPeer is part of a consensus configuration this will connect it to other peers
   // in the consensus configuration.
   CHECKED_STATUS Start(const consensus::ConsensusBootstrapInfo& info);
 
-  // Shutdown this tablet peer.
-  // If a shutdown is already in progress, blocks until that shutdown is complete.
-  void Shutdown();
+  // Starts shutdown process.
+  // Returns true if shutdown was just initiated, false if shutdown was already running.
+  MUST_USE_RESULT bool StartShutdown();
+  // Completes shutdown process and waits for it's completeness.
+  void CompleteShutdown(IsDropTable is_drop_table = IsDropTable::kFalse);
+
+  void Shutdown(IsDropTable is_drop_table = IsDropTable::kFalse);
 
   // Check that the tablet is in a RUNNING state.
   CHECKED_STATUS CheckRunning() const;
@@ -131,9 +149,12 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   // to the RPC WriteRequest, WriteResponse, RpcContext and to the tablet's
   // MvccManager.
   // The operation_state is deallocated after use by this function.
-  CHECKED_STATUS SubmitWrite(std::unique_ptr<WriteOperationState> operation_state);
+  void WriteAsync(
+      std::unique_ptr<WriteOperationState> operation_state, int64_t term, CoarseTimePoint deadline);
 
-  void Submit(std::unique_ptr<Operation> operation);
+  void Submit(std::unique_ptr<Operation> operation, int64_t term) override;
+
+  void Aborted(Operation* operation) override;
 
   HybridTime Now() override;
 
@@ -142,23 +163,29 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   std::unique_ptr<UpdateTxnOperationState> CreateUpdateTransactionState(
       tserver::TransactionStatePB* request) override;
 
-  void SubmitUpdateTransaction(std::unique_ptr<UpdateTxnOperationState> state) override;
+  void SubmitUpdateTransaction(
+      std::unique_ptr<UpdateTxnOperationState> state, int64_t term) override;
+
+  void GetLastReplicatedData(RemoveIntentsData* data) override;
 
   void GetTabletStatusPB(TabletStatusPB* status_pb_out) const;
 
   // Used by consensus to create and start a new ReplicaOperation.
-  virtual CHECKED_STATUS StartReplicaOperation(
-      const scoped_refptr<consensus::ConsensusRound>& round) override;
+  CHECKED_STATUS StartReplicaOperation(
+      const scoped_refptr<consensus::ConsensusRound>& round,
+      HybridTime propagated_safe_time) override;
 
-  consensus::Consensus* consensus() const {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return consensus_.get();
-  }
+  // This is an override of a ConsensusContext method. This is called from
+  // UpdateReplica -> EnqueuePreparesUnlocked on Raft heartbeats.
+  void SetPropagatedSafeTime(HybridTime ht) override;
 
-  scoped_refptr<consensus::Consensus> shared_consensus() const {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return consensus_;
-  }
+  // Returns false if it is preferable to don't apply write operation.
+  bool ShouldApplyWrite() override;
+
+  consensus::Consensus* consensus() const;
+  consensus::RaftConsensus* raft_consensus() const;
+
+  std::shared_ptr<consensus::Consensus> shared_consensus() const;
 
   TabletClass* tablet() const {
     std::lock_guard<simple_spinlock> lock(lock_);
@@ -170,10 +197,11 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
     return tablet_;
   }
 
-  const TabletStatePB state() const {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return state_;
+  const RaftGroupStatePB state() const {
+    return state_.load(std::memory_order_acquire);
   }
+
+  const TabletDataState data_state() const;
 
   // Returns the current Raft configuration.
   const consensus::RaftConfigPB RaftConfig() const;
@@ -183,24 +211,25 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   }
 
   // Sets the tablet to a BOOTSTRAPPING state, indicating it is starting up.
-  void SetBootstrapping() {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    CHECK_EQ(NOT_STARTED, state_);
-    state_ = BOOTSTRAPPING;
+  CHECKED_STATUS SetBootstrapping() {
+    return UpdateState(RaftGroupStatePB::NOT_STARTED, RaftGroupStatePB::BOOTSTRAPPING, "");
   }
+
+  CHECKED_STATUS UpdateState(RaftGroupStatePB expected, RaftGroupStatePB new_state,
+                             const std::string& error_message);
 
   // sets the tablet state to FAILED additionally setting the error to the provided
   // one.
-  void SetFailed(const Status& error) {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    state_ = FAILED;
-    error_ = error;
-  }
+  void SetFailed(const Status& error);
 
   // Returns the error that occurred, when state is FAILED.
   CHECKED_STATUS error() const {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return error_;
+    Status *error;
+    if ((error = error_.get(std::memory_order_acquire)) != nullptr) {
+      // Once the error_ is set, we do not reset it to nullptr
+      return *error;
+    }
+    return Status::OK();
   }
 
   // Returns a human-readable string indicating the state of the tablet.
@@ -216,7 +245,7 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
 
   // Returns the minimum known log index that is in-memory or in-flight.
   // Used for selection of log segments to delete during Log GC.
-  CHECKED_STATUS GetEarliestNeededLogIndex(int64_t* log_index) const;
+  Result<int64_t> GetEarliestNeededLogIndex() const;
 
   // Returns a map of log index -> segment size, of all the segments that currently cannot be GCed
   // because in-memory structures have anchors in them.
@@ -229,23 +258,39 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   // Returns a non-ok status if the tablet isn't running.
   CHECKED_STATUS GetGCableDataSize(int64_t* retention_size) const;
 
-  // Return a pointer to the Log.
-  // TabletPeer keeps a reference to Log after Init().
-  log::Log* log() const {
-    return log_.get();
+  // Returns true if it is safe to retrieve the log pointer using the log() function from this
+  // tablet peer. Once the log pointer is initialized, it will stay valid for the lifetime of the
+  // TabletPeer.
+  bool log_available() const {
+    return log_atomic_.load(std::memory_order_acquire) != nullptr;
   }
+
+  // Return a pointer to the Log. TabletPeer keeps a reference to Log after Init(). This function
+  // will crash if the log has not been initialized yet.
+  log::Log* log() const;
+
+  // Returns the OpId of the latest entry in the log, or a zero OpId if the log has not been
+  // initialized.
+  yb::OpId GetLatestLogEntryOpId() const;
 
   server::Clock& clock() const override {
     return *clock_;
   }
 
-  const std::shared_future<client::YBClientPtr>& client_future() const override {
+  const server::ClockPtr& clock_ptr() const override {
+    return clock_;
+  }
+
+  bool Enqueue(rpc::ThreadPoolTask* task) override;
+
+  const std::shared_future<client::YBClient*>& client_future() const override {
     return client_future_;
   }
 
-  consensus::Consensus::LeaderStatus LeaderStatus() const override;
+  int64_t LeaderTerm() const override;
+  consensus::LeaderStatus LeaderStatus() const;
 
-  HybridTime LastCommittedHybridTime() const override;
+  HybridTime HtLeaseExpiration() const override;
 
   const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry() const {
     return log_anchor_registry_;
@@ -257,21 +302,16 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   const std::string& tablet_id() const override { return tablet_id_; }
 
   // Convenience method to return the permanent_uuid of this peer.
-  std::string permanent_uuid() const;
-
-  CHECKED_STATUS NewOperationDriver(std::unique_ptr<Operation> operation,
-                                    consensus::DriverType type,
-                                    scoped_refptr<OperationDriver>* driver);
-
-  CHECKED_STATUS NewLeaderOperationDriver(std::unique_ptr<Operation> operation,
-                                          scoped_refptr<OperationDriver>* driver) {
-    return NewOperationDriver(std::move(operation), consensus::LEADER, driver);
+  const std::string& permanent_uuid() const override {
+    return permanent_uuid_;
   }
 
-  CHECKED_STATUS NewReplicaOperationDriver(std::unique_ptr<Operation> operation,
-                                           scoped_refptr<OperationDriver>* driver) {
-    return NewOperationDriver(std::move(operation), consensus::REPLICA, driver);
-  }
+  Result<OperationDriverPtr> NewOperationDriver(std::unique_ptr<Operation>* operation,
+                                                int64_t term);
+
+  Result<OperationDriverPtr> NewLeaderOperationDriver(
+      std::unique_ptr<Operation>* operation, int64_t term);
+  Result<OperationDriverPtr> NewReplicaOperationDriver(std::unique_ptr<Operation>* operation);
 
   // Tells the tablet's log to garbage collect.
   CHECKED_STATUS RunLogGC();
@@ -287,22 +327,26 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   // Return pointer to the transaction tracker for this peer.
   const OperationTracker* operation_tracker() const { return &operation_tracker_; }
 
-  const scoped_refptr<TabletMetadata>& tablet_metadata() const {
+  const RaftGroupMetadataPtr& tablet_metadata() const {
     return meta_;
   }
 
-  TableType table_type() {
-    // TODO: what if tablet is not set?
-    return tablet()->table_type();
-  }
+  TableType table_type();
+
+  // Return the total on-disk size of this tablet replica, in bytes.
+  // Caller should hold the lock_.
+  uint64_t OnDiskSize() const;
+
+  // Returns the number of segments in log_.
+  int GetNumLogSegments() const;
+
+  std::string LogPrefix() const;
 
  protected:
   friend class RefCountedThreadSafe<TabletPeer>;
   friend class TabletPeerTest;
   FRIEND_TEST(TabletPeerTest, TestDMSAnchorPreventsLogGC);
   FRIEND_TEST(TabletPeerTest, TestActiveOperationPreventsLogGC);
-
-  ~TabletPeer();
 
   // Wait until the TabletPeer is fully in SHUTDOWN state.
   void WaitUntilShutdown();
@@ -317,20 +361,28 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
 
   virtual std::unique_ptr<Operation> CreateOperation(consensus::ReplicateMsg* replicate_msg);
 
-  const scoped_refptr<TabletMetadata> meta_;
+  const RaftGroupMetadataPtr meta_;
 
   const std::string tablet_id_;
 
   const consensus::RaftPeerPB local_peer_pb_;
 
-  TabletStatePB state_;
-  Status error_;
+  // The atomics state_, error_ and has_consensus_ maintain information about the tablet peer.
+  // While modifying the other fields in tablet peer, state_ is modified last.
+  // error_ is set before state_ is set to an error state.
+  std::atomic<enum RaftGroupStatePB> state_;
+  AtomicUniquePtr<Status> error_;
+  std::atomic<bool> has_consensus_ = {false};
+
   OperationTracker operation_tracker_;
   OperationOrderVerifier operation_order_verifier_;
+
   scoped_refptr<log::Log> log_;
+  std::atomic<log::Log*> log_atomic_{nullptr};
+
   std::shared_ptr<TabletClass> tablet_;
-  std::shared_ptr<rpc::Messenger> messenger_;
-  scoped_refptr<consensus::Consensus> consensus_;
+  rpc::ProxyCache* proxy_cache_;
+  std::shared_ptr<consensus::RaftConsensus> consensus_;
   gscoped_ptr<TabletStatusListener> status_listener_;
   simple_spinlock prepare_replicate_lock_;
 
@@ -346,12 +398,7 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   // during them in order to reject RPCs, etc.
   mutable simple_spinlock state_change_lock_;
 
-  std::unique_ptr<PrepareThread> prepare_thread_;
-
-  // Pool that executes apply tasks for transactions. This is a multi-threaded
-  // pool, constructor-injected by either the Master (for system tables) or
-  // the Tablet server.
-  ThreadPool* apply_pool_;
+  std::unique_ptr<Preparer> prepare_thread_;
 
   scoped_refptr<server::Clock> clock_;
 
@@ -370,35 +417,30 @@ class TabletPeer : public RefCountedThreadSafe<TabletPeer>,
   std::vector<MaintenanceOp*> maintenance_ops_;
 
   // Cache the permanent of the tablet UUID to retrieve it without a lock in the common case.
-  mutable std::atomic<bool> cached_permanent_uuid_initialized_ { false };
-  mutable std::string cached_permanent_uuid_;
+  const std::string permanent_uuid_;
+
+  std::atomic<rpc::ThreadPool*> service_thread_pool_{nullptr};
+
+  std::atomic<size_t> preparing_operations_{0};
 
  private:
-  std::shared_future<client::YBClientPtr> client_future_;
+  HybridTime ReportReadRestart() override;
+
+  HybridTime HybridTimeLease(MicrosTime min_allowed, CoarseTimePoint deadline);
+  HybridTime PropagatedSafeTime() override;
+  void MajorityReplicated() override;
+  void ChangeConfigReplicated(const consensus::RaftConfigPB& config) override;
+  uint64_t NumSSTFiles() override;
+
+  MetricRegistry* metric_registry_;
+
+  bool IsLeader() override {
+    return LeaderTerm() != OpId::kUnknownTerm;
+  }
+
+  std::shared_future<client::YBClient*> client_future_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletPeer);
-};
-
-typedef scoped_refptr<TabletPeer> TabletPeerPtr;
-
-// A callback to wait for the in-flight transactions to complete and to flush
-// the Log when they do.
-// Tablet is passed as a raw pointer as this callback is set in TabletMetadata and
-// were we to keep the tablet as a shared_ptr a circular dependency would occur:
-// callback->tablet->metadata->callback. Since the tablet indirectly owns this
-// callback we know that is must still be alive when it fires.
-class FlushInflightsToLogCallback : public RefCountedThreadSafe<FlushInflightsToLogCallback> {
- public:
-  FlushInflightsToLogCallback(Tablet* tablet,
-                              const scoped_refptr<log::Log>& log)
-      : tablet_(tablet),
-        log_(log) {}
-
-  CHECKED_STATUS WaitForInflightsAndFlushLog();
-
- private:
-  Tablet* tablet_;
-  scoped_refptr<log::Log> log_;
 };
 
 }  // namespace tablet

@@ -35,14 +35,17 @@
 #include <memory>
 #include <vector>
 
+#include "yb/client/client_fwd.h"
+
 #include "yb/gutil/ref_counted.h"
+#include "yb/gutil/thread_annotations.h"
+
 #include "yb/util/locks.h"
 
 namespace yb {
 namespace client {
 
 class YBError;
-class KuduInsert;
 
 namespace internal {
 
@@ -52,9 +55,7 @@ class ErrorCollector : public RefCountedThreadSafe<ErrorCollector> {
 
   void AddError(std::unique_ptr<YBError> error);
 
-  void AddError(std::shared_ptr<YBOperation> operation, Status status) {
-    AddError(std::make_unique<YBError>(std::move(operation), std::move(status)));
-  }
+  void AddError(YBOperationPtr operation, Status status);
 
   // See YBSession for details.
   int CountErrors() const;
@@ -62,12 +63,16 @@ class ErrorCollector : public RefCountedThreadSafe<ErrorCollector> {
   // See YBSession for details.
   CollectedErrors GetErrors();
 
+  // If there is only one error in the error collector, returns its associated status. Otherwise
+  // returns Status::OK().
+  Status GetSingleErrorStatus();
+
  private:
   friend class RefCountedThreadSafe<ErrorCollector>;
   ~ErrorCollector();
 
-  mutable simple_spinlock lock_;
-  CollectedErrors errors_;
+  mutable simple_spinlock mutex_;
+  CollectedErrors errors_ GUARDED_BY(mutex_);
 
   DISALLOW_COPY_AND_ASSIGN(ErrorCollector);
 };

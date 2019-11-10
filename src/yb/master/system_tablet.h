@@ -29,33 +29,59 @@ class SystemTablet : public tablet::AbstractTablet {
   SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable> yql_virtual_table,
                const TabletId& tablet_id);
 
-  const Schema& SchemaRef() const override;
+  const Schema& SchemaRef(const std::string& table_id = "") const override;
 
-  const common::QLStorageIf& QLStorage() const override;
+  const common::YQLStorageIf& QLStorage() const override;
 
   TableType table_type() const override;
 
   const TabletId& tablet_id() const override;
 
-  void RegisterReaderTimestamp(HybridTime read_point) override;
+  CHECKED_STATUS RegisterReaderTimestamp(HybridTime read_point) override;
   void UnregisterReader(HybridTime read_point) override;
-  HybridTime SafeTimestampToRead() const override;
 
-  CHECKED_STATUS HandleRedisReadRequest(
-      HybridTime timestamp, const RedisReadRequestPB& redis_read_request,
-      RedisResponsePB* response) override;
+  CHECKED_STATUS HandleRedisReadRequest(CoarseTimePoint deadline,
+                                        const ReadHybridTime& read_time,
+                                        const RedisReadRequestPB& redis_read_request,
+                                        RedisResponsePB* response) override {
+    return STATUS(NotSupported, "RedisReadRequest is not supported for system tablets!");
+  }
 
-  CHECKED_STATUS HandleQLReadRequest(
-      HybridTime timestamp, const QLReadRequestPB& ql_read_request,
-      const TransactionMetadataPB& transaction_metadata, QLResponsePB* response,
-      gscoped_ptr<faststring>* rows_data) override;
+  CHECKED_STATUS HandleQLReadRequest(CoarseTimePoint deadline,
+                                     const ReadHybridTime& read_time,
+                                     const QLReadRequestPB& ql_read_request,
+                                     const TransactionMetadataPB& transaction_metadata,
+                                     tablet::QLReadRequestResult* result) override;
 
   CHECKED_STATUS CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,
                                           const size_t row_count,
                                           QLResponsePB* response) const override;
 
+  CHECKED_STATUS HandlePgsqlReadRequest(CoarseTimePoint deadline,
+                                        const ReadHybridTime& read_time,
+                                        const PgsqlReadRequestPB& pgsql_read_request,
+                                        const TransactionMetadataPB& transaction_metadata,
+                                        tablet::PgsqlReadRequestResult* result) override {
+    return STATUS(NotSupported, "Postgres system table is not yet supported");
+  }
+
+  CHECKED_STATUS CreatePagingStateForRead(const PgsqlReadRequestPB& pgsql_read_request,
+                                          const size_t row_count,
+                                          PgsqlResponsePB* response) const override {
+    return STATUS(NotSupported, "Postgres system table is not yet supported");
+  }
+
   const TableName& GetTableName() const;
+
+  Result<IsolationLevel> GetIsolationLevel(const TransactionMetadataPB& transaction) override {
+    return IsolationLevel::NON_TRANSACTIONAL;
+  }
+
  private:
+  HybridTime DoGetSafeTime(
+      tablet::RequireLease require_lease, HybridTime min_allowed,
+      CoarseTimePoint deadline) const override;
+
   Schema schema_;
   std::unique_ptr<YQLVirtualTable> yql_virtual_table_;
   TabletId tablet_id_;

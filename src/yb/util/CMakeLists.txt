@@ -31,6 +31,13 @@
 #
 
 #######################################
+# protoc-gen-insertions
+#######################################
+
+add_executable(protoc-gen-insertions protoc-gen-insertions.cc)
+target_link_libraries(protoc-gen-insertions gutil protobuf protoc ${YB_BASE_LIBS})
+
+#######################################
 # histogram_proto
 #######################################
 
@@ -73,7 +80,7 @@ ADD_YB_LIBRARY(version_info_proto
   NONLINK_DEPS ${VERSION_INFO_PROTO_TGTS})
 
 #######################################
-# version_info_proto
+# op_id_proto
 #######################################
 
 PROTOBUF_GENERATE_CPP(
@@ -86,16 +93,28 @@ ADD_YB_LIBRARY(opid_proto
   DEPS protobuf
   NONLINK_DEPS ${OP_ID_PROTO_TGTS})
 
+#########################################
+# encryption_proto
+#########################################
+PROTOBUF_GENERATE_CPP(
+  ENCRYPTION_PROTO_SRCS ENCRYPTION_PROTO_HDRS ENCRYPTION_PROTO_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES encryption.proto)
+ADD_YB_LIBRARY(encryption_proto
+  SRCS ${ENCRYPTION_PROTO_SRCS}
+  DEPS protobuf
+  NONLINK_DEPS ${ENCRYPTION_PROTO_TGTS})
+
 ############################################################
 # Version stamp
 ############################################################
 
 # Unlike CMAKE_CURRENT_BINARY_DIR, CMAKE_BINARY_DIR is always the root of
 # the build directory.
-set(VERSION_STAMP_FILE ${CMAKE_BINARY_DIR}/src/yb/generated/version_defines.h)
+set(VERSION_STAMP_FILE ${CMAKE_BINARY_DIR}/version_metadata.json)
 
 list(APPEND GEN_VERSION_INFO_COMMAND "${BUILD_SUPPORT_DIR}/gen_version_info.py")
-list(APPEND GEN_VERSION_INFO_COMMAND "--version=${YB_VERSION_NUMBER}")
 list(APPEND GEN_VERSION_INFO_COMMAND "--build-type=${CMAKE_BUILD_TYPE}")
 if(YB_GIT_HASH)
   message(STATUS "Provided git hash: ${YB_GIT_HASH}")
@@ -117,33 +136,46 @@ else ()
 endif()
 
 set(UTIL_SRCS
+  ${SEMAPHORE_CC}
   allocation_tracker.cc
   atomic.cc
   bitmap.cc
-  bloom_filter.cc
   bitmap.cc
-  cache.cc
+  bloom_filter.cc
+  bytes_formatter.cc
   cache_metrics.cc
+  capabilities.cc
+  ctr_cipher_stream.cc
   coding.cc
+  concurrent_value.cc
   condition_variable.cc
+  countdown_latch.cc
   crc.cc
+  cross_thread_mutex.cc
   crypt.cc
   curl_util.cc
   date_time.cc
-  timestamp.cc
   debug-util.cc
+  debug/long_operation_tracker.cc
   debug/trace_event_impl.cc
   debug/trace_event_impl_constants.cc
   debug/trace_event_synthetic_delay.cc
+  decimal.cc
+  encrypted_file.cc
+  encrypted_file_factory.cc
+  encryption_util.cc
   env.cc env_posix.cc env_util.cc
   errno.cc
-  faststring.cc
+  ev_util.cc
   failure_detector.cc
+  fast_varint.cc
+  faststring.cc
   fault_injection.cc
-  flags.cc
+  file_system.cc
+  file_system_mem.cc
+  file_system_posix.cc
   flag_tags.cc
-  group_varint.cc
-  pstack_watcher.cc
+  flags.cc
   hdr_histogram.cc
   hexdump.cc
   init.cc
@@ -152,94 +184,106 @@ set(UTIL_SRCS
   kernel_stack_watchdog.cc
   locks.cc
   logging.cc
+  main_util.cc
   malloc.cc
   math_util.cc
+  mem_tracker.cc
   memcmpable_varint.cc
+  memenv/memenv.cc
   memory/arena.cc
   memory/mc_types.cc
   memory/memory.cc
-  memenv/memenv.cc
-  mem_tracker.cc
   metrics.cc
   monotime.cc
   mutex.cc
   net/dns_resolver.cc
+  net/inetaddress.cc
   net/net_util.cc
   net/sockaddr.cc
-  net/inetaddress.cc
+  net/rate_limiter.cc
   net/socket.cc
+  net/tunnel.cc
+  ntp_clock.cc
   oid_generator.cc
   once.cc
   opid.cc
   os-util.cc
   path_util.cc
-  pb_util.cc
   pb_util-internal.cc
-  ref_cnt_buffer.cc
+  pb_util.cc
+  pending_op_counter.cc
+  physical_time.cc
+  port_picker.cc
+  priority_thread_pool.cc
+  pstack_watcher.cc
   random_util.cc
-  resettable_heartbeater.cc
+  redis_util.cc
+  ref_cnt_buffer.cc
   rolling_log.cc
   rw_mutex.cc
   rwc_lock.cc
-  ${SEMAPHORE_CC}
+  shared_mem.cc
   slice.cc
-  split.cc
   spinlock_profiling.cc
+  split.cc
+  stats/perf_level_imp.cc
+  stats/iostats_context_imp.cc
   status.cc
   status_callback.cc
   stol_utils.cc
   string_case.cc
+  string_trim.cc
+  string_util.cc
   striped64.cc
   subprocess.cc
   sync_point.cc
   test_graph.cc
   thread.cc
+  thread_restrictions.cc
   threadlocal.cc
   threadpool.cc
-  thread_restrictions.cc
+  timestamp.cc
   trace.cc
-  user.cc
-  url-coding.cc
-  version_info.cc
-  string_packer.cc
-  bytes_formatter.cc
-  cross_thread_mutex.cc
-  string_trim.cc
   trilean.cc
-  pending_op_counter.cc
-  varint.cc
-  decimal.cc
-  port_picker.cc
+  universe_key_manager.cc
+  url-coding.cc
+  user.cc
   uuid.cc
-  fast_varint.cc
+  varint.cc
+  version_info.cc
+  async_util.cc
+  ${UTIL_SRCS_EXTENSIONS}
   )
 
-if(NOT APPLE)
-  set(UTIL_SRCS
-    ${UTIL_SRCS}
-    nvm_cache.cc)
-endif()
-
 set(UTIL_LIBS
-  boost_chrono
   boost_system
   boost_thread
+  cds
+  icui18n
+  icuuc
   crcutil
   crypt_blowfish
   gflags
   glog
   gutil
   histogram_proto
+  libev
   pb_util_proto
   protobuf
   version_info_proto
-  zlib)
+  encryption_proto
+  zlib
+  ${OPENSSL_CRYPTO_LIBRARY}
+  ${UTIL_LIBS_EXTENSIONS})
+
+if (NOT APPLE AND NOT USING_LINUXBREW)
+  set(UTIL_LIBS ${UTIL_LIBS} atomic)
+endif()
 
 if(NOT APPLE)
   set(UTIL_LIBS
     ${UTIL_LIBS}
     rt
-    vmem
     libbacktrace)
 endif()
 
@@ -253,6 +297,7 @@ list(APPEND UTIL_LIBS curl dl)
 ADD_YB_LIBRARY(yb_util
   SRCS ${UTIL_SRCS}
   DEPS ${UTIL_LIBS})
+
 cotire(yb_util)
 
 add_dependencies(yb_util gen_version_info)
@@ -269,10 +314,8 @@ target_link_libraries(yb_test_util
   gmock
   yb_util)
 
-if(NOT APPLE)
-target_link_libraries(yb_test_util
-  vmem)
-endif()
+add_library(encryption_test_util encryption_test_util.cc header_manager_mock_impl.cc)
+target_link_libraries(encryption_test_util yb_test_util)
 
 #######################################
 # yb_test_main
@@ -293,23 +336,15 @@ if(NOT APPLE)
 endif()
 
 #######################################
-# protoc-gen-insertions
-#######################################
-
-add_executable(protoc-gen-insertions protoc-gen-insertions.cc)
-target_link_libraries(protoc-gen-insertions gutil protobuf protoc ${YB_BASE_LIBS})
-
-#######################################
 # Unit tests
 #######################################
 
-set(YB_TEST_LINK_LIBS yb_util gutil ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS yb_test_util gutil gmock ${YB_TEST_LINK_LIBS_EXTENSIONS} ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(atomic-test)
 ADD_YB_TEST(bit-util-test)
 ADD_YB_TEST(bitmap-test)
 ADD_YB_TEST(blocking_queue-test)
 ADD_YB_TEST(bloom_filter-test)
-ADD_YB_TEST(cache-test)
 ADD_YB_TEST(callback_bind-test)
 ADD_YB_TEST(countdown_latch-test)
 ADD_YB_TEST(crc-test RUN_SERIAL true) # has a benchmark
@@ -321,13 +356,11 @@ ADD_YB_TEST(failure_detector-test)
 ADD_YB_TEST(flag_tags-test)
 ADD_YB_TEST(flags-test)
 ADD_YB_TEST(format-test RUN_SERIAL true)
-ADD_YB_TEST(group_varint-test)
 ADD_YB_TEST(hash_util-test)
 ADD_YB_TEST(hdr_histogram-test)
 ADD_YB_TEST(inline_slice-test)
-ADD_YB_TEST(interval_tree-test)
 ADD_YB_TEST(jsonreader-test)
-ADD_YB_TEST(knapsack_solver-test)
+ADD_YB_TEST(lockfree-test)
 ADD_YB_TEST(logging-test)
 ADD_YB_TEST(map-util-test)
 ADD_YB_TEST(memcmpable_varint-test LABELS no_tsan)
@@ -342,15 +375,17 @@ ADD_YB_TEST(mt-metrics-test RUN_SERIAL true)
 ADD_YB_TEST(mt-threadlocal-test RUN_SERIAL true)
 ADD_YB_TEST(net/dns_resolver-test)
 ADD_YB_TEST(net/net_util-test)
+ADD_YB_TEST(net/rate_limiter-test)
 ADD_YB_TEST(object_pool-test)
 ADD_YB_TEST(once-test)
 ADD_YB_TEST(os-util-test)
 ADD_YB_TEST(path_util-test)
+ADD_YB_TEST(priority_queue-test)
+ADD_YB_TEST(priority_thread_pool-test)
 ADD_YB_TEST(pstack_watcher-test)
 ADD_YB_TEST(ref_cnt_buffer-test)
 ADD_YB_TEST(random-test)
 ADD_YB_TEST(random_util-test)
-ADD_YB_TEST(resettable_heartbeater-test)
 ADD_YB_TEST(result-test)
 ADD_YB_TEST(rle-test)
 ADD_YB_TEST(rolling_log-test)
@@ -366,19 +401,21 @@ ADD_YB_TEST(slice-test)
 ADD_YB_TEST(spinlock_profiling-test)
 ADD_YB_TEST(split-test)
 ADD_YB_TEST(stack_watchdog-test)
+ADD_YB_TEST(stats/iostats_context_test)
 ADD_YB_TEST(status-test)
 ADD_YB_TEST(stol_utils-test)
 ADD_YB_TEST(string_case-test)
 ADD_YB_TEST(striped64-test)
+ADD_YB_TEST(strongly_typed_uuid-test)
 ADD_YB_TEST(subprocess-test)
 ADD_YB_TEST(sync_point-test)
+ADD_YB_TEST(taskstream-test)
 ADD_YB_TEST(thread-test)
 ADD_YB_TEST(threadpool-test)
 ADD_YB_TEST(tostring-test)
 ADD_YB_TEST(trace-test)
 ADD_YB_TEST(url-coding-test)
 ADD_YB_TEST(user-test)
-ADD_YB_TEST(string_packer-test)
 ADD_YB_TEST(bytes_formatter-test)
 ADD_YB_TEST(string_trim-test)
 ADD_YB_TEST(varint-test)
@@ -386,6 +423,7 @@ ADD_YB_TEST(decimal-test)
 ADD_YB_TEST(net/inetaddress-test)
 ADD_YB_TEST(uuid-test)
 ADD_YB_TEST(fast_varint-test)
+ADD_YB_TEST(shared_mem-test)
 
 #######################################
 # jsonwriter_test_proto
@@ -425,6 +463,11 @@ PROTOBUF_GENERATE_CPP(
 add_library(proto_container_test_proto
   ${PROTO_CONTAINER_TEST_PROTO_SRCS}
   ${PROTO_CONTAINER_TEST_PROTO_HDRS})
+add_dependencies(proto_container_test_proto
+  gen_src_yb_util_proto_container_test_proto
+  gen_src_yb_util_proto_container_test2_proto
+  gen_src_yb_util_proto_container_test3_proto
+  )
 target_link_libraries(proto_container_test_proto
   protobuf)
 
@@ -438,9 +481,5 @@ if(NOT "${NO_TESTS}")
     proto_container_test_proto)
 endif()
 
-#######################################
-# Builtin function.
-#######################################
-add_subdirectory(bfql)
-
-YB_INCLUDE_EXTENSIONS()
+ADD_YB_TEST(encrypted_env-test)
+target_link_libraries(encrypted_env-test encryption_test_util)

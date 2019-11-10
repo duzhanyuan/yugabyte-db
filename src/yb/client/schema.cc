@@ -39,6 +39,7 @@
 #include "yb/client/schema-internal.h"
 #include "yb/client/value-internal.h"
 #include "yb/common/partial_row.h"
+#include "yb/common/wire_protocol.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
 
@@ -78,31 +79,6 @@ YBColumnSpec* YBColumnSpec::SetSortingType(ColumnSchema::SortingType sorting_typ
   return this;
 }
 
-YBColumnSpec* YBColumnSpec::Default(YBValue* v) {
-  data_->has_default = true;
-  delete data_->default_val;
-  data_->default_val = v;
-  return this;
-}
-
-YBColumnSpec* YBColumnSpec::Compression(CompressionType compression) {
-  data_->has_compression = true;
-  data_->compression = compression;
-  return this;
-}
-
-YBColumnSpec* YBColumnSpec::Encoding(EncodingType encoding) {
-  data_->has_encoding = true;
-  data_->encoding = encoding;
-  return this;
-}
-
-YBColumnSpec* YBColumnSpec::BlockSize(int32_t block_size) {
-  data_->has_block_size = true;
-  data_->block_size = block_size;
-  return this;
-}
-
 YBColumnSpec* YBColumnSpec::PrimaryKey() {
   NotNull();
   data_->primary_key = true;
@@ -137,11 +113,6 @@ YBColumnSpec* YBColumnSpec::Counter() {
   return this;
 }
 
-YBColumnSpec* YBColumnSpec::RemoveDefault() {
-  data_->remove_default = true;
-  return this;
-}
-
 YBColumnSpec* YBColumnSpec::RenameTo(const std::string& new_name) {
   data_->has_rename_to = true;
   data_->rename_to = new_name;
@@ -157,10 +128,6 @@ Status YBColumnSpec::ToColumnSchema(YBColumnSchema* col) const {
     return STATUS(NotSupported, "cannot rename a column during CreateTable",
                                 data_->name);
   }
-  if (data_->remove_default) {
-    return STATUS(NotSupported, "cannot remove default during CreateTable",
-                                data_->name);
-  }
 
   if (!data_->has_type) {
     return STATUS(InvalidArgument, "no type provided for column", data_->name);
@@ -168,32 +135,9 @@ Status YBColumnSpec::ToColumnSchema(YBColumnSchema* col) const {
 
   bool nullable = data_->has_nullable ? data_->nullable : true;
 
-  void* default_val = nullptr;
-  // TODO: distinguish between DEFAULT NULL and no default?
-  if (data_->has_default) {
-    RETURN_NOT_OK(data_->default_val->data_->CheckTypeAndGetPointer(
-                      data_->name, data_->type, &default_val));
-  }
-
-  // Encoding and compression
-  EncodingType encoding = AUTO_ENCODING;
-  if (data_->has_encoding) {
-    encoding = data_->encoding;
-  }
-
-  CompressionType compression = DEFAULT_COMPRESSION;
-  if (data_->has_compression) {
-    compression = data_->compression;
-  }
-
-  int32_t block_size = 0; // '0' signifies server-side default
-  if (data_->has_block_size) {
-    block_size = data_->block_size;
-  }
-
   *col = YBColumnSchema(data_->name, data_->type, nullable, data_->hash_primary_key,
-                        data_->static_column, data_->is_counter, data_->sorting_type, default_val,
-                        YBColumnStorageAttributes(encoding, compression, block_size));
+                        data_->static_column, data_->is_counter, data_->order,
+                        data_->sorting_type);
 
   return Status::OK();
 }
@@ -376,14 +320,10 @@ YBColumnSchema::YBColumnSchema(const std::string &name,
                                bool is_hash_key,
                                bool is_static,
                                bool is_counter,
-                               ColumnSchema::SortingType sorting_type,
-                               const void* default_value,
-                               YBColumnStorageAttributes attributes) {
-  ColumnStorageAttributes attr_private;
-  attr_private.encoding = attributes.encoding();
-  attr_private.compression = attributes.compression();
-  col_ = new ColumnSchema(name, type, is_nullable, is_hash_key, is_static, is_counter, sorting_type,
-                          default_value, default_value, attr_private);
+                               int32_t order,
+                               ColumnSchema::SortingType sorting_type) {
+  col_ = new ColumnSchema(name, type, is_nullable, is_hash_key, is_static, is_counter, order,
+                          sorting_type);
 }
 
 YBColumnSchema::YBColumnSchema(const YBColumnSchema& other)
@@ -415,9 +355,7 @@ void YBColumnSchema::CopyFrom(const YBColumnSchema& other) {
 }
 
 bool YBColumnSchema::Equals(const YBColumnSchema& other) const {
-  return this == &other ||
-    col_ == other.col_ ||
-    (col_ != nullptr && col_->Equals(*other.col_, true));
+  return this == &other || col_ == other.col_ || (col_ != nullptr && col_->Equals(*other.col_));
 }
 
 const std::string& YBColumnSchema::name() const {
@@ -448,6 +386,10 @@ bool YBColumnSchema::is_counter() const {
   return DCHECK_NOTNULL(col_)->is_counter();
 }
 
+int32_t YBColumnSchema::order() const {
+  return DCHECK_NOTNULL(col_)->order();
+}
+
 ////////////////////////////////////////////////////////////
 // YBSchema
 ////////////////////////////////////////////////////////////
@@ -470,6 +412,10 @@ YBSchema::YBSchema(const YBSchema& other) {
   CopyFrom(other);
 }
 
+YBSchema::YBSchema(YBSchema&& other) {
+  MoveFrom(std::move(other));
+}
+
 YBSchema::YBSchema(const Schema& schema)
     : schema_(new Schema(schema)) {
 }
@@ -484,8 +430,20 @@ YBSchema& YBSchema::operator=(const YBSchema& other) {
   return *this;
 }
 
+YBSchema& YBSchema::operator=(YBSchema&& other) {
+  if (&other != this) {
+    MoveFrom(std::move(other));
+  }
+  return *this;
+}
+
 void YBSchema::CopyFrom(const YBSchema& other) {
   schema_.reset(new Schema(*other.schema_));
+  version_ = other.version();
+}
+
+void YBSchema::MoveFrom(YBSchema&& other) {
+  schema_ = std::move(other.schema_);
   version_ = other.version();
 }
 
@@ -511,16 +469,22 @@ bool YBSchema::Equals(const YBSchema& other) const {
          (schema_.get() && other.schema_.get() && schema_->Equals(*other.schema_));
 }
 
+Result<bool> YBSchema::Equals(const SchemaPB& other) const {
+  Schema schema;
+  RETURN_NOT_OK(SchemaFromPB(other, &schema));
+
+  YBSchema yb_schema(schema);
+  return Equals(yb_schema);
+}
+
 const TableProperties& YBSchema::table_properties() const {
   return schema_->table_properties();
 }
 
 YBColumnSchema YBSchema::Column(size_t idx) const {
   ColumnSchema col(schema_->column(idx));
-  YBColumnStorageAttributes attrs(col.attributes().encoding, col.attributes().compression);
   return YBColumnSchema(col.name(), col.type(), col.is_nullable(), col.is_hash_key(),
-                        col.is_static(), col.is_counter(), col.sorting_type(),
-                        col.read_default_value(), attrs);
+                        col.is_static(), col.is_counter(), col.order(), col.sorting_type());
 }
 
 YBColumnSchema YBSchema::ColumnById(int32_t column_id) const {
@@ -551,6 +515,10 @@ size_t YBSchema::num_hash_key_columns() const {
   return schema_->num_hash_key_columns();
 }
 
+size_t YBSchema::num_range_key_columns() const {
+  return schema_->num_range_key_columns();
+}
+
 uint32_t YBSchema::version() const {
   return version_;
 }
@@ -565,6 +533,10 @@ void YBSchema::GetPrimaryKeyColumnIndexes(vector<int>* indexes) const {
   for (int i = 0; i < num_key_columns(); i++) {
     (*indexes)[i] = i;
   }
+}
+
+string YBSchema::ToString() const {
+  return schema_->ToString();
 }
 
 } // namespace client

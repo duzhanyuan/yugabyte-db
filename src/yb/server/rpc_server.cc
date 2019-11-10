@@ -43,6 +43,7 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/service_pool.h"
+#include "yb/rpc/thread_pool.h"
 #include "yb/server/rpc_server.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/status.h"
@@ -53,6 +54,8 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
+using std::unique_ptr;
+using std::make_unique;
 
 DEFINE_string(rpc_bind_addresses, "0.0.0.0",
               "Comma-separated list of addresses to bind to for RPC connections. "
@@ -64,22 +67,22 @@ DEFINE_bool(rpc_server_allow_ephemeral_ports, false,
             "only allowed in tests.");
 TAG_FLAG(rpc_server_allow_ephemeral_ports, unsafe);
 
-DEFINE_int32(rpc_queue_limit, 5000, "Queue limit for rpc server");
-DEFINE_int32(rpc_workers_limit, 128, "Workers limit for rpc server");
+DECLARE_int32(rpc_default_keepalive_time_ms);
 
 namespace yb {
+namespace server {
 
 RpcServerOptions::RpcServerOptions()
   : rpc_bind_addresses(FLAGS_rpc_bind_addresses),
-    default_port(0),
-    queue_limit(FLAGS_rpc_queue_limit),
-    workers_limit(FLAGS_rpc_workers_limit) {
+    connection_keepalive_time_ms(FLAGS_rpc_default_keepalive_time_ms) {
 }
 
-RpcServer::RpcServer(const std::string& name, RpcServerOptions opts)
-    : server_state_(UNINITIALIZED),
+RpcServer::RpcServer(const std::string& name, RpcServerOptions opts,
+                     rpc::ConnectionContextFactoryPtr connection_context_factory)
+    : name_(name),
+      server_state_(UNINITIALIZED),
       options_(std::move(opts)),
-      thread_pool_(new rpc::ThreadPool(name, options_.queue_limit, options_.workers_limit)) {}
+      connection_context_factory_(std::move(connection_context_factory)) {}
 
 RpcServer::~RpcServer() {
   Shutdown();
@@ -90,7 +93,7 @@ string RpcServer::ToString() const {
   return "RpcServer";
 }
 
-Status RpcServer::Init(const shared_ptr<Messenger>& messenger) {
+Status RpcServer::Init(Messenger* messenger) {
   CHECK_EQ(server_state_, UNINITIALIZED);
   messenger_ = messenger;
 
@@ -119,13 +122,18 @@ Status RpcServer::Init(const shared_ptr<Messenger>& messenger) {
   return Status::OK();
 }
 
-Status RpcServer::RegisterService(size_t queue_limit, std::unique_ptr<rpc::ServiceIf> service) {
+Status RpcServer::RegisterService(size_t queue_limit,
+                                  rpc::ServiceIfPtr service,
+                                  rpc::ServicePriority priority) {
   CHECK(server_state_ == INITIALIZED ||
         server_state_ == BOUND) << "bad state: " << server_state_;
   const scoped_refptr<MetricEntity>& metric_entity = messenger_->metric_entity();
   string service_name = service->service_name();
-  scoped_refptr<rpc::ServicePool> service_pool =
-    new rpc::ServicePool(queue_limit, thread_pool_.get(), std::move(service), metric_entity);
+
+  rpc::ThreadPool& thread_pool = messenger_->ThreadPool(priority);
+
+  scoped_refptr<rpc::ServicePool> service_pool(new rpc::ServicePool(
+      queue_limit, &thread_pool, &messenger_->scheduler(), std::move(service), metric_entity));
   RETURN_NOT_OK(messenger_->RegisterService(service_name, service_pool));
   return Status::OK();
 }
@@ -135,7 +143,8 @@ Status RpcServer::Bind() {
 
   rpc_bound_addresses_.resize(rpc_bind_addresses_.size());
   for (size_t i = 0; i != rpc_bind_addresses_.size(); ++i) {
-    RETURN_NOT_OK(messenger_->ListenAddress(rpc_bind_addresses_[i], &rpc_bound_addresses_[i]));
+    RETURN_NOT_OK(messenger_->ListenAddress(
+        connection_context_factory_, rpc_bind_addresses_[i], &rpc_bound_addresses_[i]));
   }
 
   server_state_ = BOUND;
@@ -161,11 +170,10 @@ Status RpcServer::Start() {
 }
 
 void RpcServer::Shutdown() {
-  thread_pool_->Shutdown();
-
   if (messenger_) {
+    messenger_->ShutdownThreadPools();
     messenger_->ShutdownAcceptor();
-    WARN_NOT_OK(messenger_->UnregisterAllServices(), "Unable to unregister our services");
+    messenger_->UnregisterAllServices();
   }
 }
 
@@ -173,4 +181,5 @@ const rpc::ServicePool* RpcServer::service_pool(const string& service_name) cons
   return down_cast<rpc::ServicePool*>(messenger_->rpc_service(service_name).get());
 }
 
+} // namespace server
 } // namespace yb

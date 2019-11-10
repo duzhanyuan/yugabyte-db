@@ -18,13 +18,12 @@
 
 #include <memory>
 
-#include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
 namespace yb {
 
 //------------------------------------------ QL row ----------------------------------------
-// A QL row. It uses QLValueWithPB to store the column values.
+// A QL row. It uses QLValue to store the column values.
 class QLRow {
  public:
   explicit QLRow(const std::shared_ptr<const Schema>& schema);
@@ -44,15 +43,15 @@ class QLRow {
   }
 
   // Get a mutable/non-mutable column value.
-  const QLValue& column(const size_t col_idx) const { return values_.at(col_idx); }
-  QLValue* mutable_column(const size_t col_idx) { return &values_.at(col_idx); }
+  const QLValue& column(const size_t col_idx) const;
+  QLValue* mutable_column(const size_t col_idx);
+
+  void SetColumn(size_t col_idx, QLValuePB value);
 
   QLRow& operator=(const QLRow& other);
   QLRow& operator=(QLRow&& other);
 
-  void SetColumnValues(const std::vector<QLValueWithPB>& column_values) {
-    values_ = column_values;
-  }
+  void SetColumnValues(const std::vector<QLValue>& column_values);
 
   //------------------------------------ debug string ---------------------------------------
   // Return a string for debugging.
@@ -68,7 +67,7 @@ class QLRow {
   CHECKED_STATUS Deserialize(QLClient client, Slice* data);
 
   std::shared_ptr<const Schema> schema_;
-  std::vector<QLValueWithPB> values_;
+  std::vector<QLValue> values_;
 };
 
 //--------------------------------------- QL row block --------------------------------------
@@ -93,8 +92,10 @@ class QLRowBlock {
   // The rows
   std::vector<QLRow>& rows() { return rows_; }
 
+  const std::vector<QLRow>& rows() const { return rows_; }
+
   // Return the row by index
-  QLRow& row(size_t idx) { return rows_.at(idx); }
+  QLRow& row(size_t idx) { return rows_[idx]; }
 
   // Extend row block by 1 emtpy row and return the new row.
   QLRow& Extend();
@@ -112,10 +113,13 @@ class QLRowBlock {
 
   //-------------------------- utility functions for rows data ------------------------------
   // Return row count.
-  static CHECKED_STATUS GetRowCount(QLClient client, const std::string& data, size_t* count);
+  static Result<size_t> GetRowCount(QLClient client, const std::string& data);
 
   // Append rows data. Caller should ensure the column schemas are the same.
   static CHECKED_STATUS AppendRowsData(QLClient client, const std::string& src, std::string* dst);
+
+  // Return rows data of 0 (empty) rows.
+  static std::string ZeroRowsData(QLClient client);
 
  private:
   // Schema of the selected columns. (Note: this schema has no key column definitions)
@@ -123,25 +127,6 @@ class QLRowBlock {
   // Rows in this block.
   std::vector<QLRow> rows_;
 };
-
-// Map for easy lookup of column values of a row by the column id. This map is used in tserver
-// for saving the column values of a selected row to evaluate the WHERE and IF clauses. Since
-// we use the clauses in protobuf to evaluate, we will maintain the column values in QLValuePB
-// also to avoid conversion to and from QLValueWithPB.
-struct QLTableColumn {
- public:
-  QLValuePB value;
-  int64_t ttl_seconds;
-  int64_t write_time;
-};
-
-using QLTableRow = std::unordered_map<ColumnId, QLTableColumn>;
-using QLValueMap = std::unordered_map<ColumnId, QLValuePB>;
-
-// Evaluate a boolean condition for the given row.
-CHECKED_STATUS EvaluateCondition(const QLConditionPB& condition,
-                                 const QLTableRow& row,
-                                 bool* result);
 
 } // namespace yb
 

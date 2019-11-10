@@ -21,7 +21,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#pragma once
+#ifndef YB_ROCKSDB_TABLE_FORMAT_H
+#define YB_ROCKSDB_TABLE_FORMAT_H
+
 #include <stdint.h>
 #include <string>
 #include "yb/util/slice.h"
@@ -29,10 +31,15 @@
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/table.h"
 
+namespace yb {
+
+class MemTracker;
+
+}
+
 namespace rocksdb {
 
 class Block;
-class RandomAccessFile;
 struct ReadOptions;
 
 // the length of the magic number in bytes.
@@ -41,6 +48,8 @@ const int kMagicNumberLengthByte = 8;
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
 class BlockHandle {
+  constexpr static uint64_t kUint64FieldNotSet = ~static_cast<uint64_t>(0);
+
  public:
   BlockHandle();
   BlockHandle(uint64_t offset, uint64_t size);
@@ -53,16 +62,22 @@ class BlockHandle {
   uint64_t size() const { return size_; }
   void set_size(uint64_t _size) { size_ = _size; }
 
-  void EncodeTo(std::string* dst) const;
+  void AppendEncodedTo(std::string* dst) const;
   Status DecodeFrom(Slice* input);
 
   // Return a string that contains the copy of handle.
   std::string ToString(bool hex = true) const;
 
+  std::string ToDebugString() const;
+
   // if the block handle's offset and size are both "0", we will view it
   // as a null block handle that points to no where.
   bool IsNull() const {
     return offset_ == 0 && size_ == 0;
+  }
+
+  bool IsSet() const {
+    return offset_ != kUint64FieldNotSet && size_ != kUint64FieldNotSet;
   }
 
   static const BlockHandle& NullBlockHandle() {
@@ -102,11 +117,11 @@ class Footer {
   // In such case, the table magic number of such footer should be
   // initialized via @ReadFooterFromFile().
   // Use this when you plan to load Footer with DecodeFrom(). Never use this
-  // when you plan to EncodeTo.
+  // when you plan to AppendEncodedTo.
   Footer() : Footer(kInvalidTableMagicNumber, 0) {}
 
   // Use this constructor when you plan to write out the footer using
-  // EncodeTo(). Never use this constructor with DecodeFrom().
+  // AppendEncodedTo(). Never use this constructor with DecodeFrom().
   Footer(uint64_t table_magic_number, uint32_t version);
 
   // The version of the footer in this file
@@ -127,7 +142,7 @@ class Footer {
 
   uint64_t table_magic_number() const { return table_magic_number_; }
 
-  void EncodeTo(std::string* dst) const;
+  void AppendEncodedTo(std::string* dst) const;
 
   // Set the current footer based on the input slice.
   //
@@ -187,11 +202,31 @@ Status ReadFooterFromFile(RandomAccessFileReader* file, uint64_t file_size,
 // 1-byte type + 32-bit crc
 static const size_t kBlockTrailerSize = 5;
 
+class TrackedAllocation {
+ public:
+  TrackedAllocation();
+  TrackedAllocation(std::unique_ptr<char[]>&& data, size_t size,
+                    std::shared_ptr<yb::MemTracker> mem_tracker);
+  TrackedAllocation(TrackedAllocation&& other) = default;
+
+  TrackedAllocation& operator=(TrackedAllocation&& other);
+
+  ~TrackedAllocation();
+
+  char* get() const {
+    return holder_.get();
+  }
+ private:
+  std::unique_ptr<char[]> holder_;
+  size_t size_;
+  std::shared_ptr<yb::MemTracker> mem_tracker_;
+};
+
 struct BlockContents {
   Slice data;           // Actual contents of data
   bool cachable;        // True iff data can be cached
   CompressionType compression_type;
-  std::unique_ptr<char[]> allocation;
+  TrackedAllocation allocation;
 
   BlockContents() : cachable(false), compression_type(kNoCompression) {}
 
@@ -200,21 +235,11 @@ struct BlockContents {
       : data(_data), cachable(_cachable), compression_type(_compression_type) {}
 
   BlockContents(std::unique_ptr<char[]>&& _data, size_t _size, bool _cachable,
-                CompressionType _compression_type)
-      : data(_data.get(), _size),
-        cachable(_cachable),
-        compression_type(_compression_type),
-        allocation(std::move(_data)) {}
+                CompressionType _compression_type, std::shared_ptr<yb::MemTracker> _mem_tracker);
 
-  BlockContents(BlockContents&& other) { *this = std::move(other); }
+  BlockContents(BlockContents&& other) = default;
 
-  BlockContents& operator=(BlockContents&& other) {
-    data = std::move(other.data);
-    cachable = other.cachable;
-    compression_type = other.compression_type;
-    allocation = std::move(other.allocation);
-    return *this;
-  }
+  BlockContents& operator=(BlockContents&& other) = default;
 };
 
 // Read the block identified by "handle" from "file".  On failure
@@ -224,6 +249,7 @@ extern Status ReadBlockContents(RandomAccessFileReader* file,
                                 const ReadOptions& options,
                                 const BlockHandle& handle,
                                 BlockContents* contents, Env* env,
+                                const std::shared_ptr<yb::MemTracker>& mem_tracker,
                                 bool do_uncompress);
 
 // The 'data' points to the raw block contents read in from file.
@@ -235,16 +261,16 @@ extern Status ReadBlockContents(RandomAccessFileReader* file,
 // util/compression.h
 extern Status UncompressBlockContents(const char* data, size_t n,
                                       BlockContents* contents,
-                                      uint32_t compress_format_version);
+                                      uint32_t compress_format_version,
+                                      const std::shared_ptr<yb::MemTracker>& mem_tracker);
 
 // Implementation details follow.  Clients should ignore,
 
-inline BlockHandle::BlockHandle()
-    : BlockHandle(~static_cast<uint64_t>(0),
-                  ~static_cast<uint64_t>(0)) {
-}
+inline BlockHandle::BlockHandle() : BlockHandle(kUint64FieldNotSet, kUint64FieldNotSet) {}
 
 inline BlockHandle::BlockHandle(uint64_t _offset, uint64_t _size)
     : offset_(_offset), size_(_size) {}
 
 }  // namespace rocksdb
+
+#endif // YB_ROCKSDB_TABLE_FORMAT_H

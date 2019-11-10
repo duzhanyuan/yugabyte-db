@@ -57,19 +57,16 @@ class MasterChangeConfigTest : public YBTest {
     opts.master_rpc_ports = { 0, 0, 0 }; // external mini-cluster Start() gets the free ports.
     opts.num_masters = num_masters_ = static_cast<int>(opts.master_rpc_ports.size());
     opts.num_tablet_servers = 0;
-    opts.timeout_ = MonoDelta::FromSeconds(30);
+    opts.timeout = MonoDelta::FromSeconds(30);
+    // Master failovers should not be happening concurrently with us trying to load an initial sys
+    // catalog snapshot. At least this is not supported as of 05/27/2019.
+    opts.enable_ysql = false;
     cluster_.reset(new ExternalMiniCluster(opts));
     ASSERT_OK(cluster_->Start());
 
     ASSERT_OK(cluster_->WaitForLeaderCommitTermAdvance());
 
     ASSERT_OK(CheckNumMastersWithCluster("Start"));
-
-    MessengerBuilder builder("config_change");
-    Status s = builder.Build().MoveTo(&messenger_);
-    if (!s.ok()) {
-      LOG(FATAL) << "Unable to build messenger : " << s.ToString();
-    }
   }
 
   void TearDown() override {
@@ -125,7 +122,6 @@ class MasterChangeConfigTest : public YBTest {
   int num_masters_;
   int cur_log_index_;
   std::unique_ptr<ExternalMiniCluster> cluster_;
-  std::shared_ptr<rpc::Messenger> messenger_;
 };
 
 void MasterChangeConfigTest::VerifyLeaderMasterPeerCount() {
@@ -165,7 +161,7 @@ void MasterChangeConfigTest::VerifyNonLeaderMastersPeerCount() {
 Status MasterChangeConfigTest::WaitForMasterLeaderToBeReady(
     ExternalMaster* master,
     int timeout_sec) {
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
+  MonoTime now = MonoTime::Now();
   MonoTime deadline = now;
   deadline.AddDelta(MonoDelta::FromSeconds(timeout_sec));
   Status s;
@@ -182,7 +178,7 @@ Status MasterChangeConfigTest::WaitForMasterLeaderToBeReady(
       return Status::OK();
     }
     SleepFor(MonoDelta::FromMilliseconds(min(i, 10)));
-    now = MonoTime::Now(MonoTime::FINE);
+    now = MonoTime::Now();
   }
 
   return STATUS(TimedOut, Substitute("Timed out as master leader $0 term not ready.",
@@ -250,6 +246,32 @@ TEST_F(MasterChangeConfigTest, TestRemoveMaster) {
   SetCurLogIndex();
 
   s = cluster_->ChangeConfig(remove_master, consensus::REMOVE_SERVER);
+  ASSERT_OK_PREPEND(s, "Change Config returned error");
+
+  // REMOVE_SERVER causes the op index to increase by one.
+  ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(++cur_log_index_));
+
+  --num_masters_;
+
+  VerifyLeaderMasterPeerCount();
+  VerifyNonLeaderMastersPeerCount();
+}
+
+TEST_F(MasterChangeConfigTest, TestRemoveDeadMaster) {
+  int non_leader_index = -1;
+  Status s = cluster_->GetFirstNonLeaderMasterIndex(&non_leader_index);
+  ASSERT_OK_PREPEND(s, "Non-leader master lookup returned error");
+  if (non_leader_index == -1) {
+    FAIL() << "Failed to get a non-leader master index.";
+  }
+  ExternalMaster* remove_master = cluster_->master(non_leader_index);
+  remove_master->Shutdown();
+  LOG(INFO) << "Stopped and removing master at " << remove_master->bound_rpc_hostport().port();
+
+  SetCurLogIndex();
+
+  s = cluster_->ChangeConfig(remove_master, consensus::REMOVE_SERVER,
+                             consensus::RaftPeerPB::PRE_VOTER, true /* use_hostport */);
   ASSERT_OK_PREPEND(s, "Change Config returned error");
 
   // REMOVE_SERVER causes the op index to increase by one.
@@ -332,7 +354,7 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
   // Now the new master should start the election process.
   ASSERT_OK(cluster_->SetFlag(new_master, "do_not_start_election_test_only", "false"));
 
-  // Leader stepdowm ight not succeed as PRE_VOTER could still be uncommitted. Let it go through
+  // Leader stepdown might not succeed as PRE_VOTER could still be uncommitted. Let it go through
   // as new master should get the other votes anyway once it starts the election.
   if (!s.IsIllegalState()) {
     ASSERT_OK_PREPEND(s,  "Leader step down failed.");
@@ -428,6 +450,8 @@ TEST_F(MasterChangeConfigTest, TestWaitForChangeRoleCompletion) {
 TEST_F(MasterChangeConfigTest, TestLeaderSteppedDownNotElected) {
   SetCurLogIndex();
   ExternalMaster* old_leader = cluster_->GetLeaderMaster();
+  // Give the other peers few iterations to converge.
+  ASSERT_OK(cluster_->SetFlag(old_leader, "leader_failure_max_missed_heartbeat_periods", "24"));
   LOG(INFO) << "Current leader bound to " << old_leader->bound_rpc_hostport().ToString();
   TabletServerErrorPB::Code dummy_err = TabletServerErrorPB::UNKNOWN_ERROR;
   ASSERT_OK_PREPEND(cluster_->StepDownMasterLeader(&dummy_err),
@@ -447,12 +471,38 @@ TEST_F(MasterChangeConfigTest, TestMulitpleLeaderRestarts) {
   // Revive the first leader.
   ASSERT_OK(first_leader->Restart());
   ExternalMaster* check_leader = cluster_->GetLeaderMaster();
-  // Leader should remain the same second one.
-  ASSERT_EQ(second_leader->bound_rpc_addr().port(), check_leader->bound_rpc_addr().port());
+  // Leader should not be first leader.
+  ASSERT_NE(check_leader->bound_rpc_addr().port(), first_leader->bound_rpc_addr().port());
   second_leader->Shutdown();
   check_leader = cluster_->GetLeaderMaster();
   // Leader should not be second one, it can be any one of the other masters.
   ASSERT_NE(second_leader->bound_rpc_addr().port(), check_leader->bound_rpc_addr().port());
+}
+
+TEST_F(MasterChangeConfigTest, TestPingShellMaster) {
+  string peers = "";
+  // Create a shell master as `peers` is empty (for master_addresses).
+  Result<ExternalMaster *> new_shell_master = cluster_->StartMasterWithPeers(peers);
+  ASSERT_OK(new_shell_master);
+  // Add the new shell master to the quorum and ensure it is still running and pingable.
+  SetCurLogIndex();
+  Status s = cluster_->ChangeConfig(*new_shell_master, consensus::ADD_SERVER);
+  LOG(INFO) << "Started shell " << (*new_shell_master)->bound_rpc_hostport().ToString();
+  ASSERT_OK_PREPEND(s, "Change Config returned error : ");
+  ++num_masters_;
+  ASSERT_OK(cluster_->PingMaster(*new_shell_master));
+}
+
+// Process that stops/fails internal to external mini cluster is not allowing test to terminate.
+TEST_F(MasterChangeConfigTest, DISABLED_TestIncorrectMasterStart) {
+  string peers = cluster_->GetMasterAddresses();
+  // Master process start with master_addresses not containing a new master host/port should fail
+  // and become un-pingable.
+  Result<ExternalMaster *> new_master = cluster_->StartMasterWithPeers(peers);
+  ASSERT_OK(new_master);
+  LOG(INFO) << "Tried incorrect master " << (*new_master)->bound_rpc_hostport().ToString();
+  ASSERT_NOK(cluster_->PingMaster(*new_master));
+  (*new_master)->Shutdown();
 }
 
 } // namespace master

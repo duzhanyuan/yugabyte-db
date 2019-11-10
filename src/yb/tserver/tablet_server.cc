@@ -39,15 +39,15 @@
 
 #include <glog/logging.h>
 
-#include "yb/cfile/block_cache.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/rpc/service_if.h"
+#include "yb/rpc/yb_rpc.h"
 #include "yb/server/rpc_server.h"
 #include "yb/server/webserver.h"
 #include "yb/tablet/maintenance_manager.h"
 #include "yb/tserver/heartbeater.h"
-#include "yb/tserver/scanners.h"
+#include "yb/tserver/metrics_snapshotter.h"
 #include "yb/tserver/tablet_service.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver-path-handlers.h"
@@ -55,13 +55,20 @@
 #include "yb/util/flag_tags.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/status.h"
+#include "yb/util/env.h"
+#include "yb/gutil/strings/split.h"
+#include "yb/gutil/sysinfo.h"
+#include "yb/rocksdb/env.h"
 
 using std::make_shared;
 using std::shared_ptr;
 using std::vector;
 using yb::rpc::ServiceIf;
 using yb::tablet::TabletPeer;
+
+using namespace yb::size_literals;
 
 DEFINE_int32(tablet_server_svc_num_threads, -1,
              "Number of RPC worker threads for the TS service. If -1, it is auto configured.");
@@ -80,16 +87,16 @@ DEFINE_int32(ts_remote_bootstrap_svc_num_threads, 10,
              "Number of RPC worker threads for the TS remote bootstrap service");
 TAG_FLAG(ts_remote_bootstrap_svc_num_threads, advanced);
 
-DEFINE_int32(tablet_server_svc_queue_length, -1,
-             "RPC queue length for the TS service. If -1, it is auto configured.");
+DEFINE_int32(tablet_server_svc_queue_length, yb::tserver::TabletServer::kDefaultSvcQueueLength,
+             "RPC queue length for the TS service.");
 TAG_FLAG(tablet_server_svc_queue_length, advanced);
 
 DEFINE_int32(ts_admin_svc_queue_length, 50,
              "RPC queue length for the TS admin service");
 TAG_FLAG(ts_admin_svc_queue_length, advanced);
 
-DEFINE_int32(ts_consensus_svc_queue_length, -1,
-             "RPC queue length for the TS consensus service. If -1, it is auto configured.");
+DEFINE_int32(ts_consensus_svc_queue_length, yb::tserver::TabletServer::kDefaultSvcQueueLength,
+             "RPC queue length for the TS consensus service.");
 TAG_FLAG(ts_consensus_svc_queue_length, advanced);
 
 DEFINE_int32(ts_remote_bootstrap_svc_queue_length, 50,
@@ -101,20 +108,37 @@ DEFINE_bool(enable_direct_local_tablet_server_call,
             "Enable direct call to local tablet server");
 TAG_FLAG(enable_direct_local_tablet_server_call, advanced);
 
+DEFINE_string(redis_proxy_bind_address, "", "Address to bind the redis proxy to");
+DEFINE_int32(redis_proxy_webserver_port, 0, "Webserver port for redis proxy");
+
+DEFINE_string(cql_proxy_bind_address, "", "Address to bind the CQL proxy to");
+DEFINE_int32(cql_proxy_webserver_port, 0, "Webserver port for CQL proxy");
+
+DEFINE_string(pgsql_proxy_bind_address, "", "Address to bind the PostgreSQL proxy to");
+DECLARE_int32(pgsql_proxy_webserver_port);
+
+DEFINE_int64(inbound_rpc_memory_limit, 0, "Inbound RPC memory limit");
+
+DEFINE_bool(start_pgsql_proxy, false,
+            "Whether to run a PostgreSQL server as a child process of the tablet server");
+
+DEFINE_bool(tserver_enable_metrics_snapshotter, false, "Should metrics snapshotter be enabled");
+
 namespace yb {
 namespace tserver {
 
 TabletServer::TabletServer(const TabletServerOptions& opts)
-    : RpcAndWebServerBase("TabletServer", opts, "yb.tabletserver"),
-      initted_(false),
+    : RpcAndWebServerBase(
+          "TabletServer", opts, "yb.tabletserver", server::CreateMemTrackerForServer()),
       fail_heartbeats_for_tests_(false),
       opts_(opts),
       tablet_manager_(new TSTabletManager(fs_manager_.get(), this, metric_registry())),
-      scanner_manager_(new ScannerManager(metric_entity())),
       path_handlers_(new TabletServerPathHandlers(this)),
       maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)),
       master_config_index_(0),
       tablet_server_service_(nullptr) {
+  SetConnectionContextFactory(rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(
+      FLAGS_inbound_rpc_memory_limit, mem_tracker()));
 }
 
 TabletServer::~TabletServer() {
@@ -128,30 +152,64 @@ std::string TabletServer::ToString() const {
 }
 
 Status TabletServer::ValidateMasterAddressResolution() const {
-  for (const HostPort& master_addr : *opts_.GetMasterAddresses().get()) {
-    RETURN_NOT_OK_PREPEND(master_addr.ResolveAddresses(NULL),
-                          strings::Substitute(
-                              "Couldn't resolve master service address '$0'",
-                              master_addr.ToString()));
-  }
-  return Status::OK();
+  return server::ResolveMasterAddresses(opts_.GetMasterAddresses(), nullptr);
 }
 
-Status TabletServer::UpdateMasterAddresses(const consensus::RaftConfigPB& new_config) {
-  shared_ptr<vector<HostPort>> new_master_addresses = make_shared<vector<HostPort>>();
+Status TabletServer::UpdateMasterAddresses(const consensus::RaftConfigPB& new_config,
+                                           bool is_master_leader) {
+  shared_ptr<server::MasterAddresses> new_master_addresses;
+  if (is_master_leader) {
+    SetCurrentMasterIndex(new_config.opid_index());
+    new_master_addresses = make_shared<server::MasterAddresses>();
 
-  SetCurrentMasterIndex(new_config.opid_index());
+    SetCurrentMasterIndex(new_config.opid_index());
 
-  for (const auto& peer : new_config.peers()) {
-    HostPort hp;
-    RETURN_NOT_OK(HostPortFromPB(peer.last_known_addr(), &hp));
-    new_master_addresses->push_back(std::move(hp));
+    for (const auto& peer : new_config.peers()) {
+      std::vector<HostPort> list;
+      for (const auto& hp : peer.last_known_private_addr()) {
+        list.push_back(HostPortFromPB(hp));
+      }
+      for (const auto& hp : peer.last_known_broadcast_addr()) {
+        list.push_back(HostPortFromPB(hp));
+      }
+      new_master_addresses->push_back(std::move(list));
+    }
+  } else {
+    new_master_addresses = make_shared<server::MasterAddresses>(*opts_.GetMasterAddresses());
+
+    for (auto& list : *new_master_addresses) {
+      std::sort(list.begin(), list.end());
+    }
+
+    for (const auto& peer : new_config.peers()) {
+      std::vector<HostPort> list;
+      for (const auto& hp : peer.last_known_private_addr()) {
+        list.push_back(HostPortFromPB(hp));
+      }
+      for (const auto& hp : peer.last_known_broadcast_addr()) {
+        list.push_back(HostPortFromPB(hp));
+      }
+      std::sort(list.begin(), list.end());
+      bool found = false;
+      for (const auto& existing : *new_master_addresses) {
+        if (existing == list) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        new_master_addresses->push_back(std::move(list));
+      }
+    }
   }
-  opts_.SetMasterAddresses(new_master_addresses);
 
   LOG(INFO) << "Got new list of " << new_config.peers_size() << " masters at index "
-            << new_config.opid_index() << " new masters="
-            << HostPort::ToCommaSeparatedString(*new_master_addresses.get());
+            << new_config.opid_index() << " old masters = "
+            << yb::ToString(opts_.GetMasterAddresses())
+            << " new masters = " << yb::ToString(new_master_addresses) << " from "
+            << (is_master_leader ? "leader." : "follower.");
+
+  opts_.SetMasterAddresses(new_master_addresses);
 
   heartbeater_->set_master_addresses(new_master_addresses);
 
@@ -159,9 +217,7 @@ Status TabletServer::UpdateMasterAddresses(const consensus::RaftConfigPB& new_co
 }
 
 Status TabletServer::Init() {
-  CHECK(!initted_);
-
-  cfile::BlockCache::GetSingleton()->StartInstrumentation(metric_entity());
+  CHECK(!initted_.load(std::memory_order_acquire));
 
   // Validate that the passed master address actually resolves.
   // We don't validate that we can connect at this point -- it should
@@ -174,13 +230,14 @@ Status TabletServer::Init() {
 
   heartbeater_.reset(new Heartbeater(opts_, this));
 
+  if (FLAGS_tserver_enable_metrics_snapshotter) {
+    metrics_snapshotter_.reset(new MetricsSnapshotter(opts_, this));
+  }
+
   RETURN_NOT_OK_PREPEND(tablet_manager_->Init(),
                         "Could not init Tablet Manager");
 
-  RETURN_NOT_OK_PREPEND(scanner_manager_->StartRemovalThread(),
-                        "Could not start expired Scanner removal thread");
-
-  initted_ = true;
+  initted_.store(true, std::memory_order_release);
   return Status::OK();
 }
 
@@ -189,48 +246,25 @@ Status TabletServer::WaitInited() {
 }
 
 void TabletServer::AutoInitServiceFlags() {
-  const int32 num_cores = std::thread::hardware_concurrency();
+  const int32 num_cores = base::NumCPUs();
 
   if (FLAGS_tablet_server_svc_num_threads == -1) {
     // Auto select number of threads for the TS service based on number of cores.
     // But bound it between 64 & 512.
-    LOG(INFO) << "Auto setting FLAGS_tablet_server_svc_num_threads...";
     const int32 num_threads = std::min(512, num_cores * 32);
     FLAGS_tablet_server_svc_num_threads = std::max(64, num_threads);
+    LOG(INFO) << "Auto setting FLAGS_tablet_server_svc_num_threads to "
+              << FLAGS_tablet_server_svc_num_threads;
   }
-  LOG(INFO) << "FLAGS_tablet_server_svc_num_threads=" << FLAGS_tablet_server_svc_num_threads;
 
   if (FLAGS_ts_consensus_svc_num_threads == -1) {
     // Auto select number of threads for the TS service based on number of cores.
     // But bound it between 64 & 512.
-    LOG(INFO) << "Auto setting FLAGS_ts_consensus_svc_num_threads...";
     const int32 num_threads = std::min(512, num_cores * 32);
     FLAGS_ts_consensus_svc_num_threads = std::max(64, num_threads);
+    LOG(INFO) << "Auto setting FLAGS_ts_consensus_svc_num_threads to "
+              << FLAGS_ts_consensus_svc_num_threads;
   }
-  LOG(INFO) << "FLAGS_ts_consensus_svc_num_threads=" << FLAGS_ts_consensus_svc_num_threads;
-
-  if (FLAGS_tablet_server_svc_queue_length == -1) {
-    LOG(INFO) << "Auto setting FLAGS_tablet_server_svc_queue_length...";
-    if (num_cores <= 4) {
-      // Assume desktop/lighter weight use case.
-      FLAGS_tablet_server_svc_queue_length = 50;
-    } else {
-      FLAGS_tablet_server_svc_queue_length = 5000;
-    }
-  }
-  LOG(INFO) << "FLAGS_tablet_server_svc_queue_length=" << FLAGS_tablet_server_svc_queue_length;
-
-  if (FLAGS_ts_consensus_svc_queue_length == -1) {
-    LOG(INFO) << "Auto setting FLAGS_ts_consensus_svc_queue_length...";
-    if (num_cores <= 4) {
-      // Assume desktop/lighter weight use case.
-      FLAGS_ts_consensus_svc_queue_length = 50;
-    } else {
-      FLAGS_ts_consensus_svc_queue_length = 512;
-    }
-  }
-  LOG(INFO) << "FLAGS_ts_consensus_svc_queue_length=" << FLAGS_ts_consensus_svc_queue_length;
-
 }
 
 Status TabletServer::RegisterServices() {
@@ -246,28 +280,38 @@ Status TabletServer::RegisterServices() {
   std::unique_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(metric_entity(),
                                                                         tablet_manager_.get()));
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_ts_consensus_svc_queue_length,
-                                                     std::move(consensus_service)));
+                                                     std::move(consensus_service),
+                                                     rpc::ServicePriority::kHigh));
 
-  std::unique_ptr<ServiceIf> remote_bootstrap_service(
-      new RemoteBootstrapServiceImpl(fs_manager_.get(), tablet_manager_.get(), metric_entity()));
+  std::unique_ptr<ServiceIf> remote_bootstrap_service =
+      std::make_unique<enterprise::RemoteBootstrapServiceImpl>(fs_manager_.get(),
+                                                                        tablet_manager_.get(),
+                                                                        metric_entity());
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_ts_remote_bootstrap_svc_queue_length,
                                                      std::move(remote_bootstrap_service)));
   return Status::OK();
 }
 
 Status TabletServer::Start() {
-  CHECK(initted_);
+  CHECK(initted_.load(std::memory_order_acquire));
 
   AutoInitServiceFlags();
+
+  RETURN_NOT_OK(tablet_manager_->Start());
   RETURN_NOT_OK(RegisterServices());
   RETURN_NOT_OK(RpcAndWebServerBase::Start());
 
   // If enabled, creates a proxy to call this tablet server locally.
   if (FLAGS_enable_direct_local_tablet_server_call) {
-    proxy_.reset(new TabletServerServiceProxy(messenger_, Endpoint()));
+    proxy_ = std::make_shared<TabletServerServiceProxy>(proxy_cache_.get(), HostPort());
   }
 
   RETURN_NOT_OK(heartbeater_->Start());
+
+  if (FLAGS_tserver_enable_metrics_snapshotter) {
+    RETURN_NOT_OK(metrics_snapshotter_->Start());
+  }
+
   RETURN_NOT_OK(maintenance_manager_->Init());
 
   google::FlushLogFiles(google::INFO); // Flush the startup messages.
@@ -278,16 +322,22 @@ Status TabletServer::Start() {
 void TabletServer::Shutdown() {
   LOG(INFO) << "TabletServer shutting down...";
 
-  if (initted_) {
+  bool expected = true;
+  if (initted_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
     maintenance_manager_->Shutdown();
     WARN_NOT_OK(heartbeater_->Stop(), "Failed to stop TS Heartbeat thread");
+
+    if (FLAGS_tserver_enable_metrics_snapshotter) {
+      WARN_NOT_OK(metrics_snapshotter_->Stop(), "Failed to stop TS Metrics Snapshotter thread");
+    }
+
     {
       std::lock_guard<simple_spinlock> l(lock_);
       tablet_server_service_ = nullptr;
     }
+    tablet_manager_->StartShutdown();
     RpcAndWebServerBase::Shutdown();
-    scanner_manager_.reset();
-    tablet_manager_->Shutdown();
+    tablet_manager_->CompleteShutdown();
   }
 
   LOG(INFO) << "TabletServer shut down complete. Bye!";
@@ -304,6 +354,30 @@ Status TabletServer::PopulateLiveTServers(const master::TSHeartbeatResponsePB& h
   return Status::OK();
 }
 
+Status TabletServer::GetTabletStatus(const GetTabletStatusRequestPB* req,
+                                     GetTabletStatusResponsePB* resp) const {
+  VLOG(3) << "GetTabletStatus called for tablet " << req->tablet_id();
+  tablet::TabletPeerPtr peer;
+  if (!tablet_manager_->LookupTablet(req->tablet_id(), &peer)) {
+    return STATUS(NotFound, "Tablet not found", req->tablet_id());
+  }
+  peer->GetTabletStatusPB(resp->mutable_tablet_status());
+  return Status::OK();
+}
+
+bool TabletServer::LeaderAndReady(const TabletId& tablet_id) const {
+  tablet::TabletPeerPtr peer;
+  if (!tablet_manager_->LookupTablet(tablet_id, &peer)) {
+    return false;
+  }
+  return peer->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
+}
+
+Status TabletServer::SetUniverseKeyRegistry(
+    const yb::UniverseKeyRegistryPB& universe_key_registry) {
+  return Status::OK();
+}
+
 void TabletServer::set_cluster_uuid(const std::string& cluster_uuid) {
   std::lock_guard<simple_spinlock> l(lock_);
   cluster_uuid_ = cluster_uuid;
@@ -317,6 +391,61 @@ std::string TabletServer::cluster_uuid() const {
 TabletServiceImpl* TabletServer::tablet_server_service() {
   std::lock_guard<simple_spinlock> l(lock_);
   return tablet_server_service_;
+}
+
+string GetDynamicUrlTile(const string path, const string host, const int port) {
+
+  vector<std::string> parsed_hostname = strings::Split(host, ":");
+  std::string link = strings::Substitute("http://$0:$1$2",
+                                         parsed_hostname[0], yb::ToString(port), path);
+  return link;
+}
+
+void TabletServer::DisplayRpcIcons(std::stringstream* output) {
+  // RPCs in Progress.
+  DisplayIconTile(output, "fa-tasks", "TServer RPCs", "/rpcz");
+  // YCQL RPCs in Progress.
+  string cass_url = GetDynamicUrlTile("/rpcz", FLAGS_cql_proxy_bind_address,
+                                      FLAGS_cql_proxy_webserver_port);
+  DisplayIconTile(output, "fa-tasks", "YCQL RPCs", cass_url);
+
+  // YEDIS RPCs in Progress.
+  string redis_url = GetDynamicUrlTile("/rpcz", FLAGS_redis_proxy_bind_address,
+                                       FLAGS_redis_proxy_webserver_port);
+  DisplayIconTile(output, "fa-tasks", "YEDIS RPCs", redis_url);
+
+  // YSQL RPCs in Progress.
+  string sql_url = GetDynamicUrlTile("/rpcz", FLAGS_pgsql_proxy_bind_address,
+                                     FLAGS_pgsql_proxy_webserver_port);
+  DisplayIconTile(output, "fa-tasks", "YSQL RPCs", sql_url);
+
+}
+
+Env* TabletServer::GetEnv() {
+  return Env::Default();
+}
+
+rocksdb::Env* TabletServer::GetRocksDBEnv() {
+  return rocksdb::Env::Default();
+}
+
+int TabletServer::GetSharedMemoryFd() {
+  return shared_memory_.GetFd();
+}
+
+void TabletServer::SetYSQLCatalogVersion(uint64_t new_version) {
+  std::lock_guard<simple_spinlock> l(lock_);
+  if (new_version > ysql_catalog_version_) {
+    ysql_catalog_version_ = new_version;
+    shared_memory_.SetYSQLCatalogVersion(new_version);
+  } else if (new_version < ysql_catalog_version_) {
+    LOG(DFATAL) << "Ignoring ysql catalog version update: new version too old. "
+                 << "New: " << new_version << ", Old: " << ysql_catalog_version_;
+  }
+}
+
+TabletPeerLookupIf* TabletServer::tablet_peer_lookup() {
+  return tablet_manager_.get();
 }
 
 }  // namespace tserver

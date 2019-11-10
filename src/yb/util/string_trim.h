@@ -57,6 +57,14 @@ std::string LeftShiftTextBlock(const std::string& s);
 // respecting the maximum line length rule in expected test output specified using raw literals.
 std::string ApplyEagerLineContinuation(const std::string& s);
 
+// Trim C++-style comments from each line of the given string. Used to allow including comments
+// inside DocDB debug dump string constants.
+std::string TrimCppComments(const std::string& s);
+
+// Treating the given string as a multi-line piece of text, trims trailing whitespace from every
+// line of it and returns the resulting multi-line piece of text as a string.
+std::string TrimTrailingWhitespaceFromEveryLine(std::string s);
+
 }  // namespace util
 }  // namespace yb
 

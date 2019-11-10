@@ -347,12 +347,12 @@ Options DBTestBase::CurrentOptions(
       break;
     }
     case kBlockBasedTableWithPrefixHashIndex: {
-      table_options.index_type = BlockBasedTableOptions::kHashSearch;
+      table_options.index_type = IndexType::kHashSearch;
       options.prefix_extractor.reset(NewFixedPrefixTransform(1));
       break;
     }
     case kBlockBasedTableWithWholeKeyHashIndex: {
-      table_options.index_type = BlockBasedTableOptions::kHashSearch;
+      table_options.index_type = IndexType::kHashSearch;
       options.prefix_extractor.reset(NewNoopTransform());
       break;
     }
@@ -987,8 +987,8 @@ UpdateStatus DBTestBase::updateInPlaceNoAction(char* prevValue,
 
 // Utility method to test InplaceUpdate
 void DBTestBase::validateNumberOfEntries(int numValues, int cf) {
-  ScopedArenaIterator iter;
   Arena arena;
+  ScopedArenaIterator iter;
   if (cf != 0) {
     iter.set(dbfull()->NewInternalIterator(&arena, handles_[cf]));
   } else {
@@ -1022,7 +1022,7 @@ void DBTestBase::CopyFile(const std::string& source,
     ASSERT_OK(env_->GetFileSize(source, &size));
   }
 
-  char buffer[4096];
+  uint8_t buffer[4096];
   Slice slice;
   while (size > 0) {
     uint64_t one = std::min(uint64_t(sizeof(buffer)), size);

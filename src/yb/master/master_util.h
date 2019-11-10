@@ -11,14 +11,15 @@
 // under the License.
 //
 
-#ifndef YB_COMMON_MASTER_UTIL_H
-#define YB_COMMON_MASTER_UTIL_H
+#ifndef YB_MASTER_MASTER_UTIL_H
+#define YB_MASTER_MASTER_UTIL_H
 
 #include <memory>
 
-#include "yb/rpc/messenger.h"
-#include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/rpc_fwd.h"
 #include "yb/master/master.pb.h"
+
+#include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/status.h"
 
@@ -26,21 +27,33 @@
 
 namespace yb {
 
-class MasterUtil {
- public:
-  // Given a hostport, return the master server information protobuf.
-  // Does not apply to tablet server.
-  static CHECKED_STATUS GetMasterEntryForHost(const std::shared_ptr<rpc::Messenger>& messenger,
-                                      const HostPort& hostport,
-                                      int timeout,
-                                      ServerEntryPB* e);
+namespace consensus {
 
- private:
-  MasterUtil();
+class RaftPeerPB;
 
-  DISALLOW_COPY_AND_ASSIGN(MasterUtil);
-};
+}
 
+namespace master {
+
+// Given a hostport, return the master server information protobuf.
+// Does not apply to tablet server.
+CHECKED_STATUS GetMasterEntryForHosts(
+    rpc::ProxyCache* proxy_cache,
+    const std::vector<HostPort>& hostports,
+    MonoDelta timeout,
+    ServerEntryPB* e);
+
+const HostPortPB& DesiredHostPort(const TSInfoPB& ts_info, const CloudInfoPB& from);
+
+void TakeRegistration(consensus::RaftPeerPB* source, TSInfoPB* dest);
+void CopyRegistration(consensus::RaftPeerPB source, TSInfoPB* dest);
+
+void TakeRegistration(ServerRegistrationPB* source, TSInfoPB* dest);
+void CopyRegistration(ServerRegistrationPB source, TSInfoPB* dest);
+
+bool IsSystemNamespace(const std::string& namespace_name);
+
+} // namespace master
 } // namespace yb
 
-#endif
+#endif // YB_MASTER_MASTER_UTIL_H

@@ -45,6 +45,7 @@
 
 #include "yb/util/enums.h"
 #include "yb/util/monotime.h"
+#include "yb/util/result.h"
 #include "yb/util/status_callback.h"
 
 namespace yb {
@@ -59,7 +60,7 @@ class RpcCommand : public std::enable_shared_from_this<RpcCommand> {
  public:
   // Asynchronously sends the RPC to the remote end.
   //
-  // Subclasses should use SendRpcCb() below as the callback function.
+  // Subclasses should use Finished() below as the callback function.
   virtual void SendRpc() = 0;
 
   // Returns a string representation of the RPC.
@@ -67,30 +68,26 @@ class RpcCommand : public std::enable_shared_from_this<RpcCommand> {
 
   // Callback for SendRpc(). If 'status' is not OK, something failed
   // before the RPC was sent.
-  virtual void SendRpcCb(const Status& status) = 0;
+  virtual void Finished(const Status& status) = 0;
 
   virtual void Abort() = 0;
+
+  virtual CoarseTimePoint deadline() const = 0;
 
  protected:
   ~RpcCommand() {}
 };
 
-YB_DEFINE_ENUM(RpcRetrierState, (kIdle)(kRunning)(kWaiting)(kFinished));
+YB_DEFINE_ENUM(RpcRetrierState, (kIdle)(kRunning)(kScheduling)(kWaiting)(kFinished));
+YB_DEFINE_ENUM(BackoffStrategy, (kLinear)(kExponential));
+YB_STRONGLY_TYPED_BOOL(RetryWhenBusy);
 
 // Provides utilities for retrying failed RPCs.
 //
 // All RPCs should use HandleResponse() to retry certain generic errors.
 class RpcRetrier {
  public:
-  RpcRetrier(MonoTime deadline, std::shared_ptr<rpc::Messenger> messenger)
-      : attempt_num_(1),
-        deadline_(std::move(deadline)),
-        messenger_(std::move(messenger)) {
-    if (deadline_.Initialized()) {
-      controller_.set_deadline(deadline_);
-    }
-    controller_.Reset();
-  }
+  RpcRetrier(CoarseTimePoint deadline, Messenger* messenger, ProxyCache *proxy_cache);
 
   ~RpcRetrier();
 
@@ -101,7 +98,10 @@ class RpcRetrier {
   //
   // Otherwise, returns false and writes the controller status to
   // 'out_status'.
-  bool HandleResponse(RpcCommand* rpc, Status* out_status);
+  // retry_when_busy should be set to false if user does not want to retry request when server
+  // returned that he is busy.
+  bool HandleResponse(RpcCommand* rpc, Status* out_status,
+                      RetryWhenBusy retry_when_busy = RetryWhenBusy::kTrue);
 
   // Retries an RPC at some point in the near future. If 'why_status' is not OK,
   // records it as the most recent error causing the RPC to retry. This is
@@ -112,36 +112,56 @@ class RpcRetrier {
   // deadline has already expired at the time that Retry() was called.
   //
   // Callers should ensure that 'rpc' remains alive.
-  void DelayedRetry(RpcCommand* rpc, const Status& why_status);
+  CHECKED_STATUS DelayedRetry(
+      RpcCommand* rpc, const Status& why_status,
+      BackoffStrategy strategy = BackoffStrategy::kLinear);
 
   RpcController* mutable_controller() { return &controller_; }
   const RpcController& controller() const { return controller_; }
 
-  const MonoTime& deadline() const { return deadline_; }
+  // Sets up deadline and returns controller.
+  // Do not forget that setting deadline in RpcController is NOT thread safe.
+  RpcController* PrepareController(MonoDelta single_call_timeout);
 
-  const std::shared_ptr<Messenger>& messenger() const {
+  CoarseTimePoint deadline() const { return deadline_; }
+
+  rpc::Messenger* messenger() const {
     return messenger_;
+  }
+
+  ProxyCache& proxy_cache() const {
+    return proxy_cache_;
   }
 
   int attempt_num() const { return attempt_num_; }
 
-  // Called when an RPC comes up for retrying. Actually sends the RPC.
-  void DelayedRetryCb(RpcCommand* rpc, const Status& status);
-
   void Abort();
 
+  std::string ToString() const;
+
+  bool finished() const {
+    return state_.load(std::memory_order_acquire) == RpcRetrierState::kFinished;
+  }
+
  private:
+  // Called when an RPC comes up for retrying. Actually sends the RPC.
+  void DoRetry(RpcCommand* rpc, const Status& status);
+
   // The next sent rpc will be the nth attempt (indexed from 1).
-  int attempt_num_;
+  int attempt_num_ = 1;
+
+  const CoarseTimePoint start_;
 
   // If the remote end is busy, the RPC will be retried (with a small
   // delay) until this deadline is reached.
   //
   // May be uninitialized.
-  MonoTime deadline_;
+  const CoarseTimePoint deadline_;
 
   // Messenger to use when sending the RPC.
-  std::shared_ptr<Messenger> messenger_;
+  Messenger* messenger_ = nullptr;
+
+  ProxyCache& proxy_cache_;
 
   // RPC controller to use when sending the RPC.
   RpcController controller_;
@@ -150,7 +170,7 @@ class RpcRetrier {
   // Errors from the server take precedence over timeout errors.
   Status last_error_;
 
-  std::atomic<int64_t> task_id_{-1};
+  std::atomic<ScheduledTaskId> task_id_{kInvalidTaskId};
 
   std::atomic<RpcRetrierState> state_{RpcRetrierState::kIdle};
 
@@ -160,9 +180,8 @@ class RpcRetrier {
 // An in-flight remote procedure call to some server.
 class Rpc : public RpcCommand {
  public:
-  Rpc(const MonoTime& deadline,
-      const std::shared_ptr<rpc::Messenger>& messenger)
-  : retrier_(deadline, messenger) {
+  Rpc(CoarseTimePoint deadline, Messenger* messenger, ProxyCache* proxy_cache)
+      : retrier_(deadline, messenger, proxy_cache) {
   }
 
   virtual ~Rpc() {}
@@ -170,15 +189,20 @@ class Rpc : public RpcCommand {
   // Returns the number of times this RPC has been sent. Will always be at
   // least one.
   int num_attempts() const { return retrier().attempt_num(); }
-  const MonoTime& deadline() const { return retrier_.deadline(); }
+  CoarseTimePoint deadline() const override { return retrier_.deadline(); }
 
   void Abort() override {
     retrier_.Abort();
   }
 
+  void ScheduleRetry(const Status& status);
+
  protected:
   const RpcRetrier& retrier() const { return retrier_; }
   RpcRetrier* mutable_retrier() { return &retrier_; }
+  RpcController* PrepareController(MonoDelta single_call_timeout = MonoDelta()) {
+    return retrier_.PrepareController(single_call_timeout);
+  }
 
  private:
   friend class RpcRetrier;
@@ -188,6 +212,8 @@ class Rpc : public RpcCommand {
 
   DISALLOW_COPY_AND_ASSIGN(Rpc);
 };
+
+YB_STRONGLY_TYPED_BOOL(RequestShutdown);
 
 class Rpcs {
  public:
@@ -203,20 +229,26 @@ class Rpcs {
   void RegisterAndStart(RpcCommandPtr call, Handle* handle);
   RpcCommandPtr Unregister(Handle* handle);
   void Abort(std::initializer_list<Handle*> list);
+  // Request all active calls to abort.
+  void RequestAbortAll();
   Rpcs::Handle Prepare();
 
   RpcCommandPtr Unregister(Handle handle) {
     return Unregister(&handle);
   }
 
-
   Handle InvalidHandle() { return calls_.end(); }
 
  private:
+  // Requests all active calls to abort. Returns deadline for waiting on abort completion.
+  // If shutdown is true - switches Rpcs to shutting down state.
+  CoarseTimePoint DoRequestAbortAll(RequestShutdown shutdown);
+
   boost::optional<std::mutex> mutex_holder_;
   std::mutex* mutex_;
   std::condition_variable cond_;
   Calls calls_;
+  bool shutdown_ = false;
 };
 
 template <class T, class... Args>
@@ -224,6 +256,57 @@ RpcCommandPtr StartRpc(Args&&... args) {
   auto rpc = std::make_shared<T>(std::forward<Args>(args)...);
   rpc->SendRpc();
   return rpc;
+}
+
+template <class Value>
+class RpcFutureCallback {
+ public:
+  RpcFutureCallback(Rpcs::Handle handle,
+                    Rpcs* rpcs,
+                    std::shared_ptr<std::promise<Result<Value>>> promise)
+      : rpcs_(rpcs), handle_(handle), promise_(std::move(promise)) {}
+
+  void operator()(const Status& status, Value value) const {
+    rpcs_->Unregister(handle_);
+    if (status.ok()) {
+      promise_->set_value(std::move(value));
+    } else {
+      promise_->set_value(status);
+    }
+  }
+ private:
+  Rpcs* rpcs_;
+  Rpcs::Handle handle_;
+  std::shared_ptr<std::promise<Result<Value>>> promise_;
+};
+
+template <class Value, class Functor>
+class WrappedRpcFuture {
+ public:
+  WrappedRpcFuture(const Functor& functor, Rpcs* rpcs) : functor_(functor), rpcs_(rpcs) {}
+
+  template <class... Args>
+  std::future<Result<Value>> operator()(Args&&... args) const {
+    auto promise = std::make_shared<std::promise<Result<Value>>>();
+    auto future = promise->get_future();
+    auto handle = rpcs_->Prepare();
+    if (handle == rpcs_->InvalidHandle()) {
+      promise->set_value(STATUS(Aborted, "Rpcs aborted"));
+      return future;
+    }
+    *handle = functor_(std::forward<Args>(args)...,
+                       RpcFutureCallback<Value>(handle, rpcs_, promise));
+    (**handle).SendRpc();
+    return future;
+  }
+ private:
+  Functor* functor_;
+  Rpcs* rpcs_;
+};
+
+template <class Value, class Functor>
+WrappedRpcFuture<Value, Functor> WrapRpcFuture(const Functor& functor, Rpcs* rpcs) {
+  return WrappedRpcFuture<Value, Functor>(functor, rpcs);
 }
 
 } // namespace rpc

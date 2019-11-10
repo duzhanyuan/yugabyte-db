@@ -36,6 +36,9 @@
 #include <vector>
 #include <memory>
 
+#include <boost/container/small_vector.hpp>
+#include <boost/optional/optional_fwd.hpp>
+
 #include "yb/util/env.h"
 #include "yb/util/status.h"
 #include "yb/util/net/net_fwd.h"
@@ -49,9 +52,17 @@ class HostPort {
   HostPort(std::string host, uint16_t port);
   explicit HostPort(const Endpoint& endpoint);
 
+  static HostPort FromBoundEndpoint(const Endpoint& endpoint);
+
   // Parse a "host:port" pair into this object.
   // If there is no port specified in the string, then 'default_port' is used.
   CHECKED_STATUS ParseString(const std::string& str, uint16_t default_port);
+
+  static Result<HostPort> FromString(const std::string& str, uint16_t default_port) {
+    HostPort result;
+    RETURN_NOT_OK(result.ParseString(str, default_port));
+    return std::move(result);
+  }
 
   // Resolve any addresses corresponding to this host:port pair.
   // Note that a host may resolve to more than one IP address.
@@ -72,9 +83,19 @@ class HostPort {
   // HostPort objects. If no port is specified for an entry in the
   // comma separated list, 'default_port' is used for that entry's
   // pair.
-  static CHECKED_STATUS ParseStrings(const std::string& comma_sep_addrs,
-                             uint16_t default_port,
-                             std::vector<HostPort>* res);
+  static CHECKED_STATUS ParseStrings(
+      const std::string& comma_sep_addrs,
+      uint16_t default_port,
+      std::vector<HostPort>* res,
+      const char* separator = ",");
+
+  static Result<std::vector<HostPort>> ParseStrings(
+      const std::string& comma_sep_addrs, uint16_t default_port,
+      const char* separator = ",") {
+    std::vector<HostPort> result;
+    RETURN_NOT_OK(ParseStrings(comma_sep_addrs, default_port, &result, separator));
+    return std::move(result);
+  }
 
   // Takes a vector of HostPort objects and returns a comma separated
   // string containing of "host:port" pairs. This method is the
@@ -87,19 +108,28 @@ class HostPort {
   // Remove a given host/port from a vector of comma separated server multiple addresses, each in
   // [host:port,]+ format and returns a final list as a remaining vector of hostports.
   static CHECKED_STATUS RemoveAndGetHostPortList(
-    const Endpoint& remove,
-    const std::vector<std::string>& multiple_server_addresses,
-    uint16_t default_port,
-    std::vector<HostPort> *res);
+      const Endpoint& remove,
+      const std::vector<std::string>& multiple_server_addresses,
+      uint16_t default_port,
+      std::vector<HostPort> *res);
 
   bool operator==(const HostPort& other) const {
     return host() == other.host() && port() == other.port();
+  }
+
+  friend bool operator<(const HostPort& lhs, const HostPort& rhs) {
+    auto cmp_hosts = lhs.host_.compare(rhs.host_);
+    return cmp_hosts < 0 || (cmp_hosts == 0 && lhs.port_ < rhs.port_);
   }
 
  private:
   std::string host_;
   uint16_t port_;
 };
+
+inline std::ostream& operator<<(std::ostream& out, const HostPort& value) {
+  return out << value.ToString();
+}
 
 struct HostPortHash {
   size_t operator()(const HostPort& hostPort) const {
@@ -122,6 +152,9 @@ bool IsPrivilegedPort(uint16_t port);
 
 // Return the local machine's hostname.
 CHECKED_STATUS GetHostname(std::string* hostname);
+
+// Return the local machine's hostname as a Result.
+Result<std::string> GetHostname();
 
 // Return the local machine's FQDN.
 CHECKED_STATUS GetFQDN(std::string* fqdn);
@@ -158,5 +191,16 @@ enum class AddressFilter {
 };
 Status GetLocalAddresses(std::vector<IpAddress>* result, AddressFilter filter);
 
+// Convert the given host/port pair to a string of the host:port format.
+std::string HostPortToString(const std::string& host, int port);
+
+CHECKED_STATUS HostToAddresses(
+    const std::string& host,
+    boost::container::small_vector_base<IpAddress>* addresses);
+
+Result<IpAddress> HostToAddress(const std::string& host);
+boost::optional<IpAddress> TryFastResolve(const std::string& host);
+
 } // namespace yb
+
 #endif  // YB_UTIL_NET_NET_UTIL_H

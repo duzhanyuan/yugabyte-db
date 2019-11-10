@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 # Copyright (c) YugaByte, Inc.
 #
@@ -15,6 +15,7 @@
 
 # Checks syntax of a Python script. Based on this StackOverflow question: https://goo.gl/cfZLMe.
 
+import os
 import sys
 import traceback
 
@@ -25,6 +26,12 @@ def horizontal_line():
 
 if __name__ == '__main__':
     filename = sys.argv[1]
+    if not os.path.exists(filename):
+        print >>sys.stderr, "Python file does not exist, cannot check syntax: %s" % filename
+        print >>sys.stderr, "This file might have been deleted as part of the latest commit."
+        # Don't consider this an error.
+        sys.exit(0)
+
     source = open(filename, 'r').read() + '\n'
     try:
         compile(source, filename, 'exec')

@@ -52,8 +52,6 @@ import org.jboss.netty.buffer.ChannelBuffers;
 
 import java.io.IOException;
 
-import static org.yb.client.ExternalConsistencyMode.CLIENT_PROPAGATED;
-
 /**
  * Abstract base class for all RPC requests going out to YB.
  * <p>
@@ -77,6 +75,7 @@ public abstract class YRpc<R> {
   protected static final String MASTER_SERVICE_NAME = "yb.master.MasterService";
   protected static final String TABLET_SERVER_SERVICE_NAME = "yb.tserver.TabletServerService";
   protected static final String CONSENSUS_SERVICE_NAME = "yb.consensus.ConsensusService";
+  protected static final String CDC_SERVICE_NAME = "yb.cdc.CDCService";
 
   public interface HasKey {
     /**
@@ -104,7 +103,6 @@ public abstract class YRpc<R> {
   final DeadlineTracker deadlineTracker;
 
   protected long propagatedTimestamp = -1;
-  protected ExternalConsistencyMode externalConsistencyMode = CLIENT_PROPAGATED;
 
   /**
    * How many times have we retried this RPC?.
@@ -113,6 +111,9 @@ public abstract class YRpc<R> {
    * the rest of the code, due to other existing synchronization.
    */
   byte attempt;  // package-private for TabletClient and AsyncYBClient only.
+
+  // Maximum number of attempts to try the RPC. Default 100 times.
+  byte maxAttempts = 100;
 
   // Whether or not retries for this RPC should always go to the same server. This is required in
   // some cases where we do not want the RPC retries to hit a different server serving the same
@@ -159,19 +160,6 @@ public abstract class YRpc<R> {
    * @throws Exception An exception that will be sent to errback.
    */
   abstract Pair<R, Object> deserialize(CallResponse callResponse, String tsUUID) throws Exception;
-
-  /**
-   * Sets the external consistency mode for this RPC.
-   * TODO make this cover most if not all RPCs (right now only scans and writes use this).
-   * @param externalConsistencyMode the mode to set
-   */
-  public void setExternalConsistencyMode(ExternalConsistencyMode externalConsistencyMode) {
-    this.externalConsistencyMode = externalConsistencyMode;
-  }
-
-  public ExternalConsistencyMode getExternalConsistencyMode() {
-    return this.externalConsistencyMode;
-  }
 
   /**
    * Sets the propagated timestamp for this RPC.
@@ -258,6 +246,7 @@ public abstract class YRpc<R> {
       buf.append(tablet.getTabletIdAsString());
     }
     buf.append(", attempt=").append(attempt);
+    buf.append(", maxAttempts=").append(maxAttempts);
     buf.append(", ").append(deadlineTracker);
     buf.append(", ").append(deferred);
     buf.append(')');
@@ -265,19 +254,19 @@ public abstract class YRpc<R> {
   }
 
   static void readProtobuf(final Slice slice,
-      final com.google.protobuf.GeneratedMessage.Builder<?> builder) {
+                           final Message.Builder builder) {
     final int length = slice.length();
     final byte[] payload = slice.getRawArray();
     final int offset = slice.getRawOffset();
     try {
       builder.mergeFrom(payload, offset, length);
       if (!builder.isInitialized()) {
-        throw new InvalidResponseException("Could not deserialize the response," +
-            " incompatible RPC? Error is: " + builder.getInitializationErrorString(), null);
+        throw new RuntimeException("Could not deserialize the response," +
+                " incompatible RPC? Error is: " + builder.getInitializationErrorString());
       }
     } catch (InvalidProtocolBufferException e) {
       final String msg = "Invalid RPC response: length=" + length
-          + ", payload=" + Bytes.pretty(payload);
+              + ", payload=" + Bytes.pretty(payload);
       throw new InvalidResponseException(msg, e);
     }
   }

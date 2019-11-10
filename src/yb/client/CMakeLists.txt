@@ -37,22 +37,23 @@ set(CLIENT_SRCS
   client.cc
   client_builder-internal.cc
   client-internal.cc
+  client_utils.cc
+  error.cc
   error_collector.cc
-  error-internal.cc
   in_flight_op.cc
   meta_cache.cc
-  scan_batch.cc
-  scan_predicate.cc
-  scanner-internal.cc
-  session-internal.cc
+  meta_data_cache.cc
+  permissions.cc
+  session.cc
   schema.cc
-  table-internal.cc
-  table_alterer-internal.cc
-  table_creator-internal.cc
-  tablet_server-internal.cc
+  table.cc
+  table_alterer.cc
+  table_creator.cc
+  table_handle.cc
   tablet_rpc.cc
   transaction.cc
   transaction_manager.cc
+  transaction_pool.cc
   transaction_rpc.cc
   value.cc
   yb_op.cc
@@ -67,9 +68,11 @@ set(CLIENT_LIBS
   server_process
   tserver_proto
   tserver_service_proto
+  tserver_util
   yb_util
   gutil
-  yrpc)
+  yrpc
+  yb_docdb_encoding)
 
 # We customize the output name/directory of the exported library so that we can
 # call it "yb_client" without it colliding with the regular library.
@@ -99,15 +102,20 @@ target_link_libraries(yb_client_test_util
                       gmock
                       yb_client)
 
-add_library(ql-dml-test-base ql-dml-test-base.cc)
+add_library(ql-dml-test-base ql-dml-test-base.cc txn-test-base.cc)
 target_link_libraries(ql-dml-test-base integration-tests)
 
 # Tests
 
-set(YB_TEST_LINK_LIBS yb_client ql_util integration-tests ql-dml-test-base ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS integration-tests rpc_test_util ql-dml-test-base ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(client-test)
 ADD_YB_TEST(client-unittest)
 ADD_YB_TEST(ql-dml-test)
 ADD_YB_TEST(ql-dml-ttl-test)
+ADD_YB_TEST(ql-list-test)
 ADD_YB_TEST(ql-tablet-test)
 ADD_YB_TEST(ql-transaction-test)
+ADD_YB_TEST(ql-stress-test)
+ADD_YB_TEST(snapshot-txn-test)
+ADD_YB_TEST(serializable-txn-test)
+ADD_YB_TEST(tablet_rpc-test)

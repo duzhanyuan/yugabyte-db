@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <functional>
 #include <thread>
+#include <set>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -43,13 +44,22 @@
 #include "yb/client/client.h"
 #include "yb/client/client-internal.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/client_utils.h"
+#include "yb/client/error.h"
 #include "yb/client/meta_cache.h"
-#include "yb/client/row_result.h"
-#include "yb/client/scanner-internal.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/tablet_server.h"
 #include "yb/client/value.h"
 #include "yb/client/yb_op.h"
+
 #include "yb/common/partial_row.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/wire_protocol.h"
+
 #include "yb/consensus/consensus.proxy.h"
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/stl_util.h"
@@ -62,15 +72,19 @@
 #include "yb/master/mini_master.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_test_util.h"
 #include "yb/server/metadata.h"
 #include "yb/server/hybrid_clock.h"
-#include "yb/ql/util/statement_result.h"
+#include "yb/yql/cql/ql/util/statement_result.h"
+#include "yb/yql/pggate/pg_tabledesc.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/operations/write_operation.h"
 #include "yb/tserver/mini_tablet_server.h"
-#include "yb/tserver/scanners.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
+
+#include "yb/util/capabilities.h"
 #include "yb/util/metrics.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status.h"
@@ -81,22 +95,28 @@
 
 DECLARE_bool(enable_data_block_fsync);
 DECLARE_bool(log_inject_latency);
+DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(log_inject_latency_ms_mean);
 DECLARE_int32(log_inject_latency_ms_stddev);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 DECLARE_int32(max_create_tablets_per_ts);
-DECLARE_int32(scanner_gc_check_interval_us);
 DECLARE_int32(scanner_inject_latency_on_each_batch_ms);
 DECLARE_int32(scanner_max_batch_size_bytes);
 DECLARE_int32(scanner_ttl_ms);
 DECLARE_int32(tablet_server_svc_queue_length);
+DECLARE_int32(replication_factor);
 
 DEFINE_int32(test_scan_num_rows, 1000, "Number of rows to insert and scan");
+DECLARE_int32(min_backoff_ms_exponent);
+DECLARE_int32(max_backoff_ms_exponent);
 
 METRIC_DECLARE_counter(rpcs_queue_overflow);
 
+DEFINE_CAPABILITY(ClientTest, 0x1523c5ae);
+
 using namespace std::literals; // NOLINT
+using namespace std::placeholders;
 
 namespace yb {
 namespace client {
@@ -104,8 +124,6 @@ namespace client {
 using std::string;
 using std::set;
 using std::vector;
-
-using namespace std::placeholders;
 
 using base::subtle::Atomic32;
 using base::subtle::NoBarrier_AtomicIncrement;
@@ -120,15 +138,17 @@ using std::shared_ptr;
 using tablet::TabletPeer;
 using tserver::MiniTabletServer;
 
-class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
+constexpr int32_t kNoBound = kint32max;
+constexpr int kNumTablets = 2;
+
+class ClientTest: public YBMiniClusterTestBase<MiniCluster> {
  public:
   ClientTest() {
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("key")->Type(INT32)->NotNull()->HashPrimaryKey();
     b.AddColumn("int_val")->Type(INT32)->NotNull();
     b.AddColumn("string_val")->Type(STRING)->Nullable();
-    b.AddColumn("non_null_with_default")->Type(INT32)->NotNull()
-      ->Default(YBValue::FromInt(12345));
+    b.AddColumn("non_null_with_default")->Type(INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
 
     FLAGS_enable_data_block_fsync = false; // Keep unit tests fast.
@@ -139,35 +159,27 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
 
     // Reduce the TS<->Master heartbeat interval
     FLAGS_heartbeat_interval_ms = 10;
-    FLAGS_scanner_gc_check_interval_us = 50 * 1000; // 50 milliseconds.
 
     // Start minicluster and wait for tablet servers to connect to master.
-    cluster_.reset(new MiniCluster(env_.get(), MiniClusterOptions()));
+    auto opts = MiniClusterOptions();
+    opts.num_tablet_servers = 3;
+    cluster_.reset(new MiniCluster(env_.get(), opts));
     ASSERT_OK(cluster_->Start());
 
     // Connect to the cluster.
-    ASSERT_OK(YBClientBuilder()
+    client_ = ASSERT_RESULT(YBClientBuilder()
         .add_master_server_addr(yb::ToString(cluster_->mini_master()->bound_rpc_addr()))
-        .Build(&client_));
+        .Build());
 
     // Create a keyspace;
     ASSERT_OK(client_->CreateNamespace(kKeyspaceName));
 
-    ASSERT_NO_FATALS(CreateTable(kTableName, 1, GenerateSplitRows(), &client_table_));
-    ASSERT_NO_FATALS(CreateTable(kTable2Name, 1, vector<const YBPartialRow*>(),
-                                 &client_table2_));
-  }
-
-  // Generate a set of split rows for tablets used in this test.
-  vector<const YBPartialRow*> GenerateSplitRows() {
-    vector<const YBPartialRow*> rows;
-    YBPartialRow* row = schema_.NewRow();
-    CHECK_OK(row->SetInt32(0, 9));
-    rows.push_back(row);
-    return rows;
+    ASSERT_NO_FATALS(CreateTable(kTableName, kNumTablets, &client_table_));
+    ASSERT_NO_FATALS(CreateTable(kTable2Name, 1, &client_table2_));
   }
 
   void DoTearDown() override {
+    client_.reset();
     if (cluster_) {
       cluster_->Shutdown();
       cluster_.reset();
@@ -175,19 +187,11 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
     YBMiniClusterTestBase::DoTearDown();
   }
 
-  // Count the rows of a table, checking that the operation succeeds.
-  //
-  // Must be public to use as a thread closure.
-  void CheckRowCount(YBTable* table) {
-    CountRowsFromClient(table);
-  }
-
  protected:
 
   static const string kKeyspaceName;
   static const YBTableName kTableName;
   static const YBTableName kTable2Name;
-  static const int32_t kNoBound;
 
   string GetFirstTabletId(YBTable* table) {
     GetTableLocationsRequestPB req;
@@ -204,17 +208,24 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
       MiniTabletServer* server = cluster_->mini_tablet_server(i);
       if (server->is_started()) {
         ASSERT_EQ(0, server->server()->rpc_server()->
-                  service_pool("yb.tserver.TabletServerService")->
-                  RpcsQueueOverflowMetric()->value());
+            service_pool("yb.tserver.TabletServerService")->
+            RpcsQueueOverflowMetric()->value());
       }
     }
   }
 
+  YBSessionPtr CreateSession(YBClient* client = nullptr) {
+    if (client == nullptr) {
+      client = client_.get();
+    }
+    std::shared_ptr<YBSession> session = client->NewSession();
+    session->SetTimeout(10s);
+    return session;
+  }
+
   // Inserts 'num_rows' test rows using 'client'
-  void InsertTestRows(YBClient* client, YBTable* table, int num_rows, int first_row = 0) {
-    shared_ptr<YBSession> session = client->NewSession();
-    ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-    session->SetTimeoutMillis(10000);
+  void InsertTestRows(YBClient* client, const TableHandle& table, int num_rows, int first_row = 0) {
+    auto session = CreateSession(client);
     for (int i = first_row; i < num_rows + first_row; i++) {
       ASSERT_OK(session->Apply(BuildTestRow(table, i)));
     }
@@ -223,193 +234,117 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   // Inserts 'num_rows' using the default client.
-  void InsertTestRows(YBTable* table, int num_rows, int first_row = 0) {
+  void InsertTestRows(const TableHandle& table, int num_rows, int first_row = 0) {
     InsertTestRows(client_.get(), table, num_rows, first_row);
   }
 
-  void UpdateTestRows(YBTable* table, int lo, int hi) {
-    shared_ptr<YBSession> session = client_->NewSession();
-    ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-    session->SetTimeoutMillis(10000);
+  void UpdateTestRows(const TableHandle& table, int lo, int hi) {
+    auto session = CreateSession();
     for (int i = lo; i < hi; i++) {
-      shared_ptr<KuduUpdate> update(UpdateTestRow(table, i));
-      ASSERT_OK(session->Apply(update));
+      ASSERT_OK(session->Apply(UpdateTestRow(table, i)));
     }
     FlushSessionOrDie(session);
     ASSERT_NO_FATALS(CheckNoRpcOverflow());
   }
 
-  void DeleteTestRows(YBTable* table, int lo, int hi) {
-    shared_ptr<YBSession> session = client_->NewSession();
-    ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-    session->SetTimeoutMillis(10000);
+  void DeleteTestRows(const TableHandle& table, int lo, int hi) {
+    auto session = CreateSession();
     for (int i = lo; i < hi; i++) {
-      shared_ptr<KuduDelete> del(DeleteTestRow(table, i));
-      ASSERT_OK(session->Apply(del));
+      ASSERT_OK(session->Apply(DeleteTestRow(table, i)));
     }
     FlushSessionOrDie(session);
     ASSERT_NO_FATALS(CheckNoRpcOverflow());
   }
 
-  shared_ptr<KuduInsert> BuildTestRow(YBTable* table, int index) {
-    shared_ptr<KuduInsert> insert(table->NewInsert());
-    YBPartialRow* row = insert->mutable_row();
-    CHECK_OK(row->SetInt32(0, index));
-    CHECK_OK(row->SetInt32(1, index * 2));
-    CHECK_OK(row->SetStringCopy(2, Slice(StringPrintf("hello %d", index))));
-    CHECK_OK(row->SetInt32(3, index * 3));
+  shared_ptr<YBqlWriteOp> BuildTestRow(const TableHandle& table, int index) {
+    auto insert = table.NewInsertOp();
+    auto req = insert->mutable_request();
+    QLAddInt32HashValue(req, index);
+    const auto& columns = table.schema().columns();
+    table.AddInt32ColumnValue(req, columns[1].name(), index * 2);
+    table.AddStringColumnValue(req, columns[2].name(), StringPrintf("hello %d", index));
+    table.AddInt32ColumnValue(req, columns[3].name(), index * 3);
     return insert;
   }
 
-  shared_ptr<KuduUpdate> UpdateTestRow(YBTable* table, int index) {
-    shared_ptr<KuduUpdate> update(table->NewUpdate());
-    YBPartialRow* row = update->mutable_row();
-    CHECK_OK(row->SetInt32(0, index));
-    CHECK_OK(row->SetInt32(1, index * 2 + 1));
-    CHECK_OK(row->SetStringCopy(2, Slice(StringPrintf("hello again %d", index))));
+  shared_ptr<YBqlWriteOp> UpdateTestRow(const TableHandle& table, int index) {
+    auto update = table.NewUpdateOp();
+    auto req = update->mutable_request();
+    QLAddInt32HashValue(req, index);
+    const auto& columns = table.schema().columns();
+    table.AddInt32ColumnValue(req, columns[1].name(), index * 2 + 1);
+    table.AddStringColumnValue(req, columns[2].name(), StringPrintf("hello again %d", index));
     return update;
   }
 
-  shared_ptr<KuduDelete> DeleteTestRow(YBTable* table, int index) {
-    shared_ptr<KuduDelete> del(table->NewDelete());
-    YBPartialRow* row = del->mutable_row();
-    CHECK_OK(row->SetInt32(0, index));
+  shared_ptr<YBqlWriteOp> DeleteTestRow(const TableHandle& table, int index) {
+    auto del = table.NewDeleteOp();
+    QLAddInt32HashValue(del->mutable_request(), index);
     return del;
   }
 
   void DoTestScanWithoutPredicates() {
-    YBScanner scanner(client_table_.get());
-    ASSERT_OK(scanner.SetProjectedColumns({ "key" }));
+    client::TableIteratorOptions options;
+    options.columns = std::vector<std::string>{"key"};
     LOG_TIMING(INFO, "Scanning with no predicates") {
-      ASSERT_OK(scanner.Open());
-
-      ASSERT_TRUE(scanner.HasMoreRows());
-      YBScanBatch batch;
       uint64_t sum = 0;
-      while (scanner.HasMoreRows()) {
-        ASSERT_OK(scanner.NextBatch(&batch));
-        for (const YBScanBatch::RowPtr& row : batch) {
-          int32_t value;
-          ASSERT_OK(row.GetInt32(0, &value));
-          sum += value;
-        }
+      for (const auto& row : client::TableRange(client_table_, options)) {
+        sum += row.column(0).int32_value();
       }
       // The sum should be the sum of the arithmetic series from
       // 0..FLAGS_test_scan_num_rows-1
       uint64_t expected = implicit_cast<uint64_t>(FLAGS_test_scan_num_rows) *
-                            (0 + (FLAGS_test_scan_num_rows - 1)) / 2;
+          (0 + (FLAGS_test_scan_num_rows - 1)) / 2;
       ASSERT_EQ(expected, sum);
     }
   }
 
   void DoTestScanWithStringPredicate() {
-    YBScanner scanner(client_table_.get());
-    ASSERT_OK(scanner.AddConjunctPredicate(
-                  client_table_->NewComparisonPredicate("string_val", YBPredicate::GREATER_EQUAL,
-                                                        YBValue::CopyString("hello 2"))));
-    ASSERT_OK(scanner.AddConjunctPredicate(
-                  client_table_->NewComparisonPredicate("string_val", YBPredicate::LESS_EQUAL,
-                                                        YBValue::CopyString("hello 3"))));
+    TableIteratorOptions options;
+    options.filter = FilterBetween("hello 2"s, Inclusive::kFalse,
+                                   "hello 3"s, Inclusive::kFalse,
+                                   "string_val");
 
+    bool found = false;
     LOG_TIMING(INFO, "Scanning with string predicate") {
-      ASSERT_OK(scanner.Open());
-
-      ASSERT_TRUE(scanner.HasMoreRows());
-      YBScanBatch batch;
-      while (scanner.HasMoreRows()) {
-        ASSERT_OK(scanner.NextBatch(&batch));
-        for (const YBScanBatch::RowPtr& row : batch) {
-          Slice s;
-          ASSERT_OK(row.GetString(2, &s));
-          if (!s.starts_with("hello 2") && !s.starts_with("hello 3")) {
-            FAIL() << row.ToString();
-          }
+      for (const auto& row : TableRange(client_table_, options)) {
+        found = true;
+        Slice slice(row.column(2).string_value());
+        if (!slice.starts_with("hello 2") && !slice.starts_with("hello 3")) {
+          FAIL() << row.ToString();
         }
       }
     }
+    ASSERT_TRUE(found);
   }
 
   void DoTestScanWithKeyPredicate() {
-    YBScanner scanner(client_table_.get());
-    ASSERT_OK(scanner.AddConjunctPredicate(
-                  client_table_->NewComparisonPredicate("key", YBPredicate::GREATER_EQUAL,
-                                                        YBValue::FromInt(5))));
-    ASSERT_OK(scanner.AddConjunctPredicate(
-                  client_table_->NewComparisonPredicate("key", YBPredicate::LESS_EQUAL,
-                                                        YBValue::FromInt(10))));
+    auto op = client_table_.NewReadOp();
+    auto req = op->mutable_request();
 
-    LOG_TIMING(INFO, "Scanning with key predicate") {
-      ASSERT_OK(scanner.Open());
-
-      ASSERT_TRUE(scanner.HasMoreRows());
-      YBScanBatch batch;
-      while (scanner.HasMoreRows()) {
-        ASSERT_OK(scanner.NextBatch(&batch));
-        for (const YBScanBatch::RowPtr& row : batch) {
-          int32_t k;
-          ASSERT_OK(row.GetInt32(0, &k));
-          if (k < 5 || k > 10) {
-            FAIL() << row.ToString();
-          }
-        }
-      }
+    auto* const condition = req->mutable_where_expr()->mutable_condition();
+    condition->set_op(QL_OP_AND);
+    client_table_.AddInt32Condition(condition, "key", QL_OP_GREATER_THAN_EQUAL, 5);
+    client_table_.AddInt32Condition(condition, "key", QL_OP_LESS_THAN_EQUAL, 10);
+    client_table_.AddColumns({"key"}, req);
+    auto session = client_->NewSession();
+    session->SetTimeout(60s);
+    ASSERT_OK(session->ApplyAndFlush(op));
+    ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, op->response().status());
+    auto rowblock = ql::RowsResult(op.get()).GetRowBlock();
+    for (const auto& row : rowblock->rows()) {
+      int32_t key = row.column(0).int32_value();
+      ASSERT_GE(key, 5);
+      ASSERT_LE(key, 10);
     }
   }
 
-  int CountRowsFromClient(YBTable* table) {
-    return CountRowsFromClient(table, kNoBound, kNoBound);
-  }
-
-  int CountRowsFromClient(YBTable* table, int32_t lower_bound, int32_t upper_bound) {
-    return CountRowsFromClient(table, YBClient::LEADER_ONLY, lower_bound, upper_bound);
-  }
-
-  int CountRowsFromClient(YBTable* table, YBClient::ReplicaSelection selection,
-                          int32_t lower_bound, int32_t upper_bound) {
-    YBScanner scanner(table);
-#ifndef NDEBUG
-    EXPECT_OK(scanner.SetTimeoutMillis(30000));
-#endif
-    CHECK_OK(scanner.SetSelection(selection));
-    CHECK_OK(scanner.SetProjectedColumns(vector<string>()));
-    if (lower_bound != kNoBound) {
-      CHECK_OK(scanner.AddConjunctPredicate(
-                   client_table_->NewComparisonPredicate("key", YBPredicate::GREATER_EQUAL,
-                                                         YBValue::FromInt(lower_bound))));
-    }
-    if (upper_bound != kNoBound) {
-      CHECK_OK(scanner.AddConjunctPredicate(
-                   client_table_->NewComparisonPredicate("key", YBPredicate::LESS_EQUAL,
-                                                         YBValue::FromInt(upper_bound))));
-    }
-
-    // We hit timeout with QL table type in tests like TestServerTooBusyRetry. This YBScanner based
-    // reads will be replaced with QLReadRequest based reads, so the isTimedOut check is temporary.
-    Status s = scanner.Open();
-    if (s.IsTimedOut()) {
-      return 0;
-    }
-    CHECK_OK(s);
-    int count = 0;
-    YBScanBatch batch;
-    while (scanner.HasMoreRows()) {
-      Status s = scanner.NextBatch(&batch);
-      if (s.IsTimedOut()) {
-        continue;
-      }
-      CHECK_OK(s);
-      count += batch.NumRows();
-    }
-    return count;
-  }
-
-  // Creates a table with 'num_replicas', split into tablets based on 'split_rows'
+  // Creates a table with RF=FLAGS_replication_factor, split into tablets based on 'split_rows'
   // (or single tablet if 'split_rows' is empty).
   void CreateTable(const YBTableName& table_name_orig,
-                   int num_replicas,
-                   const vector<const YBPartialRow*>& split_rows,
-                   shared_ptr<YBTable>* table,
-                   YBTableType table_type = YBTableType::YQL_TABLE_TYPE) {
+                   int num_tablets,
+                   TableHandle* table) {
+    auto num_replicas = FLAGS_replication_factor;
     // The implementation allows table name without a keyspace.
     YBTableName table_name(table_name_orig.has_namespace() ?
         table_name_orig.namespace_name() : kKeyspaceName, table_name_orig.table_name());
@@ -425,15 +360,7 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
       ASSERT_OK(cluster_->WaitForTabletServerCount(num_replicas));
     }
 
-    gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
-    ASSERT_OK(table_creator->table_name(table_name)
-                            .schema(&schema_)
-                            .num_replicas(num_replicas)
-                            .split_rows(split_rows)
-                            .table_type(table_type)
-                            .Create());
-
-    ASSERT_OK(client_->OpenTable(table_name, table));
+    ASSERT_OK(table->Create(table_name, num_tablets, schema_, client_.get()));
   }
 
   // Kills a tablet server.
@@ -446,10 +373,10 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
       if (ts->server()->instance_pb().permanent_uuid() == uuid) {
         if (restart) {
           LOG(INFO) << "Restarting TS at " << ts->bound_rpc_addr();
-          RETURN_NOT_OK(ts->Restart());
+              RETURN_NOT_OK(ts->Restart());
           if (wait_started) {
             LOG(INFO) << "Waiting for TS " << ts->bound_rpc_addr() << " to finish bootstrapping";
-            RETURN_NOT_OK(ts->WaitStarted());
+                RETURN_NOT_OK(ts->WaitStarted());
           }
         } else {
           LOG(INFO) << "Killing TS " << uuid << " at " << ts->bound_rpc_addr();
@@ -480,6 +407,10 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
 
   void DoApplyWithoutFlushTest(int sleep_micros);
 
+  Result<std::unique_ptr<rpc::Messenger>> CreateMessenger(const std::string& name) {
+    return rpc::MessengerBuilder(name).Build();
+  }
+
   enum WhichServerToKill {
     DEAD_MASTER,
     DEAD_TSERVER
@@ -489,16 +420,58 @@ class ClientTest : public YBMiniClusterTestBase<MiniCluster> {
   YBSchema schema_;
 
   gscoped_ptr<MiniCluster> cluster_;
-  shared_ptr<YBClient> client_;
-  shared_ptr<YBTable> client_table_;
-  shared_ptr<YBTable> client_table2_;
+  std::unique_ptr<YBClient> client_;
+  TableHandle client_table_;
+  TableHandle client_table2_;
 };
 
 
 const string ClientTest::kKeyspaceName("my_keyspace");
 const YBTableName ClientTest::kTableName(kKeyspaceName, "client-testtb");
 const YBTableName ClientTest::kTable2Name(kKeyspaceName, "client-testtb2");
-const int32_t ClientTest::kNoBound = kint32max;
+
+namespace {
+
+TableFilter MakeFilter(int32_t lower_bound, int32_t upper_bound, std::string column = "key") {
+  if (lower_bound != kNoBound) {
+    if (upper_bound != kNoBound) {
+      return FilterBetween(lower_bound, Inclusive::kTrue, upper_bound, Inclusive::kTrue,
+                           std::move(column));
+    } else {
+      return FilterGreater(lower_bound, Inclusive::kTrue, std::move(column));
+    }
+  }
+  if (upper_bound != kNoBound) {
+    return FilterLess(upper_bound, Inclusive::kTrue, std::move(column));
+  }
+  return TableFilter();
+}
+
+int CountRowsFromClient(const TableHandle& table, YBConsistencyLevel consistency,
+                        int32_t lower_bound, int32_t upper_bound) {
+  TableIteratorOptions options;
+  options.consistency = consistency;
+  options.columns = std::vector<std::string>{"key"};
+  options.filter = MakeFilter(lower_bound, upper_bound);
+  return boost::size(TableRange(table, options));
+}
+
+int CountRowsFromClient(const TableHandle& table, int32_t lower_bound, int32_t upper_bound) {
+  return CountRowsFromClient(table, YBConsistencyLevel::STRONG, lower_bound, upper_bound);
+}
+
+int CountRowsFromClient(const TableHandle& table) {
+  return CountRowsFromClient(table, kNoBound, kNoBound);
+}
+
+// Count the rows of a table, checking that the operation succeeds.
+//
+// Must be public to use as a thread closure.
+void CheckRowCount(const TableHandle& table) {
+  CountRowsFromClient(table);
+}
+
+} // namespace
 
 TEST_F(ClientTest, TestListTables) {
   vector<YBTableName> tables;
@@ -506,7 +479,7 @@ TEST_F(ClientTest, TestListTables) {
   std::sort(tables.begin(), tables.end(), [](const YBTableName& n1, const YBTableName& n2) {
     return n1.ToString() < n2.ToString();
   });
-  ASSERT_EQ(2 + cluster_->leader_mini_master()->NumSystemTables(), tables.size());
+  ASSERT_EQ(2 + master::kNumSystemTables, tables.size());
   ASSERT_EQ(kTableName, tables[0]) << "Tables:" << ToString(tables);
   ASSERT_EQ(kTable2Name, tables[1]) << "Tables:" << ToString(tables);
   tables.clear();
@@ -518,18 +491,27 @@ TEST_F(ClientTest, TestListTables) {
 TEST_F(ClientTest, TestListTabletServers) {
   std::vector<std::unique_ptr<YBTabletServer>> tss;
   ASSERT_OK(client_->ListTabletServers(&tss));
-  ASSERT_EQ(1, tss.size());
-  ASSERT_EQ(cluster_->mini_tablet_server(0)->server()->instance_pb().permanent_uuid(),
-            tss[0]->uuid());
-  ASSERT_EQ(cluster_->mini_tablet_server(0)->server()->first_rpc_address().address().to_string(),
-            tss[0]->hostname());
+  ASSERT_EQ(3, tss.size());
+  set<string> actual_ts_uuids;
+  set<string> actual_ts_hostnames;
+  set<string> expected_ts_uuids;
+  set<string> expected_ts_hostnames;
+  for (int i = 0; i < tss.size(); ++i) {
+    auto server = cluster_->mini_tablet_server(i)->server();
+    expected_ts_uuids.insert(server->instance_pb().permanent_uuid());
+    actual_ts_uuids.insert(tss[i]->uuid());
+    expected_ts_hostnames.insert(server->options().broadcast_addresses[0].host());
+    actual_ts_hostnames.insert(tss[i]->hostname());
+  }
+  ASSERT_EQ(expected_ts_uuids, actual_ts_uuids);
+  ASSERT_EQ(expected_ts_hostnames, actual_ts_hostnames);
 }
 
 TEST_F(ClientTest, TestBadTable) {
   shared_ptr<YBTable> t;
   Status s = client_->OpenTable(YBTableName(kKeyspaceName, "xxx-does-not-exist"), &t);
   ASSERT_TRUE(s.IsNotFound());
-  ASSERT_STR_CONTAINS(s.ToString(false), "Not found: The table does not exist");
+  ASSERT_STR_CONTAINS(s.ToString(false), "Not found: The object does not exist");
 }
 
 // Test that, if the master is down, we experience a network error talking
@@ -540,14 +522,14 @@ TEST_F(ClientTest, TestMasterDown) {
   shared_ptr<YBTable> t;
   client_->data_->default_admin_operation_timeout_ = MonoDelta::FromSeconds(1);
   Status s = client_->OpenTable(YBTableName(kKeyspaceName, "other-tablet"), &t);
-  ASSERT_TRUE(s.IsNetworkError());
+  ASSERT_TRUE(s.IsTimedOut());
 }
 
+// TODO scan with predicates is not supported.
 TEST_F(ClientTest, TestScan) {
-  ASSERT_NO_FATALS(InsertTestRows(
-      client_table_.get(), FLAGS_test_scan_num_rows));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, FLAGS_test_scan_num_rows));
 
-  ASSERT_EQ(FLAGS_test_scan_num_rows, CountRowsFromClient(client_table_.get()));
+  ASSERT_EQ(FLAGS_test_scan_num_rows, CountRowsFromClient(client_table_));
 
   // Scan after insert
   DoTestScanWithoutPredicates();
@@ -555,526 +537,159 @@ TEST_F(ClientTest, TestScan) {
   DoTestScanWithKeyPredicate();
 
   // Scan after update
-  UpdateTestRows(client_table_.get(), 0, FLAGS_test_scan_num_rows);
+  UpdateTestRows(client_table_, 0, FLAGS_test_scan_num_rows);
   DoTestScanWithKeyPredicate();
 
   // Scan after delete half
-  DeleteTestRows(client_table_.get(), 0, FLAGS_test_scan_num_rows / 2);
+  DeleteTestRows(client_table_, 0, FLAGS_test_scan_num_rows / 2);
   DoTestScanWithKeyPredicate();
 
   // Scan after delete all
-  DeleteTestRows(client_table_.get(), FLAGS_test_scan_num_rows / 2 + 1,
-                 FLAGS_test_scan_num_rows);
+  DeleteTestRows(client_table_, FLAGS_test_scan_num_rows / 2 + 1, FLAGS_test_scan_num_rows);
   DoTestScanWithKeyPredicate();
 
   // Scan after re-insert
-  InsertTestRows(client_table_.get(), 1);
+  InsertTestRows(client_table_, 1);
   DoTestScanWithKeyPredicate();
 }
 
-TEST_F(ClientTest, TestScanAtSnapshot) {
-  int half_the_rows = FLAGS_test_scan_num_rows / 2;
-
-  // Insert half the rows
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         half_the_rows));
-
-  // get the time from the server and transform to micros disregarding any
-  // logical values (we shouldn't have any with a single server anyway);
-  int64_t ts = server::HybridClock::GetPhysicalValueMicros(
-      cluster_->mini_tablet_server(0)->server()->clock()->Now());
-
-  // Insert the second half of the rows
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         half_the_rows, half_the_rows));
-
-  YBScanner scanner(client_table_.get());
-  ASSERT_OK(scanner.Open());
-  uint64_t count = 0;
-
-  // Do a "normal", READ_LATEST scan
-  YBScanBatch batch;
-  while (scanner.HasMoreRows()) {
-    ASSERT_OK(scanner.NextBatch(&batch));
-    count += batch.NumRows();
+void CheckCounts(const TableHandle& table, const std::vector<int>& expected) {
+  std::vector<std::pair<int, int>> bounds = {
+    { kNoBound, kNoBound },
+    { kNoBound, 15 },
+    { 27, kNoBound },
+    { 0, 15 },
+    { 0, 10 },
+    { 0, 20 },
+    { 0, 30 },
+    { 14, 30 },
+    { 30, 30 },
+    { 50, kNoBound },
+  };
+  ASSERT_EQ(bounds.size(), expected.size());
+  for (size_t i = 0; i != bounds.size(); ++i) {
+    ASSERT_EQ(expected[i], CountRowsFromClient(table, bounds[i].first, bounds[i].second));
   }
-
-  ASSERT_EQ(FLAGS_test_scan_num_rows, count);
-
-  // Now close the scanner and perform a scan at 'ts'
-  scanner.Close();
-  ASSERT_OK(scanner.SetReadMode(YBScanner::READ_AT_SNAPSHOT));
-  ASSERT_OK(scanner.SetSnapshotMicros(ts));
-  ASSERT_OK(scanner.Open());
-
-  count = 0;
-  while (scanner.HasMoreRows()) {
-    ASSERT_OK(scanner.NextBatch(&batch));
-    count += batch.NumRows();
-  }
-
-  ASSERT_EQ(half_the_rows, count);
-}
-
-// Test scanning at a hybrid_time in the future compared to the
-// local clock. If we are within the clock error, this should wait.
-// If we are far in the future, we should get an error.
-TEST_F(ClientTest, TestScanAtFutureHybridTime) {
-  YBScanner scanner(client_table_.get());
-  ASSERT_OK(scanner.SetReadMode(YBScanner::READ_AT_SNAPSHOT));
-
-  // Try to perform a scan at NowLatest(). This is in the future,
-  // but the server should wait until it's in the past.
-  int64_t ts = server::HybridClock::GetPhysicalValueMicros(
-      cluster_->mini_tablet_server(0)->server()->clock()->NowLatest());
-  ASSERT_OK(scanner.SetSnapshotMicros(ts));
-  ASSERT_OK(scanner.Open());
-  scanner.Close();
-
-  // Try to perform a scan far in the future (60s -- higher than max clock error).
-  // This should return an error.
-  ts += 60 * 1000000;
-  ASSERT_OK(scanner.SetSnapshotMicros(ts));
-  Status s = scanner.Open();
-  EXPECT_TRUE(s.IsInvalidArgument()) << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "in the future.");
+  // Run through various scans.
 }
 
 TEST_F(ClientTest, TestScanMultiTablet) {
   // 5 tablets, each with 10 rows worth of space.
-  gscoped_ptr<YBPartialRow> row(schema_.NewRow());
-  vector<const YBPartialRow*> rows;
-  for (int i = 1; i < 5; i++) {
-    YBPartialRow* row = schema_.NewRow();
-    CHECK_OK(row->SetInt32(0, i * 10));
-    rows.push_back(row);
-  }
-  gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
-  shared_ptr<YBTable> table;
-  ASSERT_NO_FATALS(CreateTable(YBTableName("TestScanMultiTablet"), 1, rows, &table));
+  TableHandle table;
+  ASSERT_NO_FATALS(CreateTable(YBTableName("TestScanMultiTablet"), 5, &table));
 
   // Insert rows with keys 12, 13, 15, 17, 22, 23, 25, 27...47 into each
   // tablet, except the first which is empty.
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(5000);
+    auto session = CreateSession();
   for (int i = 1; i < 5; i++) {
-    shared_ptr<KuduInsert> insert;
-    insert = BuildTestRow(table.get(), 2 + (i * 10));
-    ASSERT_OK(session->Apply(insert));
-    insert = BuildTestRow(table.get(), 3 + (i * 10));
-    ASSERT_OK(session->Apply(insert));
-    insert = BuildTestRow(table.get(), 5 + (i * 10));
-    ASSERT_OK(session->Apply(insert));
-    insert = BuildTestRow(table.get(), 7 + (i * 10));
-    ASSERT_OK(session->Apply(insert));
+    ASSERT_OK(session->Apply(BuildTestRow(table, 2 + (i * 10))));
+    ASSERT_OK(session->Apply(BuildTestRow(table, 3 + (i * 10))));
+    ASSERT_OK(session->Apply(BuildTestRow(table, 5 + (i * 10))));
+    ASSERT_OK(session->Apply(BuildTestRow(table, 7 + (i * 10))));
   }
   FlushSessionOrDie(session);
 
   // Run through various scans.
-  ASSERT_EQ(16, CountRowsFromClient(table.get(), kNoBound, kNoBound));
-  ASSERT_EQ(3, CountRowsFromClient(table.get(), kNoBound, 15));
-  ASSERT_EQ(9, CountRowsFromClient(table.get(), 27, kNoBound));
-  ASSERT_EQ(3, CountRowsFromClient(table.get(), 0, 15));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 10));
-  ASSERT_EQ(4, CountRowsFromClient(table.get(), 0, 20));
-  ASSERT_EQ(8, CountRowsFromClient(table.get(), 0, 30));
-  ASSERT_EQ(6, CountRowsFromClient(table.get(), 14, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 50, kNoBound));
+  CheckCounts(table, { 16, 3, 9, 3, 0, 4, 8, 6, 0, 0 });
 
   // Update every other row
   for (int i = 1; i < 5; ++i) {
-    shared_ptr<KuduUpdate> update;
-    update = UpdateTestRow(table.get(), 2 + i * 10);
-    ASSERT_OK(session->Apply(update));
-    update = UpdateTestRow(table.get(), 5 + i * 10);
-    ASSERT_OK(session->Apply(update));
+    ASSERT_OK(session->Apply(UpdateTestRow(table, 2 + i * 10)));
+    ASSERT_OK(session->Apply(UpdateTestRow(table, 5 + i * 10)));
   }
   FlushSessionOrDie(session);
 
   // Check all counts the same (make sure updates don't change # of rows)
-  ASSERT_EQ(16, CountRowsFromClient(table.get(), kNoBound, kNoBound));
-  ASSERT_EQ(3, CountRowsFromClient(table.get(), kNoBound, 15));
-  ASSERT_EQ(9, CountRowsFromClient(table.get(), 27, kNoBound));
-  ASSERT_EQ(3, CountRowsFromClient(table.get(), 0, 15));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 10));
-  ASSERT_EQ(4, CountRowsFromClient(table.get(), 0, 20));
-  ASSERT_EQ(8, CountRowsFromClient(table.get(), 0, 30));
-  ASSERT_EQ(6, CountRowsFromClient(table.get(), 14, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 50, kNoBound));
+  CheckCounts(table, { 16, 3, 9, 3, 0, 4, 8, 6, 0, 0 });
 
   // Delete half the rows
   for (int i = 1; i < 5; ++i) {
-    shared_ptr<KuduDelete> del;
-    del = DeleteTestRow(table.get(), 5 + i*10);
-    ASSERT_OK(session->Apply(del));
-    del = DeleteTestRow(table.get(), 7 + i*10);
-    ASSERT_OK(session->Apply(del));
+    ASSERT_OK(session->Apply(DeleteTestRow(table, 5 + i*10)));
+    ASSERT_OK(session->Apply(DeleteTestRow(table, 7 + i*10)));
   }
   FlushSessionOrDie(session);
 
   // Check counts changed accordingly
-  ASSERT_EQ(8, CountRowsFromClient(table.get(), kNoBound, kNoBound));
-  ASSERT_EQ(2, CountRowsFromClient(table.get(), kNoBound, 15));
-  ASSERT_EQ(4, CountRowsFromClient(table.get(), 27, kNoBound));
-  ASSERT_EQ(2, CountRowsFromClient(table.get(), 0, 15));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 10));
-  ASSERT_EQ(2, CountRowsFromClient(table.get(), 0, 20));
-  ASSERT_EQ(4, CountRowsFromClient(table.get(), 0, 30));
-  ASSERT_EQ(2, CountRowsFromClient(table.get(), 14, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 50, kNoBound));
+  CheckCounts(table, { 8, 2, 4, 2, 0, 2, 4, 2, 0, 0 });
 
   // Delete rest of rows
   for (int i = 1; i < 5; ++i) {
-    shared_ptr<KuduDelete> del;
-    del = DeleteTestRow(table.get(), 2 + i*10);
-    ASSERT_OK(session->Apply(del));
-    del = DeleteTestRow(table.get(), 3 + i*10);
-    ASSERT_OK(session->Apply(del));
+    ASSERT_OK(session->Apply(DeleteTestRow(table, 2 + i*10)));
+    ASSERT_OK(session->Apply(DeleteTestRow(table, 3 + i*10)));
   }
   FlushSessionOrDie(session);
 
   // Check counts changed accordingly
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), kNoBound, kNoBound));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), kNoBound, 15));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 27, kNoBound));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 15));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 10));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 20));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 0, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 14, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 30, 30));
-  ASSERT_EQ(0, CountRowsFromClient(table.get(), 50, kNoBound));
+  CheckCounts(table, { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
 }
 
 TEST_F(ClientTest, TestScanEmptyTable) {
-  YBScanner scanner(client_table_.get());
-  ASSERT_OK(scanner.SetProjectedColumns(vector<string>()));
-  ASSERT_OK(scanner.Open());
-
-  // There are two tablets in the table, both empty. Until we scan to
-  // the last tablet, HasMoreRows will return true (because it doesn't
-  // know whether there's data in subsequent tablets).
-  ASSERT_TRUE(scanner.HasMoreRows());
-  YBScanBatch batch;
-  ASSERT_OK(scanner.NextBatch(&batch));
-  ASSERT_EQ(0, batch.NumRows());
-  ASSERT_FALSE(scanner.HasMoreRows());
+  TableIteratorOptions options;
+  options.columns = std::vector<std::string>();
+  ASSERT_EQ(boost::size(TableRange(client_table_, options)), 0);
 }
 
 // Test scanning with an empty projection. This should yield an empty
 // row block with the proper number of rows filled in. Impala issues
 // scans like this in order to implement COUNT(*).
 TEST_F(ClientTest, TestScanEmptyProjection) {
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         FLAGS_test_scan_num_rows));
-  YBScanner scanner(client_table_.get());
-  ASSERT_OK(scanner.SetProjectedColumns(vector<string>()));
-  ASSERT_EQ(scanner.GetProjectionSchema().num_columns(), 0);
-  LOG_TIMING(INFO, "Scanning with no projected columns") {
-    ASSERT_OK(scanner.Open());
-
-    ASSERT_TRUE(scanner.HasMoreRows());
-    YBScanBatch batch;
-    uint64_t count = 0;
-    while (scanner.HasMoreRows()) {
-      ASSERT_OK(scanner.NextBatch(&batch));
-      count += batch.NumRows();
-    }
-    ASSERT_EQ(FLAGS_test_scan_num_rows, count);
-  }
-}
-
-TEST_F(ClientTest, TestProjectInvalidColumn) {
-  YBScanner scanner(client_table_.get());
-  Status s = scanner.SetProjectedColumns({ "column-doesnt-exist" });
-  ASSERT_EQ("Not found: Column: \"column-doesnt-exist\" was not found in the table schema.",
-            s.ToString(/* no file/line */ false));
-
-  // Test trying to use a projection where a column is used multiple times.
-  // TODO: consider fixing this to support returning the column multiple
-  // times, even though it's not very useful.
-  s = scanner.SetProjectedColumns({ "key", "key" });
-  ASSERT_EQ("Invalid argument: Duplicate column name: key", s.ToString(/* no file/line */ false));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, FLAGS_test_scan_num_rows));
+  TableIteratorOptions options;
+  options.columns = std::vector<std::string>();
+  ASSERT_EQ(boost::size(TableRange(client_table_, options)), FLAGS_test_scan_num_rows);
 }
 
 // Test a scan where we have a predicate on a key column that is not
 // in the projection.
 TEST_F(ClientTest, TestScanPredicateKeyColNotProjected) {
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         FLAGS_test_scan_num_rows));
-  YBScanner scanner(client_table_.get());
-  ASSERT_OK(scanner.SetProjectedColumns({ "int_val" }));
-  ASSERT_EQ(scanner.GetProjectionSchema().num_columns(), 1);
-  ASSERT_EQ(scanner.GetProjectionSchema().Column(0).type(), QLType::Create(INT32));
-  ASSERT_OK(scanner.AddConjunctPredicate(
-                client_table_->NewComparisonPredicate("key", YBPredicate::GREATER_EQUAL,
-                                                      YBValue::FromInt(5))));
-  ASSERT_OK(scanner.AddConjunctPredicate(
-                client_table_->NewComparisonPredicate("key", YBPredicate::LESS_EQUAL,
-                                                      YBValue::FromInt(10))));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, FLAGS_test_scan_num_rows));
 
   size_t nrows = 0;
-  int32_t curr_key = 5;
-  LOG_TIMING(INFO, "Scanning with predicate columns not projected") {
-    ASSERT_OK(scanner.Open());
+  TableIteratorOptions options;
+  options.columns = std::vector<std::string>{"key", "int_val"};
+  options.filter = MakeFilter(5, 10);
+  for (const auto& row : TableRange(client_table_, options)) {
+    int32_t key = row.column(0).int32_value();
+    int32_t val = row.column(1).int32_value();
+    ASSERT_EQ(key * 2, val);
 
-    ASSERT_TRUE(scanner.HasMoreRows());
-    YBScanBatch batch;
-    while (scanner.HasMoreRows()) {
-      ASSERT_OK(scanner.NextBatch(&batch));
-      for (const YBScanBatch::RowPtr& row : batch) {
-        int32_t val;
-        ASSERT_OK(row.GetInt32(0, &val));
-        ASSERT_EQ(curr_key * 2, val);
-        nrows++;
-        curr_key++;
-      }
-    }
+    ++nrows;
   }
-  ASSERT_EQ(nrows, 6);
+
+  ASSERT_EQ(6, nrows);
 }
 
 // Test a scan where we have a predicate on a non-key column that is
 // not in the projection.
 TEST_F(ClientTest, TestScanPredicateNonKeyColNotProjected) {
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         FLAGS_test_scan_num_rows));
-  YBScanner scanner(client_table_.get());
-  ASSERT_OK(scanner.AddConjunctPredicate(
-                client_table_->NewComparisonPredicate("int_val", YBPredicate::GREATER_EQUAL,
-                                                      YBValue::FromInt(10))));
-  ASSERT_OK(scanner.AddConjunctPredicate(
-                client_table_->NewComparisonPredicate("int_val", YBPredicate::LESS_EQUAL,
-                                                      YBValue::FromInt(20))));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, FLAGS_test_scan_num_rows));
 
   size_t nrows = 0;
-  int32_t curr_key = 10;
+  TableIteratorOptions options;
+  options.columns = std::vector<std::string>{"key", "int_val"};
+  options.filter = MakeFilter(10, 20, "int_val");
+  TableRange range(client_table_, options);
+  for (const auto& row : range) {
+    int32_t key = row.column(0).int32_value();
+    int32_t val = row.column(1).int32_value();
+    ASSERT_EQ(key * 2, val);
 
-  ASSERT_OK(scanner.SetProjectedColumns({ "key" }));
-
-  LOG_TIMING(INFO, "Scanning with predicate columns not projected") {
-    ASSERT_OK(scanner.Open());
-
-    ASSERT_TRUE(scanner.HasMoreRows());
-    YBScanBatch batch;
-    while (scanner.HasMoreRows()) {
-      ASSERT_OK(scanner.NextBatch(&batch));
-      for (const YBScanBatch::RowPtr& row : batch) {
-        int32_t val;
-        ASSERT_OK(row.GetInt32(0, &val));
-        ASSERT_EQ(curr_key / 2, val);
-        nrows++;
-        curr_key += 2;
-      }
-    }
+    ++nrows;
   }
+
   ASSERT_EQ(nrows, 6);
 }
 
-// Test adding various sorts of invalid binary predicates.
-TEST_F(ClientTest, TestInvalidPredicates) {
-  YBScanner scanner(client_table_.get());
-
-  // Predicate on a column that does not exist.
-  Status s = scanner.AddConjunctPredicate(
-      client_table_->NewComparisonPredicate("this-does-not-exist",
-                                            YBPredicate::EQUAL, YBValue::FromInt(5)));
-  EXPECT_EQ("Not found: column not found: this-does-not-exist",
-            s.ToString(/* no file/line */ false));
-
-  // Int predicate on a string column.
-  s = scanner.AddConjunctPredicate(
-      client_table_->NewComparisonPredicate("string_val",
-                                            YBPredicate::EQUAL, YBValue::FromInt(5)));
-  EXPECT_EQ("Invalid argument: non-string value for string column string_val",
-            s.ToString(false));
-
-  // String predicate on an int column.
-  s = scanner.AddConjunctPredicate(
-      client_table_->NewComparisonPredicate("int_val",
-                                            YBPredicate::EQUAL, YBValue::CopyString("x")));
-  EXPECT_EQ("Invalid argument: non-int value for int column int_val",
-            s.ToString(false));
-
-  // Out-of-range int predicate on an int column.
-  s = scanner.AddConjunctPredicate(
-      client_table_->NewComparisonPredicate(
-          "int_val",
-          YBPredicate::EQUAL,
-          YBValue::FromInt(static_cast<int64_t>(MathLimits<int32_t>::kMax) + 10)));
-  EXPECT_EQ("Invalid argument: value 2147483657 out of range for "
-            "32-bit signed integer column 'int_val'", s.ToString(false));
-}
-
-
-// Check that the tserver proxy is reset on close, even for empty tables.
-TEST_F(ClientTest, TestScanCloseProxy) {
-  const YBTableName kEmptyTable("TestScanCloseProxy");
-  shared_ptr<YBTable> table;
-  ASSERT_NO_FATALS(CreateTable(kEmptyTable, 3, GenerateSplitRows(), &table));
-
-  {
-    // Open and close an empty scanner.
-    YBScanner scanner(table.get());
-    ASSERT_OK(scanner.Open());
-    scanner.Close();
-    CHECK_EQ(0, scanner.data_->proxy_.use_count()) << "Proxy was not reset!";
-  }
-
-  // Insert some test rows.
-  ASSERT_NO_FATALS(InsertTestRows(table.get(),
-                                         FLAGS_test_scan_num_rows));
-  {
-    // Open and close a scanner with rows.
-    YBScanner scanner(table.get());
-    ASSERT_OK(scanner.Open());
-    scanner.Close();
-    CHECK_EQ(0, scanner.data_->proxy_.use_count()) << "Proxy was not reset!";
-  }
-}
-
-namespace internal {
-
-static void ReadBatchToStrings(YBScanner* scanner, vector<string>* rows) {
-  YBScanBatch batch;
-  ASSERT_OK(scanner->NextBatch(&batch));
-  for (int i = 0; i < batch.NumRows(); i++) {
-    rows->push_back(batch.Row(i).ToString());
-  }
-}
-
-static void DoScanWithCallback(
-    YBTable* table, const vector<string>& expected_rows,
-    const std::function<Status(const string&)>& cb) {
-  // Initialize fault-tolerant snapshot scanner.
-  YBScanner scanner(table);
-  ASSERT_OK(scanner.SetFaultTolerant());
-  // Set a small batch size so it reads in multiple batches.
-  ASSERT_OK(scanner.SetBatchSizeBytes(1));
-
-  ASSERT_OK(scanner.Open());
-  vector<string> rows;
-
-  // Do a first scan to get us started.
-  {
-    LOG(INFO) << "Setting up scanner.";
-    ASSERT_TRUE(scanner.HasMoreRows());
-    ASSERT_NO_FATALS(ReadBatchToStrings(&scanner, &rows));
-    ASSERT_GT(rows.size(), 0);
-    ASSERT_TRUE(scanner.HasMoreRows());
-  }
-
-  // Call the callback on the tserver serving the scan.
-  LOG(INFO) << "Calling callback.";
-  {
-    YBTabletServer* kts_ptr;
-    ASSERT_OK(scanner.GetCurrentServer(&kts_ptr));
-    gscoped_ptr<YBTabletServer> kts(kts_ptr);
-    ASSERT_OK(cb(kts->uuid()));
-  }
-
-  // Check that we can still read the next batch.
-  LOG(INFO) << "Checking that we can still read the next batch.";
-  ASSERT_TRUE(scanner.HasMoreRows());
-  ASSERT_OK(scanner.SetBatchSizeBytes(1024*1024));
-  while (scanner.HasMoreRows()) {
-    ASSERT_NO_FATALS(ReadBatchToStrings(&scanner, &rows));
-  }
-  scanner.Close();
-
-  // Verify results from the scan.
-  LOG(INFO) << "Verifying results from scan.";
-  for (int i = 0; i < rows.size(); i++) {
-    EXPECT_EQ(expected_rows[i], rows[i]);
-  }
-  ASSERT_EQ(expected_rows.size(), rows.size());
-}
-
-}  // namespace internal
-
-// Test that ordered snapshot scans can be resumed in the case of different tablet server failures.
-TEST_F(ClientTest, TestScanFaultTolerance) {
-  // Create test table and insert test rows.
-  const YBTableName kScanTable("TestScanFaultTolerance");
-  shared_ptr<YBTable> table;
-  ASSERT_NO_FATALS(CreateTable(kScanTable, 3, vector<const YBPartialRow*>(), &table));
-  ASSERT_NO_FATALS(InsertTestRows(table.get(), FLAGS_test_scan_num_rows));
-
-  // Do an initial scan to determine the expected rows for later verification.
-  vector<string> expected_rows;
-  ScanTableToStrings(table.get(), &expected_rows);
-
-  for (int with_flush = 0; with_flush <= 1; with_flush++) {
-    SCOPED_TRACE((with_flush == 1) ? "with flush" : "without flush");
-    // The second time through, flush to ensure that we test both against MRS and
-    // disk.
-    if (with_flush) {
-      string tablet_id = GetFirstTabletId(table.get());
-      for (int i = 0; i < 3; i++) {
-        scoped_refptr<TabletPeer> tablet_peer;
-        ASSERT_TRUE(cluster_->mini_tablet_server(i)->server()->tablet_manager()->LookupTablet(
-                tablet_id, &tablet_peer));
-        ASSERT_OK(tablet_peer->tablet()->Flush(tablet::FlushMode::kSync));
-      }
-    }
-
-    // Test a few different recoverable server-side error conditions.
-    // Since these are recoverable, the scan will succeed when retried elsewhere.
-
-    // Restarting and waiting should result in a SCANNER_EXPIRED error.
-    LOG(INFO) << "Doing a scan while restarting a tserver and waiting for it to come up...";
-    ASSERT_NO_FATALS(internal::DoScanWithCallback(
-        table.get(), expected_rows,
-        std::bind(&ClientTest_TestScanFaultTolerance_Test::RestartTServerAndWait, this, _1)));
-
-    // Restarting and not waiting means the tserver is hopefully bootstrapping, leading to
-    // a TABLET_NOT_RUNNING error.
-    LOG(INFO) << "Doing a scan while restarting a tserver...";
-    ASSERT_NO_FATALS(internal::DoScanWithCallback(
-        table.get(), expected_rows,
-        std::bind(&ClientTest_TestScanFaultTolerance_Test::RestartTServerAsync, this, _1)));
-    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-      MiniTabletServer* ts = cluster_->mini_tablet_server(i);
-      ASSERT_OK(ts->WaitStarted());
-    }
-
-    // Killing the tserver should lead to an RPC timeout.
-    LOG(INFO) << "Doing a scan while killing a tserver...";
-    ASSERT_NO_FATALS(internal::DoScanWithCallback(
-        table.get(), expected_rows,
-        std::bind(&ClientTest_TestScanFaultTolerance_Test::KillTServer, this, _1)));
-
-    // Restart the server that we killed.
-    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-      MiniTabletServer* ts = cluster_->mini_tablet_server(i);
-      if (!ts->is_started()) {
-        ASSERT_OK(ts->Start());
-        ASSERT_OK(ts->WaitStarted());
-      }
-    }
-  }
-}
-
 TEST_F(ClientTest, TestGetTabletServerBlacklist) {
-  shared_ptr<YBTable> table;
-  ASSERT_NO_FATALS(CreateTable(YBTableName("blacklist"),
-                               3,
-                               GenerateSplitRows(),
-                               &table));
-  InsertTestRows(table.get(), 1, 0);
+  TableHandle table;
+  ASSERT_NO_FATALS(CreateTable(YBTableName("blacklist"), kNumTablets, &table));
+  InsertTestRows(table, 1, 0);
 
   // Look up the tablet and its replicas into the metadata cache.
   // We have to loop since some replicas may have been created slowly.
   scoped_refptr<internal::RemoteTablet> rt;
   while (true) {
-    Synchronizer sync;
-    client_->data_->meta_cache_->LookupTabletByKey(table.get(), "", MonoTime::Max(), &rt,
-                                                  sync.AsStatusCallback());
-    ASSERT_OK(sync.Wait());
+    rt = ASSERT_RESULT(LookupFirstTabletFuture(table.get()).get());
     ASSERT_TRUE(rt.get() != nullptr);
     vector<internal::RemoteTabletServer*> tservers;
     rt->GetRemoteTabletServers(&tservers);
@@ -1139,29 +754,22 @@ TEST_F(ClientTest, TestGetTabletServerBlacklist) {
 }
 
 TEST_F(ClientTest, TestScanWithEncodedRangePredicate) {
-  shared_ptr<YBTable> table;
+  TableHandle table;
   ASSERT_NO_FATALS(CreateTable(YBTableName("split-table"),
-                               1, /* replicas */
-                               GenerateSplitRows(),
+                               kNumTablets,
                                &table));
 
-  ASSERT_NO_FATALS(InsertTestRows(table.get(), 100));
+  ASSERT_NO_FATALS(InsertTestRows(table, 100));
 
-  vector<string> all_rows;
-  ASSERT_NO_FATALS(ScanTableToStrings(table.get(), &all_rows));
+  TableRange all_range(table, {});
+  auto all_rows = ScanToStrings(all_range);
   ASSERT_EQ(100, all_rows.size());
-
-  gscoped_ptr<YBPartialRow> row(table->schema().NewRow());
 
   // Test a double-sided range within first tablet
   {
-    YBScanner scanner(table.get());
-    CHECK_OK(row->SetInt32(0, 5));
-    ASSERT_OK(scanner.AddLowerBound(*row));
-    CHECK_OK(row->SetInt32(0, 8));
-    ASSERT_OK(scanner.AddExclusiveUpperBound(*row));
-    vector<string> rows;
-    ASSERT_NO_FATALS(ScanToStrings(&scanner, &rows));
+    TableIteratorOptions options;
+    options.filter = FilterBetween(5, Inclusive::kTrue, 8, Inclusive::kFalse);
+    auto rows = ScanToStrings(TableRange(table, options));
     ASSERT_EQ(8 - 5, rows.size());
     EXPECT_EQ(all_rows[5], rows.front());
     EXPECT_EQ(all_rows[7], rows.back());
@@ -1169,13 +777,9 @@ TEST_F(ClientTest, TestScanWithEncodedRangePredicate) {
 
   // Test a double-sided range spanning tablets
   {
-    YBScanner scanner(table.get());
-    CHECK_OK(row->SetInt32(0, 5));
-    ASSERT_OK(scanner.AddLowerBound(*row));
-    CHECK_OK(row->SetInt32(0, 15));
-    ASSERT_OK(scanner.AddExclusiveUpperBound(*row));
-    vector<string> rows;
-    ASSERT_NO_FATALS(ScanToStrings(&scanner, &rows));
+    TableIteratorOptions options;
+    options.filter = FilterBetween(5, Inclusive::kTrue, 15, Inclusive::kFalse);
+    auto rows = ScanToStrings(TableRange(table, options));
     ASSERT_EQ(15 - 5, rows.size());
     EXPECT_EQ(all_rows[5], rows.front());
     EXPECT_EQ(all_rows[14], rows.back());
@@ -1183,13 +787,9 @@ TEST_F(ClientTest, TestScanWithEncodedRangePredicate) {
 
   // Test a double-sided range within second tablet
   {
-    YBScanner scanner(table.get());
-    CHECK_OK(row->SetInt32(0, 15));
-    ASSERT_OK(scanner.AddLowerBound(*row));
-    CHECK_OK(row->SetInt32(0, 20));
-    ASSERT_OK(scanner.AddExclusiveUpperBound(*row));
-    vector<string> rows;
-    ASSERT_NO_FATALS(ScanToStrings(&scanner, &rows));
+    TableIteratorOptions options;
+    options.filter = FilterBetween(15, Inclusive::kTrue, 20, Inclusive::kFalse);
+    auto rows = ScanToStrings(TableRange(table, options));
     ASSERT_EQ(20 - 15, rows.size());
     EXPECT_EQ(all_rows[15], rows.front());
     EXPECT_EQ(all_rows[19], rows.back());
@@ -1197,11 +797,9 @@ TEST_F(ClientTest, TestScanWithEncodedRangePredicate) {
 
   // Test a lower-bound only range.
   {
-    YBScanner scanner(table.get());
-    CHECK_OK(row->SetInt32(0, 5));
-    ASSERT_OK(scanner.AddLowerBound(*row));
-    vector<string> rows;
-    ASSERT_NO_FATALS(ScanToStrings(&scanner, &rows));
+    TableIteratorOptions options;
+    options.filter = FilterGreater(5, Inclusive::kTrue);
+    auto rows = ScanToStrings(TableRange(table, options));
     ASSERT_EQ(95, rows.size());
     EXPECT_EQ(all_rows[5], rows.front());
     EXPECT_EQ(all_rows[99], rows.back());
@@ -1209,11 +807,9 @@ TEST_F(ClientTest, TestScanWithEncodedRangePredicate) {
 
   // Test an upper-bound only range in first tablet.
   {
-    YBScanner scanner(table.get());
-    CHECK_OK(row->SetInt32(0, 5));
-    ASSERT_OK(scanner.AddExclusiveUpperBound(*row));
-    vector<string> rows;
-    ASSERT_NO_FATALS(ScanToStrings(&scanner, &rows));
+    TableIteratorOptions options;
+    options.filter = FilterLess(5, Inclusive::kFalse);
+    auto rows = ScanToStrings(TableRange(table, options));
     ASSERT_EQ(5, rows.size());
     EXPECT_EQ(all_rows[0], rows.front());
     EXPECT_EQ(all_rows[4], rows.back());
@@ -1221,213 +817,14 @@ TEST_F(ClientTest, TestScanWithEncodedRangePredicate) {
 
   // Test an upper-bound only range in second tablet.
   {
-    YBScanner scanner(table.get());
-    CHECK_OK(row->SetInt32(0, 15));
-    ASSERT_OK(scanner.AddExclusiveUpperBound(*row));
-    vector<string> rows;
-    ASSERT_NO_FATALS(ScanToStrings(&scanner, &rows));
+    TableIteratorOptions options;
+    options.filter = FilterLess(15, Inclusive::kFalse);
+    auto rows = ScanToStrings(TableRange(table, options));
     ASSERT_EQ(15, rows.size());
     EXPECT_EQ(all_rows[0], rows.front());
     EXPECT_EQ(all_rows[14], rows.back());
   }
 
-}
-
-static void AssertScannersDisappear(const tserver::ScannerManager* manager) {
-  // The Close call is async, so we may have to loop a bit until we see it disappear.
-  // This loops for ~10sec. Typically it succeeds in only a few milliseconds.
-  int i = 0;
-  for (i = 0; i < 500; i++) {
-    if (manager->CountActiveScanners() == 0) {
-      LOG(INFO) << "Successfully saw scanner close on iteration " << i;
-      return;
-    }
-    // Sleep 2ms on first few times through, then longer on later iterations.
-    SleepFor(MonoDelta::FromMilliseconds(i < 10 ? 2 : 20));
-  }
-  FAIL() << "Waited too long for the scanner to close";
-}
-
-namespace {
-
-int64_t SumResults(const YBScanBatch& batch) {
-  int64_t sum = 0;
-  for (const YBScanBatch::RowPtr& row : batch) {
-    int32_t val;
-    CHECK_OK(row.GetInt32(0, &val));
-    sum += val;
-  }
-  return sum;
-}
-
-} // anonymous namespace
-
-TEST_F(ClientTest, TestScannerKeepAlive) {
-  google::FlagSaver saver;
-
-#ifndef __APPLE__
-  std::chrono::milliseconds kScannerTtl = 100ms;
-#else
-  // MAC OS X could just don't notify waiting socket that there is some data recieved for 100+ ms.
-  std::chrono::milliseconds kScannerTtl = 400ms;
-#endif
-
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), 1000));
-  // Set the scanner ttl really low
-  ANNOTATE_BENIGN_RACE(&FLAGS_scanner_ttl_ms, "Set at runtime, for tests.");
-  FLAGS_scanner_ttl_ms = kScannerTtl.count();
-
-  // Start a scan but don't get the whole data back
-  YBScanner scanner(client_table_.get());
-  // This will make sure we have to do multiple NextBatch calls to the second tablet.
-  ASSERT_OK(scanner.SetBatchSizeBytes(100));
-  ASSERT_OK(scanner.Open());
-
-  YBScanBatch batch;
-  int64_t sum = 0;
-
-  ASSERT_TRUE(scanner.HasMoreRows());
-  ASSERT_OK(scanner.NextBatch(&batch));
-
-  // We should get only 3 rows back (from the first tablet).
-  ASSERT_EQ(batch.NumRows(), 3);
-  sum += SumResults(batch);
-
-  ASSERT_TRUE(scanner.HasMoreRows());
-
-  // We're in between tablets but even if there isn't a live scanner the client should
-  // still return OK to the keep alive call.
-  ASSERT_OK(scanner.KeepAlive());
-
-  // Start scanning the second tablet, but break as soon as we have some data so that
-  // we have a live remote scanner on the second tablet.
-  while (scanner.HasMoreRows()) {
-    ASSERT_OK(scanner.NextBatch(&batch));
-    if (batch.NumRows() > 0) break;
-  }
-  sum += SumResults(batch);
-  ASSERT_TRUE(scanner.HasMoreRows());
-
-  // Now loop while keeping the scanner alive. Each time we loop we sleep 1/2 a scanner
-  // ttl interval (the garbage collector is running each 50 msecs too.).
-  for (int i = 0; i < 5; i++) {
-    std::this_thread::sleep_for(kScannerTtl / 2);
-    ASSERT_OK(scanner.KeepAlive());
-  }
-
-  // Get a second batch before sleeping/keeping alive some more. This is test for a bug
-  // where we would only actually perform a KeepAlive() rpc after the first request and
-  // not on subsequent ones.
-  while (scanner.HasMoreRows()) {
-    ASSERT_OK(scanner.NextBatch(&batch));
-    if (batch.NumRows() > 0) break;
-  }
-
-  ASSERT_TRUE(scanner.HasMoreRows());
-  for (int i = 0; i < 5; i++) {
-    std::this_thread::sleep_for(kScannerTtl / 2);
-    ASSERT_OK(scanner.KeepAlive());
-  }
-  sum += SumResults(batch);
-
-  // Loop to get the remaining rows.
-  while (scanner.HasMoreRows()) {
-    ASSERT_OK(scanner.NextBatch(&batch));
-    sum += SumResults(batch);
-  }
-  ASSERT_FALSE(scanner.HasMoreRows());
-  ASSERT_EQ(sum, 499500);
-}
-
-// Test cleanup of scanners on the server side when closed.
-TEST_F(ClientTest, TestCloseScanner) {
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), 10));
-
-  const tserver::ScannerManager* manager =
-    cluster_->mini_tablet_server(0)->server()->scanner_manager();
-  // Open the scanner, make sure it gets closed right away
-  {
-    SCOPED_TRACE("Implicit close");
-    YBScanner scanner(client_table_.get());
-    ASSERT_OK(scanner.Open());
-    ASSERT_EQ(0, manager->CountActiveScanners());
-    scanner.Close();
-    AssertScannersDisappear(manager);
-  }
-
-  // Open the scanner, make sure we see 1 registered scanner.
-  {
-    SCOPED_TRACE("Explicit close");
-    YBScanner scanner(client_table_.get());
-    ASSERT_OK(scanner.SetBatchSizeBytes(0)); // won't return data on open
-    ASSERT_OK(scanner.Open());
-    ASSERT_EQ(1, manager->CountActiveScanners());
-    scanner.Close();
-    AssertScannersDisappear(manager);
-  }
-
-  {
-    SCOPED_TRACE("Close when out of scope");
-    {
-      YBScanner scanner(client_table_.get());
-      ASSERT_OK(scanner.SetBatchSizeBytes(0));
-      ASSERT_OK(scanner.Open());
-      ASSERT_EQ(1, manager->CountActiveScanners());
-    }
-    // Above scanner went out of scope, so the destructor should close asynchronously.
-    AssertScannersDisappear(manager);
-  }
-}
-
-TEST_F(ClientTest, TestScanTimeout) {
-  // If we set the RPC timeout to be 0, we'll time out in the GetTableLocations
-  // code path and not even discover where the tablet is hosted.
-  {
-    client_->data_->default_rpc_timeout_ = MonoDelta::FromSeconds(0);
-    YBScanner scanner(client_table_.get());
-    Status s = scanner.Open();
-    EXPECT_TRUE(s.IsTimedOut()) << s.ToString();
-    EXPECT_FALSE(scanner.data_->remote_) << "should not have located any tablet";
-    client_->data_->default_rpc_timeout_ = MonoDelta::FromSeconds(5);
-  }
-
-  // Warm the cache so that the subsequent timeout occurs within the scan,
-  // not the lookup.
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), 1));
-
-  // The "overall operation" timed out; no replicas failed.
-  {
-    YBScanner scanner(client_table_.get());
-    ASSERT_OK(scanner.SetTimeoutMillis(0));
-    ASSERT_TRUE(scanner.Open().IsTimedOut());
-    YB_ASSERT_TRUE(scanner.data_->remote_) << "We should have located a tablet";;
-    ASSERT_EQ(0, scanner.data_->remote_->GetNumFailedReplicas());
-  }
-
-  // Insert some more rows so that the scan takes multiple batches, instead of
-  // fetching all the data on the 'Open()' call.
-  client_->data_->default_rpc_timeout_ = MonoDelta::FromSeconds(5);
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), 1000, 1));
-  {
-    google::FlagSaver saver;
-    FLAGS_scanner_max_batch_size_bytes = 100;
-    YBScanner scanner(client_table_.get());
-
-    // Set the single-RPC timeout low. Since we only have a single replica of this
-    // table, we'll ignore this timeout for the actual scan calls, and use the
-    // scanner timeout instead.
-    FLAGS_scanner_inject_latency_on_each_batch_ms = 50;
-    client_->data_->default_rpc_timeout_ = MonoDelta::FromMilliseconds(1);
-    ASSERT_OK(scanner.SetTimeoutMillis(5000));
-
-    // Should successfully scan.
-    ASSERT_OK(scanner.Open());
-    ASSERT_TRUE(scanner.HasMoreRows());
-    while (scanner.HasMoreRows()) {
-      YBScanBatch batch;
-      ASSERT_OK(scanner.NextBatch(&batch));
-    }
-  }
 }
 
 static std::unique_ptr<YBError> GetSingleErrorFromSession(YBSession* session) {
@@ -1440,136 +837,127 @@ static std::unique_ptr<YBError> GetSingleErrorFromSession(YBSession* session) {
 
 // Simplest case of inserting through the client API: a single row
 // with manual batching.
-TEST_F(ClientTest, TestInsertSingleRowManualBatch) {
-  shared_ptr<YBSession> session = client_->NewSession();
+// TODO Actually we need to check that hash columns present during insert. But it is not done yet.
+TEST_F(ClientTest, DISABLED_TestInsertSingleRowManualBatch) {
+  auto session = CreateSession();
   ASSERT_FALSE(session->HasPendingOperations());
 
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-
-  shared_ptr<KuduInsert> insert(client_table_->NewInsert());
+  auto insert = client_table_.NewInsertOp();
   // Try inserting without specifying a key: should fail.
-  ASSERT_OK(insert->mutable_row()->SetInt32("int_val", 54321));
-  ASSERT_OK(insert->mutable_row()->SetStringCopy("string_val", "hello world"));
-  Status s = session->Apply(insert);
-  ASSERT_EQ("Illegal state: Key not specified: "
-            "INSERT int32 int_val=54321, string string_val=hello world",
-            s.ToString(false));  // No file or line number.
-
-  // Get error
-  ASSERT_EQ(session->CountPendingErrors(), 1) << "Should report bad key to error container";
-  auto error = GetSingleErrorFromSession(session.get());
+  client_table_.AddInt32ColumnValue(insert->mutable_request(), "int_val", 54321);
+  client_table_.AddStringColumnValue(insert->mutable_request(), "string_val", "hello world");
+  ASSERT_OK(session->ApplyAndFlush(insert));
+  ASSERT_EQ(QLResponsePB::YQL_STATUS_RUNTIME_ERROR, insert->response().status());
 
   // Retry
-  ASSERT_OK(insert->mutable_row()->SetInt32("key", 12345));
+  QLAddInt32HashValue(insert->mutable_request(), 12345);
   ASSERT_OK(session->Apply(insert));
   ASSERT_TRUE(session->HasPendingOperations()) << "Should be pending until we Flush";
 
-  FlushSessionOrDie(session);
+  FlushSessionOrDie(session, { insert });
 }
 
-static Status ApplyInsertToSession(YBSession* session,
-                                   const shared_ptr<YBTable>& table,
-                                   int row_key,
-                                   int int_val,
-                                   const char* string_val) {
-  shared_ptr<KuduInsert> insert(table->NewInsert());
-  RETURN_NOT_OK(insert->mutable_row()->SetInt32("key", row_key));
-  RETURN_NOT_OK(insert->mutable_row()->SetInt32("int_val", int_val));
-  RETURN_NOT_OK(insert->mutable_row()->SetStringCopy("string_val", string_val));
+namespace {
+
+CHECKED_STATUS ApplyInsertToSession(YBSession* session,
+                                    const TableHandle& table,
+                                    int row_key,
+                                    int int_val,
+                                    const char* string_val,
+                                    std::shared_ptr<YBqlOp>* op = nullptr) {
+  auto insert = table.NewInsertOp();
+  QLAddInt32HashValue(insert->mutable_request(), row_key);
+  table.AddInt32ColumnValue(insert->mutable_request(), "int_val", int_val);
+  table.AddStringColumnValue(insert->mutable_request(), "string_val", string_val);
+  if (op) {
+    *op = insert;
+  }
   return session->Apply(insert);
 }
 
-static Status ApplyUpdateToSession(YBSession* session,
-                                   const shared_ptr<YBTable>& table,
-                                   int row_key,
-                                   int int_val) {
-  shared_ptr<KuduUpdate> update(table->NewUpdate());
-  RETURN_NOT_OK(update->mutable_row()->SetInt32("key", row_key));
-  RETURN_NOT_OK(update->mutable_row()->SetInt32("int_val", int_val));
+CHECKED_STATUS ApplyUpdateToSession(YBSession* session,
+                                    const TableHandle& table,
+                                    int row_key,
+                                    int int_val) {
+  auto update = table.NewUpdateOp();
+  QLAddInt32HashValue(update->mutable_request(), row_key);
+  table.AddInt32ColumnValue(update->mutable_request(), "int_val", int_val);
   return session->Apply(update);
 }
 
-static Status ApplyDeleteToSession(YBSession* session,
-                                   const shared_ptr<YBTable>& table,
-                                   int row_key) {
-  shared_ptr<KuduDelete> del(table->NewDelete());
-  RETURN_NOT_OK(del->mutable_row()->SetInt32("key", row_key));
+CHECKED_STATUS ApplyDeleteToSession(YBSession* session,
+                                    const TableHandle& table,
+                                    int row_key) {
+  auto del = table.NewDeleteOp();
+  QLAddInt32HashValue(del->mutable_request(), row_key);
   return session->Apply(del);
 }
 
-TEST_F(ClientTest, TestWriteTimeout) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+} // namespace
 
-  // First time out the lookup on the master side.
+TEST_F(ClientTest, TestWriteTimeout) {
+  auto session = CreateSession();
+
+  LOG(INFO) << "Time out the lookup on the master side";
   {
     google::FlagSaver saver;
     FLAGS_master_inject_latency_on_tablet_lookups_ms = 110;
-    session->SetTimeoutMillis(100);
+    session->SetTimeout(100ms);
     ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
     Status s = session->Flush();
     ASSERT_TRUE(s.IsIOError()) << "unexpected status: " << s.ToString();
     auto error = GetSingleErrorFromSession(session.get());
     ASSERT_TRUE(error->status().IsTimedOut()) << error->status().ToString();
     ASSERT_STR_CONTAINS(error->status().ToString(),
-        strings::Substitute("GetTableLocations($0, int32 key=1, 1) failed: "
+        strings::Substitute("GetTableLocations($0, hash_code: NaN, 1) failed: "
             "timed out after deadline expired", client_table_->name().ToString()));
   }
 
-  // Next time out the actual write on the tablet server.
+  LOG(INFO) << "Time out the actual write on the tablet server";
   {
     google::FlagSaver saver;
-    FLAGS_log_inject_latency = true;
-    FLAGS_log_inject_latency_ms_mean = 110;
-    FLAGS_log_inject_latency_ms_stddev = 0;
+    SetAtomicFlag(true, &FLAGS_log_inject_latency);
+    SetAtomicFlag(110, &FLAGS_log_inject_latency_ms_mean);
+    SetAtomicFlag(0, &FLAGS_log_inject_latency_ms_stddev);
 
     ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
     Status s = session->Flush();
-    ASSERT_TRUE(s.IsIOError());
+    ASSERT_TRUE(s.IsIOError()) << s;
     auto error = GetSingleErrorFromSession(session.get());
     ASSERT_TRUE(error->status().IsTimedOut()) << error->status().ToString();
-    ASSERT_STR_CONTAINS(error->status().ToString(), "Failed Write");
-    ASSERT_STR_CONTAINS(error->status().ToString(), "Write RPC to 127.0.0.1:");
-    ASSERT_STR_CONTAINS(error->status().ToString(), "after 1 attempt");
+    ASSERT_STR_CONTAINS(error->status().ToString(), "timed out");
   }
 }
 
 // Test which does an async flush and then drops the reference
 // to the Session. This should still call the callback.
 TEST_F(ClientTest, TestAsyncFlushResponseAfterSessionDropped) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
   Synchronizer s;
-  YBStatusMemberCallback<Synchronizer> cb(&s, &Synchronizer::StatusCB);
-  session->FlushAsync(&cb);
+  session->FlushAsync(s.AsStatusFunctor());
   session.reset();
   ASSERT_OK(s.Wait());
 
   // Try again, this time should not have an error response (to re-insert the same row).
   s.Reset();
-  session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  session = CreateSession();
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
   ASSERT_EQ(1, session->CountBufferedOperations());
-  session->FlushAsync(&cb);
+  session->FlushAsync(s.AsStatusFunctor());
   ASSERT_EQ(0, session->CountBufferedOperations());
   session.reset();
-  ASSERT_TRUE(s.Wait().ok());
+  ASSERT_OK(s.Wait());
 }
 
 TEST_F(ClientTest, TestSessionClose) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "row"));
   // Closing the session now should return Status::IllegalState since we
   // have a pending operation.
   ASSERT_TRUE(session->Close().IsIllegalState());
 
-  Synchronizer s;
-  YBStatusMemberCallback<Synchronizer> cb(&s, &Synchronizer::StatusCB);
-  session->FlushAsync(&cb);
-  ASSERT_OK(s.Wait());
+  ASSERT_OK(session->Flush());
 
   ASSERT_OK(session->Close());
 }
@@ -1577,8 +965,7 @@ TEST_F(ClientTest, TestSessionClose) {
 // Test which sends multiple batches through the same session, each of which
 // contains multiple rows spread across multiple tablets.
 TEST_F(ClientTest, TestMultipleMultiRowManualBatches) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
 
   const int kNumBatches = 5;
   const int kRowsPerBatch = 10;
@@ -1599,23 +986,19 @@ TEST_F(ClientTest, TestMultipleMultiRowManualBatches) {
   }
 
   const int kNumRowsPerTablet = kNumBatches * kRowsPerBatch / 2;
-  ASSERT_EQ(kNumRowsPerTablet, CountRowsFromClient(client_table_.get()));
-  ASSERT_EQ(kNumRowsPerTablet, CountRowsFromClient(client_table2_.get()));
+  ASSERT_EQ(kNumRowsPerTablet, CountRowsFromClient(client_table_));
+  ASSERT_EQ(kNumRowsPerTablet, CountRowsFromClient(client_table2_));
 
   // Verify the data looks right.
-  vector<string> rows;
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   std::sort(rows.begin(), rows.end());
   ASSERT_EQ(kNumRowsPerTablet, rows.size());
-  ASSERT_EQ("(int32 key=0, int32 int_val=0, string string_val=hello world, "
-            "int32 non_null_with_default=12345)"
-            , rows[0]);
+  ASSERT_EQ("{ int32:0, int32:0, string:\"hello world\", null }", rows[0]);
 }
 
 // Test a batch where one of the inserted rows succeeds and duplicates succeed too.
 TEST_F(ClientTest, TestBatchWithDuplicates) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
 
   // Insert a row with key "1"
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "original row"));
@@ -1629,28 +1012,23 @@ TEST_F(ClientTest, TestBatchWithDuplicates) {
   ASSERT_TRUE(s.ok());
 
   // Verify that the other row was successfully inserted
-  vector<string> rows;
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(2, rows.size());
   std::sort(rows.begin(), rows.end());
-  ASSERT_EQ("(int32 key=1, int32 int_val=1, string string_val=Attempted dup, "
-            "int32 non_null_with_default=12345)", rows[0]);
-  ASSERT_EQ("(int32 key=2, int32 int_val=1, string string_val=Should succeed, "
-            "int32 non_null_with_default=12345)", rows[1]);
+  ASSERT_EQ("{ int32:1, int32:1, string:\"Attempted dup\", null }", rows[0]);
+  ASSERT_EQ("{ int32:2, int32:1, string:\"Should succeed\", null }", rows[1]);
 }
 
 // Test flushing an empty batch (should be a no-op).
 TEST_F(ClientTest, TestEmptyBatch) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   FlushSessionOrDie(session);
 }
 
 void ClientTest::DoTestWriteWithDeadServer(WhichServerToKill which) {
   DontVerifyClusterBeforeNextTearDown();
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeoutMillis(1000);
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
+  session->SetTimeout(1s);
 
   // Shut down the server.
   switch (which) {
@@ -1658,7 +1036,9 @@ void ClientTest::DoTestWriteWithDeadServer(WhichServerToKill which) {
       cluster_->mini_master()->Shutdown();
       break;
     case DEAD_TSERVER:
-      cluster_->mini_tablet_server(0)->Shutdown();
+      for (int i = 0; i < cluster_->num_tablet_servers(); ++i) {
+        cluster_->mini_tablet_server(i)->Shutdown();
+      }
       break;
   }
 
@@ -1671,16 +1051,20 @@ void ClientTest::DoTestWriteWithDeadServer(WhichServerToKill which) {
   switch (which) {
     case DEAD_MASTER:
       // Only one master, so no retry for finding the new leader master.
-      ASSERT_TRUE(error->status().IsNetworkError());
+      ASSERT_TRUE(error->status().IsTimedOut());
+      ASSERT_STR_CONTAINS(error->status().ToString(false), "Network error");
       break;
     case DEAD_TSERVER:
       ASSERT_TRUE(error->status().IsTimedOut());
-      ASSERT_STR_CONTAINS(error->status().ToString(), "Connection refused");
+      auto pos = error->status().ToString().find("Connection refused");
+      if (pos == std::string::npos) {
+        pos = error->status().ToString().find("Broken pipe");
+      }
+      ASSERT_NE(std::string::npos, pos);
       break;
   }
 
-  ASSERT_EQ(error->failed_op().ToString(),
-            "INSERT int32 key=1, int32 int_val=1, string string_val=x");
+  ASSERT_STR_CONTAINS(error->failed_op().ToString(), "QL_WRITE");
 }
 
 // Test error handling cases where the master is down (tablet resolution fails)
@@ -1695,15 +1079,13 @@ TEST_F(ClientTest, TestWriteWithDeadTabletServer) {
 }
 
 void ClientTest::DoApplyWithoutFlushTest(int sleep_micros) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "x"));
   SleepFor(MonoDelta::FromMicroseconds(sleep_micros));
   session.reset(); // should not crash!
 
   // Should have no rows.
-  vector<string> rows;
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(0, rows.size());
 }
 
@@ -1728,14 +1110,13 @@ TEST_F(ClientTest, TestApplyToSessionWithoutFlushing_OpsBuffered) {
 // Apply a large amount of data without calling Flush(), and ensure
 // that we get an error on Apply() rather than sending a too-large
 // RPC to the server.
-TEST_F(ClientTest, TestApplyTooMuchWithoutFlushing) {
+TEST_F(ClientTest, DISABLED_TestApplyTooMuchWithoutFlushing) {
 
   // Applying a bunch of small rows without a flush should result
   // in an error.
   {
     bool got_expected_error = false;
-    shared_ptr<YBSession> session = client_->NewSession();
-    ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+    auto session = CreateSession();
     for (int i = 0; i < 1000000; i++) {
       Status s = ApplyInsertToSession(session.get(), client_table_, 1, 1, "x");
       if (s.IsIncomplete()) {
@@ -1761,115 +1142,79 @@ TEST_F(ClientTest, TestApplyTooMuchWithoutFlushing) {
 
 // Test that update updates and delete deletes with expected use
 TEST_F(ClientTest, TestMutationsWork) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "original row"));
   FlushSessionOrDie(session);
 
   ASSERT_OK(ApplyUpdateToSession(session.get(), client_table_, 1, 2));
   FlushSessionOrDie(session);
-  vector<string> rows;
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(1, rows.size());
-  ASSERT_EQ("(int32 key=1, int32 int_val=2, string string_val=original row, "
-            "int32 non_null_with_default=12345)", rows[0]);
+  ASSERT_EQ("{ int32:1, int32:2, string:\"original row\", null }", rows[0]);
   rows.clear();
 
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 1));
   FlushSessionOrDie(session);
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(0, rows.size());
 }
 
 TEST_F(ClientTest, TestMutateDeletedRow) {
-  vector<string> rows;
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, "original row"));
   FlushSessionOrDie(session);
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 1));
   FlushSessionOrDie(session);
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(0, rows.size());
 
   // Attempt update deleted row
   ASSERT_OK(ApplyUpdateToSession(session.get(), client_table_, 1, 2));
   Status s = session->Flush();
   ASSERT_TRUE(s.ok());
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(1, rows.size());
 
   // Attempt delete deleted row
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 1));
   s = session->Flush();
   ASSERT_TRUE(s.ok());
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(0, rows.size());
 }
 
 TEST_F(ClientTest, TestMutateNonexistentRow) {
-  vector<string> rows;
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
 
   // Attempt update nonexistent row
   ASSERT_OK(ApplyUpdateToSession(session.get(), client_table_, 1, 2));
   Status s = session->Flush();
   ASSERT_TRUE(s.ok());
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(1, rows.size());
 
   // Attempt delete nonexistent row
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 1));
   s = session->Flush();
   ASSERT_TRUE(s.ok());
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(0, rows.size());
-}
-
-TEST_F(ClientTest, TestWriteWithBadColumn) {
-  shared_ptr<YBTable> table;
-  ASSERT_OK(client_->OpenTable(kTableName, &table));
-
-  // Try to do a write with the bad schema.
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  gscoped_ptr<KuduInsert> insert(table->NewInsert());
-  ASSERT_OK(insert->mutable_row()->SetInt32("key", 12345));
-  Status s = insert->mutable_row()->SetInt32("bad_col", 12345);
-  ASSERT_TRUE(s.IsNotFound());
-  ASSERT_STR_CONTAINS(s.ToString(), "No such column: bad_col");
 }
 
 // Do a write with a bad schema on the client side. This should make the Prepare
 // phase of the write fail, which will result in an error on the RPC response.
 TEST_F(ClientTest, TestWriteWithBadSchema) {
-  shared_ptr<YBTable> table;
-  ASSERT_OK(client_->OpenTable(kTableName, &table));
-
   // Remove the 'int_val' column.
   // Now the schema on the client is "old"
   gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-  ASSERT_OK(table_alterer
-            ->DropColumn("int_val")
-            ->Alter());
+  ASSERT_OK(table_alterer->DropColumn("int_val")->Alter());
 
   // Try to do a write with the bad schema.
-  shared_ptr<YBSession> session = client_->NewSession();
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
-  ASSERT_OK(ApplyInsertToSession(session.get(), client_table_,
-                                        12345, 12345, "x"));
-  Status s = session->Flush();
-  ASSERT_FALSE(s.ok());
-
-  // Verify the specific error.
-  auto error = GetSingleErrorFromSession(session.get());
-  ASSERT_TRUE(error->status().IsInvalidArgument());
-  ASSERT_STR_CONTAINS(error->status().ToString(),
-            "Client provided column int_val[int32 NOT NULL] "
-            "not present in tablet");
-  ASSERT_EQ(error->failed_op().ToString(),
-            "INSERT int32 key=12345, int32 int_val=12345, string string_val=x");
+  auto session = CreateSession();
+  std::shared_ptr<YBqlOp> op;
+  ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 12345, 12345, "x", &op));
+  ASSERT_OK(session->Flush());
+  ASSERT_EQ(QLResponsePB::YQL_STATUS_SCHEMA_VERSION_MISMATCH, op->response().status());
 }
 
 TEST_F(ClientTest, TestBasicAlterOperations) {
@@ -1879,15 +1224,6 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     Status s = table_alterer->Alter();
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(), "No alter steps provided");
-  }
-
-  // test that adding a non-nullable column with no default value throws an error
-  {
-    gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AddColumn("key")->Type(INT32)->NotNull();
-    Status s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "column `key`: NOT NULL columns must have a default");
   }
 
   // test that remove key should throws an error
@@ -1911,7 +1247,7 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
 
   // Need a tablet peer for the next set of tests.
   string tablet_id = GetFirstTabletId(client_table_.get());
-  scoped_refptr<TabletPeer> tablet_peer;
+  std::shared_ptr<TabletPeer> tablet_peer;
   ASSERT_TRUE(cluster_->mini_tablet_server(0)->server()->tablet_manager()->LookupTablet(
       tablet_id, &tablet_peer));
 
@@ -1923,31 +1259,13 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     ASSERT_EQ(1, tablet_peer->tablet()->metadata()->schema_version());
   }
 
-  // test that specifying an encoding incompatible with the column's
-  // type throws an error
-  {
-    gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AddColumn("new_string_val")->Type(STRING)->Encoding(GROUP_VARINT);
-    Status s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsNotSupported());
-    ASSERT_STR_CONTAINS(s.ToString(), "Unsupported type/encoding pair");
-    ASSERT_EQ(1, tablet_peer->tablet()->metadata()->schema_version());
-  }
-
-  {
-    gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AddColumn("new_string_val")->Type(STRING)->Encoding(PREFIX_ENCODING);
-    ASSERT_OK(table_alterer->Alter());
-    ASSERT_EQ(2, tablet_peer->tablet()->metadata()->schema_version());
-  }
-
   {
     const YBTableName kRenamedTableName(kKeyspaceName, "RenamedTable");
     gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     ASSERT_OK(table_alterer
               ->RenameTo(kRenamedTableName)
               ->Alter());
-    ASSERT_EQ(3, tablet_peer->tablet()->metadata()->schema_version());
+    ASSERT_EQ(2, tablet_peer->tablet()->metadata()->schema_version());
     ASSERT_EQ(kRenamedTableName.table_name(), tablet_peer->tablet()->metadata()->table_name());
 
     vector<YBTableName> tables;
@@ -1959,12 +1277,11 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
 
 TEST_F(ClientTest, TestDeleteTable) {
   // Open the table before deleting it.
-  ASSERT_OK(client_->OpenTable(kTableName, &client_table_));
+  ASSERT_OK(client_table_.Open(kTableName, client_.get()));
 
   // Insert a few rows, and scan them back. This is to populate the MetaCache.
-  ASSERT_NO_FATALS(InsertTestRows(client_.get(), client_table_.get(), 10));
-  vector<string> rows;
-  ScanTableToStrings(client_table_.get(), &rows);
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, 10));
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(10, rows.size());
 
   // Remove the table
@@ -1979,7 +1296,7 @@ TEST_F(ClientTest, TestDeleteTable) {
   int wait_time = 1000;
   bool tablet_found = true;
   for (int i = 0; i < 80 && tablet_found; ++i) {
-    scoped_refptr<TabletPeer> tablet_peer;
+    std::shared_ptr<TabletPeer> tablet_peer;
     tablet_found = cluster_->mini_tablet_server(0)->server()->tablet_manager()->LookupTablet(
                       tablet_id, &tablet_peer);
     SleepFor(MonoDelta::FromMicroseconds(wait_time));
@@ -1988,16 +1305,16 @@ TEST_F(ClientTest, TestDeleteTable) {
   ASSERT_FALSE(tablet_found);
 
   // Try to open the deleted table
-  Status s = client_->OpenTable(kTableName, &client_table_);
+  Status s = client_table_.Open(kTableName, client_.get());
   ASSERT_TRUE(s.IsNotFound());
-  ASSERT_STR_CONTAINS(s.ToString(), "The table does not exist");
+  ASSERT_STR_CONTAINS(s.ToString(), "The object does not exist");
 
   // Create a new table with the same name. This is to ensure that the client
   // doesn't cache anything inappropriately by table name (see KUDU-1055).
-  ASSERT_NO_FATALS(CreateTable(kTableName, 1, GenerateSplitRows(), &client_table_));
+  ASSERT_NO_FATALS(CreateTable(kTableName, kNumTablets, &client_table_));
 
   // Should be able to insert successfully into the new table.
-  ASSERT_NO_FATALS(InsertTestRows(client_.get(), client_table_.get(), 10));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, 10));
 }
 
 TEST_F(ClientTest, TestGetTableSchema) {
@@ -2012,7 +1329,75 @@ TEST_F(ClientTest, TestGetTableSchema) {
   Status s = client_->GetTableSchema(YBTableName(kKeyspaceName, "MissingTableName"), &schema,
                                      &partition_schema);
   ASSERT_TRUE(s.IsNotFound());
-  ASSERT_STR_CONTAINS(s.ToString(), "The table does not exist");
+  ASSERT_STR_CONTAINS(s.ToString(), "The object does not exist");
+}
+
+TEST_F(ClientTest, TestGetTableSchemaByIdAsync) {
+  Synchronizer sync;
+  auto table_info = std::make_shared<YBTableInfo>();
+  ASSERT_OK(client_->GetTableSchemaById(
+      client_table_.table()->id(), table_info, sync.AsStatusCallback()));
+  ASSERT_OK(sync.Wait());
+  ASSERT_TRUE(schema_.Equals(table_info->schema));
+}
+
+TEST_F(ClientTest, TestGetTableSchemaByIdMissingTable) {
+  // Verify that a get schema request for a missing table throws not found.
+  Synchronizer sync;
+  auto table_info = std::make_shared<YBTableInfo>();
+  ASSERT_OK(client_->GetTableSchemaById("MissingTableId", table_info, sync.AsStatusCallback()));
+  Status s = sync.Wait();
+  ASSERT_TRUE(s.IsNotFound());
+  ASSERT_STR_CONTAINS(s.ToString(), "The object does not exist");
+}
+
+void CreateCDCStreamCallbackSuccess(Synchronizer* sync, const Result<CDCStreamId>& stream) {
+  ASSERT_TRUE(stream.ok());
+  ASSERT_FALSE(stream->empty());
+  sync->StatusCB(Status::OK());
+}
+
+void CreateCDCStreamCallbackFailure(Synchronizer* sync, const Result<CDCStreamId>& stream) {
+  ASSERT_FALSE(stream.ok());
+  sync->StatusCB(stream.status());
+}
+
+TEST_F(ClientTest, TestCreateCDCStreamAsync) {
+  Synchronizer sync;
+  std::unordered_map<std::string, std::string> options;
+  client_->CreateCDCStream(
+      client_table_.table()->id(), options, std::bind(&CreateCDCStreamCallbackSuccess, &sync,
+                                                      std::placeholders::_1));
+  ASSERT_OK(sync.Wait());
+}
+
+TEST_F(ClientTest, TestCreateCDCStreamMissingTable) {
+  Synchronizer sync;
+  std::unordered_map<std::string, std::string> options;
+  client_->CreateCDCStream(
+      "MissingTableId", options, std::bind(&CreateCDCStreamCallbackFailure, &sync,
+                                           std::placeholders::_1));
+  Status s = sync.Wait();
+  ASSERT_TRUE(s.IsNotFound());
+}
+
+TEST_F(ClientTest, TestDeleteCDCStreamAsync) {
+  std::unordered_map<std::string, std::string> options;
+  auto result = client_->CreateCDCStream(client_table_.table()->id(), options);
+  ASSERT_TRUE(result.ok());
+
+  // Delete the created CDC stream.
+  Synchronizer sync;
+  client_->DeleteCDCStream(*result, sync.AsStatusCallback());
+  ASSERT_OK(sync.Wait());
+}
+
+TEST_F(ClientTest, TestDeleteCDCStreamMissingId) {
+  // Try to delete a non-existent CDC stream.
+  Synchronizer sync;
+  client_->DeleteCDCStream("MissingStreamId", sync.AsStatusCallback());
+  Status s = sync.Wait();
+  ASSERT_TRUE(s.IsNotFound());
 }
 
 TEST_F(ClientTest, TestStaleLocations) {
@@ -2025,7 +1410,9 @@ TEST_F(ClientTest, TestStaleLocations) {
   ASSERT_FALSE(locs_pb.stale());
 
   // On Master restart and no tablet report we expect the locations to be stale
-  cluster_->mini_tablet_server(0)->Shutdown();
+  for (int i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    cluster_->mini_tablet_server(i)->Shutdown();
+  }
   ASSERT_OK(cluster_->mini_master()->Restart());
   ASSERT_OK(cluster_->mini_master()->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
   ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTabletLocations(
@@ -2033,8 +1420,10 @@ TEST_F(ClientTest, TestStaleLocations) {
   ASSERT_TRUE(locs_pb.stale());
 
   // Restart the TS and Wait for the tablets to be reported to the master.
-  ASSERT_OK(cluster_->mini_tablet_server(0)->Start());
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1));
+  for (int i = 0; i < cluster_->num_tablet_servers(); ++i) {
+    ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
+  }
+  ASSERT_OK(cluster_->WaitForTabletServerCount(cluster_->num_tablet_servers()));
   ASSERT_OK(cluster_->mini_master()->master()->catalog_manager()->GetTabletLocations(
                   tablet_id, &locs_pb));
 
@@ -2062,22 +1451,20 @@ TEST_F(ClientTest, TestStaleLocations) {
 TEST_F(ClientTest, TestReplicatedMultiTabletTable) {
   const YBTableName kReplicatedTable("replicated");
   const int kNumRowsToWrite = 100;
-  const int kNumReplicas = 3;
 
-  shared_ptr<YBTable> table;
+  TableHandle table;
   ASSERT_NO_FATALS(CreateTable(kReplicatedTable,
-                               kNumReplicas,
-                               GenerateSplitRows(),
+                               kNumTablets,
                                &table));
 
   // Should have no rows to begin with.
-  ASSERT_EQ(0, CountRowsFromClient(table.get()));
+  ASSERT_EQ(0, CountRowsFromClient(table));
 
   // Insert some data.
-  ASSERT_NO_FATALS(InsertTestRows(table.get(), kNumRowsToWrite));
+  ASSERT_NO_FATALS(InsertTestRows(table, kNumRowsToWrite));
 
   // Should now see the data.
-  ASSERT_EQ(kNumRowsToWrite, CountRowsFromClient(table.get()));
+  ASSERT_EQ(kNumRowsToWrite, CountRowsFromClient(table));
 
   // TODO: once leader re-election is in, should somehow force a re-election
   // and ensure that the client handles refreshing the leader.
@@ -2086,37 +1473,28 @@ TEST_F(ClientTest, TestReplicatedMultiTabletTable) {
 TEST_F(ClientTest, TestReplicatedMultiTabletTableFailover) {
   const YBTableName kReplicatedTable("replicated_failover_on_reads");
   const int kNumRowsToWrite = 100;
-  const int kNumReplicas = 3;
   const int kNumTries = 100;
 
-  shared_ptr<YBTable> table;
+  TableHandle table;
   ASSERT_NO_FATALS(CreateTable(kReplicatedTable,
-                               kNumReplicas,
-                               GenerateSplitRows(),
+                               kNumTablets,
                                &table));
 
   // Insert some data.
-  ASSERT_NO_FATALS(InsertTestRows(table.get(), kNumRowsToWrite));
+  ASSERT_NO_FATALS(InsertTestRows(table, kNumRowsToWrite));
 
   // Find the leader of the first tablet.
-  Synchronizer sync;
-  scoped_refptr<internal::RemoteTablet> rt;
-  client_->data_->meta_cache_->LookupTabletByKey(table.get(), "",
-                                                 MonoTime::Max(),
-                                                 &rt, sync.AsStatusCallback());
-  ASSERT_OK(sync.Wait());
-  internal::RemoteTabletServer *rts = rt->LeaderTServer();
+  auto remote_tablet = ASSERT_RESULT(LookupFirstTabletFuture(table.get()).get());
+  internal::RemoteTabletServer *remote_tablet_server = remote_tablet->LeaderTServer();
 
   // Kill the leader of the first tablet.
-  ASSERT_OK(KillTServer(rts->permanent_uuid()));
+  ASSERT_OK(KillTServer(remote_tablet_server->permanent_uuid()));
 
   // We wait until we fail over to the new leader(s).
   int tries = 0;
   for (;;) {
     tries++;
-    int num_rows = CountRowsFromClient(table.get(),
-                                       YBClient::LEADER_ONLY,
-                                       kNoBound, kNoBound);
+    int num_rows = CountRowsFromClient(table);
     if (num_rows == kNumRowsToWrite) {
       LOG(INFO) << "Found expected number of rows: " << num_rows;
       break;
@@ -2138,16 +1516,14 @@ TEST_F(ClientTest, TestReplicatedMultiTabletTableFailover) {
 TEST_F(ClientTest, TestReplicatedTabletWritesWithLeaderElection) {
   const YBTableName kReplicatedTable("replicated_failover_on_writes");
   const int kNumRowsToWrite = 100;
-  const int kNumReplicas = 3;
 
-  shared_ptr<YBTable> table;
+  TableHandle table;
   ASSERT_NO_FATALS(CreateTable(kReplicatedTable,
-                               kNumReplicas,
-                               vector<const YBPartialRow*>(),
+                               1,
                                &table));
 
   // Insert some data.
-  ASSERT_NO_FATALS(InsertTestRows(table.get(), kNumRowsToWrite));
+  ASSERT_NO_FATALS(InsertTestRows(table, kNumRowsToWrite));
 
   // TODO: we have to sleep here to make sure that the leader has time to
   // propagate the writes to the followers. We can remove this once the
@@ -2156,38 +1532,32 @@ TEST_F(ClientTest, TestReplicatedTabletWritesWithLeaderElection) {
   SleepFor(MonoDelta::FromMilliseconds(1500));
 
   // Find the leader replica
-  Synchronizer sync;
-  scoped_refptr<internal::RemoteTablet> rt;
-  client_->data_->meta_cache_->LookupTabletByKey(table.get(), "",
-                                                 MonoTime::Max(),
-                                                 &rt, sync.AsStatusCallback());
-  ASSERT_OK(sync.Wait());
-  internal::RemoteTabletServer *rts;
+  auto remote_tablet = ASSERT_RESULT(LookupFirstTabletFuture(table.get()).get());
+  internal::RemoteTabletServer *remote_tablet_server;
   set<string> blacklist;
   vector<internal::RemoteTabletServer*> candidates;
   ASSERT_OK(client_->data_->GetTabletServer(client_.get(),
-                                            rt,
+                                            remote_tablet,
                                             YBClient::LEADER_ONLY,
                                             blacklist,
                                             &candidates,
-                                            &rts));
+                                            &remote_tablet_server));
 
-  string killed_uuid = rts->permanent_uuid();
+  string killed_uuid = remote_tablet_server->permanent_uuid();
   // Kill the tserver that is serving the leader tablet.
   ASSERT_OK(KillTServer(killed_uuid));
 
   // Since we waited before, hopefully all replicas will be up to date
   // and we can just promote another replica.
-  rpc::MessengerBuilder bld("client");
-  auto client_messenger = bld.Build();
-  ASSERT_OK(client_messenger);
-  gscoped_ptr<consensus::ConsensusServiceProxy> new_leader_proxy;
-
+  auto client_messenger = rpc::CreateAutoShutdownMessengerHolder(
+      ASSERT_RESULT(CreateMessenger("client")));
   int new_leader_idx = -1;
   for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
     MiniTabletServer* ts = cluster_->mini_tablet_server(i);
+    LOG(INFO) << "GOT TS " << i << " WITH UUID ???";
     if (ts->is_started()) {
       const string& uuid = ts->server()->instance_pb().permanent_uuid();
+      LOG(INFO) << uuid;
       if (uuid != killed_uuid) {
         new_leader_idx = i;
         break;
@@ -2198,9 +1568,9 @@ TEST_F(ClientTest, TestReplicatedTabletWritesWithLeaderElection) {
 
   MiniTabletServer* new_leader = cluster_->mini_tablet_server(new_leader_idx);
   ASSERT_TRUE(new_leader != nullptr);
-  new_leader_proxy.reset(
-      new consensus::ConsensusServiceProxy(*client_messenger,
-                                           new_leader->bound_rpc_addr()));
+  rpc::ProxyCache proxy_cache(client_messenger.get());
+  consensus::ConsensusServiceProxy new_leader_proxy(
+      &proxy_cache, HostPort::FromBoundEndpoint(new_leader->bound_rpc_addr()));
 
   consensus::RunLeaderElectionRequestPB req;
   consensus::RunLeaderElectionResponsePB resp;
@@ -2209,15 +1579,14 @@ TEST_F(ClientTest, TestReplicatedTabletWritesWithLeaderElection) {
   LOG(INFO) << "Promoting server at index " << new_leader_idx << " listening at "
             << new_leader->bound_rpc_addr() << " ...";
   req.set_dest_uuid(new_leader->server()->fs_manager()->uuid());
-  req.set_tablet_id(rt->tablet_id());
-  ASSERT_OK(new_leader_proxy->RunLeaderElection(req, &resp, &controller));
+  req.set_tablet_id(remote_tablet->tablet_id());
+  ASSERT_OK(new_leader_proxy.RunLeaderElection(req, &resp, &controller));
   ASSERT_FALSE(resp.has_error()) << "Got error. Response: " << resp.ShortDebugString();
 
   LOG(INFO) << "Inserting additional rows...";
-  ASSERT_NO_FATALS(InsertTestRows(client_.get(),
-                                         table.get(),
-                                         kNumRowsToWrite,
-                                         kNumRowsToWrite));
+  ASSERT_NO_FATALS(InsertTestRows(table,
+                                  kNumRowsToWrite,
+                                  kNumRowsToWrite));
 
   // TODO: we have to sleep here to make sure that the leader has time to
   // propagate the writes to the followers. We can remove this once the
@@ -2226,52 +1595,36 @@ TEST_F(ClientTest, TestReplicatedTabletWritesWithLeaderElection) {
   SleepFor(MonoDelta::FromMilliseconds(1500));
 
   LOG(INFO) << "Counting rows...";
-  ASSERT_EQ(2 * kNumRowsToWrite, CountRowsFromClient(table.get(),
-                                                     YBClient::FIRST_REPLICA,
+  ASSERT_EQ(2 * kNumRowsToWrite, CountRowsFromClient(table,
+                                                     YBConsistencyLevel::CONSISTENT_PREFIX,
                                                      kNoBound, kNoBound));
 }
 
 namespace {
 
-void CheckCorrectness(YBScanner* scanner, int expected[], int nrows) {
-  ASSERT_OK(scanner->Open());
+void CheckCorrectness(const TableHandle& table, int expected[], int nrows) {
   int readrows = 0;
-  YBScanBatch batch;
-  if (nrows) {
-    ASSERT_TRUE(scanner->HasMoreRows());
-  } else {
-    ASSERT_FALSE(scanner->HasMoreRows());
-  }
 
-  while (scanner->HasMoreRows()) {
-    ASSERT_OK(scanner->NextBatch(&batch));
-    for (const YBScanBatch::RowPtr& r : batch) {
-      int32_t key;
-      int32_t val;
-      Slice strval;
-      ASSERT_OK(r.GetInt32(0, &key));
-      ASSERT_OK(r.GetInt32(1, &val));
-      ASSERT_OK(r.GetString(2, &strval));
-      ASSERT_NE(expected[key], -1) << "Deleted key found in table in table " << key;
-      ASSERT_EQ(expected[key], val) << "Incorrect int value for key " <<  key;
-      ASSERT_EQ(strval.size(), 0) << "Incorrect string value for key " << key;
-      ++readrows;
-    }
+  for (const auto& row : TableRange(table)) {
+    ASSERT_LE(readrows, nrows);
+    int32_t key = row.column(0).int32_value();
+    ASSERT_NE(key, -1) << "Deleted key found in table in table " << key;
+    ASSERT_EQ(expected[key], row.column(1).int32_value())
+        << "Incorrect int value for key " <<  key;
+    ASSERT_EQ(row.column(2).string_value(), "")
+        << "Incorrect string value for key " << key;
+    ++readrows;
   }
   ASSERT_EQ(readrows, nrows);
-  scanner->Close();
 }
 
 } // anonymous namespace
 
 // Randomized mutations accuracy testing
 TEST_F(ClientTest, TestRandomWriteOperation) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeoutMillis(5000);
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
   int row[FLAGS_test_scan_num_rows]; // -1 indicates empty
   int nrows;
-  YBScanner scanner(client_table_.get());
 
   // First half-fill
   for (int i = 0; i < FLAGS_test_scan_num_rows/2; ++i) {
@@ -2291,18 +1644,14 @@ TEST_F(ClientTest, TestRandomWriteOperation) {
     if (i % 50 == 0) {
       LOG(INFO) << "Correctness test " << i;
       FlushSessionOrDie(session);
-      ASSERT_NO_FATALS(CheckCorrectness(&scanner, row, nrows));
+      ASSERT_NO_FATALS(CheckCorrectness(client_table_, row, nrows));
       LOG(INFO) << "...complete";
     }
 
     int change = rand_r(&seed) % FLAGS_test_scan_num_rows;
     // Insert if empty
     if (row[change] == -1) {
-      ASSERT_OK(ApplyInsertToSession(session.get(),
-                                            client_table_,
-                                            change,
-                                            change,
-                                            ""));
+      ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, change, change, ""));
       row[change] = change;
       ++nrows;
       VLOG(1) << "Insert " << change;
@@ -2310,15 +1659,10 @@ TEST_F(ClientTest, TestRandomWriteOperation) {
       // Update or delete otherwise
       int update = rand_r(&seed) & 1;
       if (update) {
-        ASSERT_OK(ApplyUpdateToSession(session.get(),
-                                              client_table_,
-                                              change,
-                                              ++row[change]));
+        ASSERT_OK(ApplyUpdateToSession(session.get(), client_table_, change, ++row[change]));
         VLOG(1) << "Update " << change;
       } else {
-        ASSERT_OK(ApplyDeleteToSession(session.get(),
-                                              client_table_,
-                                              change));
+        ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, change));
         row[change] = -1;
         --nrows;
         VLOG(1) << "Delete " << change;
@@ -2328,25 +1672,21 @@ TEST_F(ClientTest, TestRandomWriteOperation) {
 
   // And one more time for the last batch.
   FlushSessionOrDie(session);
-  ASSERT_NO_FATALS(CheckCorrectness(&scanner, row, nrows));
+  ASSERT_NO_FATALS(CheckCorrectness(client_table_, row, nrows));
 }
 
 // Test whether a batch can handle several mutations in a batch
 TEST_F(ClientTest, TestSeveralRowMutatesPerBatch) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeoutMillis(5000);
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  auto session = CreateSession();
 
   // Test insert/update
   LOG(INFO) << "Testing insert/update in same batch, key " << 1 << ".";
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, ""));
   ASSERT_OK(ApplyUpdateToSession(session.get(), client_table_, 1, 2));
   FlushSessionOrDie(session);
-  vector<string> rows;
-  ScanTableToStrings(client_table_.get(), &rows);
+  auto rows = ScanTableToStrings(client_table_);
   ASSERT_EQ(1, rows.size());
-  ASSERT_EQ("(int32 key=1, int32 int_val=2, string string_val=, "
-            "int32 non_null_with_default=12345)", rows[0]);
+  ASSERT_EQ("{ int32:1, int32:2, string:\"\", null }", rows[0]);
   rows.clear();
 
 
@@ -2355,10 +1695,9 @@ TEST_F(ClientTest, TestSeveralRowMutatesPerBatch) {
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 2, 1, ""));
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 2));
   FlushSessionOrDie(session);
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(1, rows.size());
-  ASSERT_EQ("(int32 key=1, int32 int_val=2, string string_val=, "
-            "int32 non_null_with_default=12345)", rows[0]);
+  ASSERT_EQ("{ int32:1, int32:2, string:\"\", null }", rows[0]);
   rows.clear();
 
   // Test update/delete
@@ -2366,113 +1705,86 @@ TEST_F(ClientTest, TestSeveralRowMutatesPerBatch) {
   ASSERT_OK(ApplyUpdateToSession(session.get(), client_table_, 1, 1));
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 1));
   FlushSessionOrDie(session);
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(0, rows.size());
 
   // Test delete/insert (insert a row first)
   LOG(INFO) << "Inserting row for delete/insert test, key " << 1 << ".";
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 1, ""));
   FlushSessionOrDie(session);
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(1, rows.size());
-  ASSERT_EQ("(int32 key=1, int32 int_val=1, string string_val=, "
-            "int32 non_null_with_default=12345)", rows[0]);
+  ASSERT_EQ("{ int32:1, int32:1, string:\"\", null }", rows[0]);
   rows.clear();
   LOG(INFO) << "Testing delete/insert in same batch, key " << 1 << ".";
   ASSERT_OK(ApplyDeleteToSession(session.get(), client_table_, 1));
   ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, 1, 2, ""));
   FlushSessionOrDie(session);
-  ScanTableToStrings(client_table_.get(), &rows);
+  ScanTableToStrings(client_table_, &rows);
   ASSERT_EQ(1, rows.size());
-  ASSERT_EQ("(int32 key=1, int32 int_val=2, string string_val=, "
-            "int32 non_null_with_default=12345)", rows[0]);
-            rows.clear();
+  ASSERT_EQ("{ int32:1, int32:2, string:\"\", null }", rows[0]);
+  rows.clear();
 }
 
 // Tests that master permits are properly released after a whole bunch of
 // rows are inserted.
 TEST_F(ClientTest, TestMasterLookupPermits) {
   int initial_value = client_->data_->meta_cache_->master_lookup_sem_.GetValue();
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         FLAGS_test_scan_num_rows));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, FLAGS_test_scan_num_rows));
   ASSERT_EQ(initial_value,
             client_->data_->meta_cache_->master_lookup_sem_.GetValue());
 }
 
 // Define callback for deadlock simulation, as well as various helper methods.
 namespace {
-class DLSCallback : public YBStatusCallback {
- public:
-  explicit DLSCallback(Atomic32* i) : i(i) {
-  }
 
-  void Run(const Status& s) override {
+class DeadlockSimulationCallback {
+ public:
+  explicit DeadlockSimulationCallback(Atomic32* i) : i_(i) {}
+
+  void operator()(const Status& s) const {
     CHECK_OK(s);
-    NoBarrier_AtomicIncrement(i, 1);
-    delete this;
+    NoBarrier_AtomicIncrement(i_, 1);
   }
  private:
-  Atomic32* const i;
+  Atomic32* const i_;
 };
 
 // Returns col1 value of first row.
-int32_t ReadFirstRowKeyFirstCol(const shared_ptr<YBTable>& tbl) {
-  YBScanner scanner(tbl.get());
+int32_t ReadFirstRowKeyFirstCol(const TableHandle& tbl) {
+  TableRange range(tbl);
 
-  CHECK_OK(scanner.Open());
-  YBScanBatch batch;
-  CHECK(scanner.HasMoreRows());
-  CHECK_OK(scanner.NextBatch(&batch));
-  YBRowResult row = batch.Row(0);
-  int32_t val;
-  CHECK_OK(row.GetInt32(1, &val));
-  return val;
+  auto it = range.begin();
+  EXPECT_NE(it, range.end());
+  return it->column(1).int32_value();
 }
 
 // Checks that all rows have value equal to expected, return number of rows.
-int CheckRowsEqual(const shared_ptr<YBTable>& tbl, int32_t expected) {
-  YBScanner scanner(tbl.get());
-  CHECK_OK(scanner.Open());
-  YBScanBatch batch;
+int CheckRowsEqual(const TableHandle& tbl, int32_t expected) {
   int cnt = 0;
-  while (scanner.HasMoreRows()) {
-    CHECK_OK(scanner.NextBatch(&batch));
-    for (const YBScanBatch::RowPtr& row : batch) {
-      // Check that for every key:
-      // 1. Column 1 int32_t value == expected
-      // 2. Column 2 string value is empty
-      // 3. Column 3 int32_t value is default, 12345
-      int32_t key;
-      int32_t val;
-      Slice strval;
-      int32_t val2;
-      CHECK_OK(row.GetInt32(0, &key));
-      CHECK_OK(row.GetInt32(1, &val));
-      CHECK_OK(row.GetString(2, &strval));
-      CHECK_OK(row.GetInt32(3, &val2));
-      CHECK_EQ(expected, val) << "Incorrect int value for key " << key;
-      CHECK_EQ(strval.size(), 0) << "Incorrect string value for key " << key;
-      CHECK_EQ(12345, val2);
-      ++cnt;
-    }
+  for (const auto& row : TableRange(tbl)) {
+    EXPECT_EQ(row.column(1).int32_value(), expected);
+    EXPECT_EQ(row.column(2).string_value(), "");
+    EXPECT_EQ(row.column(3).int32_value(), 12345);
+    ++cnt;
   }
   return cnt;
 }
 
 // Return a session "loaded" with updates. Sets the session timeout
 // to the parameter value. Larger timeouts decrease false positives.
-shared_ptr<YBSession> LoadedSession(const shared_ptr<YBClient>& client,
-                                      const shared_ptr<YBTable>& tbl,
-                                      bool fwd, int max, int timeout) {
+shared_ptr<YBSession> LoadedSession(YBClient* client,
+                                    const TableHandle& tbl,
+                                    bool fwd, int max, MonoDelta timeout) {
   shared_ptr<YBSession> session = client->NewSession();
-  session->SetTimeoutMillis(timeout);
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  session->SetTimeout(timeout);
   for (int i = 0; i < max; ++i) {
     int key = fwd ? i : max - i;
     CHECK_OK(ApplyUpdateToSession(session.get(), tbl, key, fwd));
   }
   return session;
 }
+
 } // anonymous namespace
 
 // Starts many clients which update a table in parallel.
@@ -2487,27 +1799,24 @@ TEST_F(ClientTest, TestDeadlockSimulation) {
 
   // Make reverse client who will make batches that update rows
   // in reverse order. Separate client used so rpc calls come in at same time.
-  shared_ptr<YBClient> rev_client;
-  ASSERT_OK(YBClientBuilder()
-                   .add_master_server_addr(ToString(cluster_->mini_master()->bound_rpc_addr()))
-                   .Build(&rev_client));
-  shared_ptr<YBTable> rev_table;
-  ASSERT_OK(client_->OpenTable(kTableName, &rev_table));
+  auto rev_client = ASSERT_RESULT(YBClientBuilder()
+      .add_master_server_addr(ToString(cluster_->mini_master()->bound_rpc_addr()))
+      .Build());
+  TableHandle rev_table;
+  ASSERT_OK(rev_table.Open(kTableName, client_.get()));
 
   // Load up some rows
   const int kNumRows = 300;
-  const int kTimeoutMillis = 60000;
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeoutMillis(kTimeoutMillis);
-  ASSERT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+  const auto kTimeout = 60s;
+  auto session = CreateSession();
   for (int i = 0; i < kNumRows; ++i)
     ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, i, i,  ""));
   FlushSessionOrDie(session);
 
   // Check both clients see rows
-  int fwd = CountRowsFromClient(client_table_.get());
+  int fwd = CountRowsFromClient(client_table_);
   ASSERT_EQ(kNumRows, fwd);
-  int rev = CountRowsFromClient(rev_table.get());
+  int rev = CountRowsFromClient(rev_table);
   ASSERT_EQ(kNumRows, rev);
 
   // Generate sessions
@@ -2515,8 +1824,8 @@ TEST_F(ClientTest, TestDeadlockSimulation) {
   shared_ptr<YBSession> fwd_sessions[kNumSessions];
   shared_ptr<YBSession> rev_sessions[kNumSessions];
   for (int i = 0; i < kNumSessions; ++i) {
-    fwd_sessions[i] = LoadedSession(client_, client_table_, true, kNumRows, kTimeoutMillis);
-    rev_sessions[i] = LoadedSession(rev_client, rev_table, true, kNumRows, kTimeoutMillis);
+    fwd_sessions[i] = LoadedSession(client_.get(), client_table_, true, kNumRows, kTimeout);
+    rev_sessions[i] = LoadedSession(rev_client.get(), rev_table, true, kNumRows, kTimeout);
   }
 
   // Run async calls - one thread updates sequentially, another in reverse.
@@ -2525,8 +1834,8 @@ TEST_F(ClientTest, TestDeadlockSimulation) {
   NoBarrier_Store(&ctr2, 0);
   for (int i = 0; i < kNumSessions; ++i) {
     // The callbacks are freed after they are invoked.
-    fwd_sessions[i]->FlushAsync(new DLSCallback(&ctr1));
-    rev_sessions[i]->FlushAsync(new DLSCallback(&ctr2));
+    fwd_sessions[i]->FlushAsync(DeadlockSimulationCallback(&ctr1));
+    rev_sessions[i]->FlushAsync(DeadlockSimulationCallback(&ctr2));
   }
 
   // Spin while waiting for ops to complete.
@@ -2557,113 +1866,67 @@ TEST_F(ClientTest, TestCreateDuplicateTable) {
   gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_TRUE(table_creator->table_name(kTableName)
               .schema(&schema_)
-              .num_replicas(1)
               .Create().IsAlreadyPresent());
+}
+
+TEST_F(ClientTest, CreateTableWithoutTservers) {
+  DoTearDown();
+
+  YBMiniClusterTestBase::SetUp();
+
+  MiniClusterOptions options;
+  options.num_tablet_servers = 0;
+  // Start minicluster with only master (to simulate tserver not yet heartbeating).
+  cluster_.reset(new MiniCluster(env_.get(), options));
+  ASSERT_OK(cluster_->Start());
+
+  // Connect to the cluster.
+  client_ = ASSERT_RESULT(YBClientBuilder()
+      .add_master_server_addr(yb::ToString(cluster_->mini_master()->bound_rpc_addr()))
+      .Build());
+
+  gscoped_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
+  Status s = table_creator->table_name(YBTableName(kKeyspaceName, "foobar"))
+      .schema(&schema_)
+      .Create();
+  ASSERT_TRUE(s.IsInvalidArgument());
+  ASSERT_STR_CONTAINS(s.ToString(), "num_tablets should be greater than 0.");
 }
 
 TEST_F(ClientTest, TestCreateTableWithTooManyTablets) {
   FLAGS_max_create_tablets_per_ts = 1;
-
-  YBPartialRow* split1 = schema_.NewRow();
-  ASSERT_OK(split1->SetInt32("key", 1));
-
-  YBPartialRow* split2 = schema_.NewRow();
-  ASSERT_OK(split2->SetInt32("key", 2));
+  auto many_tablets = FLAGS_replication_factor + 1;
 
   gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   Status s = table_creator->table_name(YBTableName(kKeyspaceName, "foobar"))
       .schema(&schema_)
-      .split_rows({ split1, split2 })
-      .num_replicas(3)
+      .num_tablets(many_tablets)
       .Create();
   ASSERT_TRUE(s.IsInvalidArgument());
-  ASSERT_STR_CONTAINS(s.ToString(),
-                      "The requested number of tablets is over the permitted maximum (1)");
+  ASSERT_STR_CONTAINS(
+      s.ToString(),
+      strings::Substitute(
+          "The requested number of tablets ($0) is over the permitted maximum ($1)", many_tablets,
+          FLAGS_replication_factor));
 }
 
-TEST_F(ClientTest, TestCreateTableWithTooManyReplicas) {
-  YBPartialRow* split1 = schema_.NewRow();
-  ASSERT_OK(split1->SetInt32("key", 1));
-
-  YBPartialRow* split2 = schema_.NewRow();
-  ASSERT_OK(split2->SetInt32("key", 2));
-
+// TODO(bogdan): Disabled until ENG-2687
+TEST_F(ClientTest, DISABLED_TestCreateTableWithTooManyReplicas) {
   gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   Status s = table_creator->table_name(YBTableName(kKeyspaceName, "foobar"))
       .schema(&schema_)
-      .split_rows({ split1, split2 })
-      .num_replicas(3)
+      .num_tablets(2)
       .Create();
   ASSERT_TRUE(s.IsInvalidArgument());
   ASSERT_STR_CONTAINS(s.ToString(),
-                      "Not enough live tablet servers to create a table with the requested "
+                      "Not enough live tablet servers to create table with the requested "
                       "replication factor 3. 1 tablet servers are alive");
-}
-
-TEST_F(ClientTest, TestLatestObservedHybridTime) {
-  // Check that a write updates the latest observed hybrid_time.
-  uint64_t ht0 = client_->GetLatestObservedHybridTime();
-  ASSERT_EQ(ht0, YBClient::kNoHybridTime);
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), 1, 0));
-  uint64_t ht1 = client_->GetLatestObservedHybridTime();
-  ASSERT_NE(ht0, ht1);
-
-  // Check that the hybrid_time of the previous write will be observed by another
-  // client performing a snapshot scan at that hybrid_time.
-  shared_ptr<YBClient> client;
-  shared_ptr<YBTable> table;
-  ASSERT_OK(YBClientBuilder()
-      .add_master_server_addr(ToString(cluster_->mini_master()->bound_rpc_addr()))
-      .Build(&client));
-  ASSERT_EQ(client->GetLatestObservedHybridTime(), YBClient::kNoHybridTime);
-  ASSERT_OK(client->OpenTable(client_table_->name(), &table));
-  YBScanner scanner(table.get());
-  ASSERT_OK(scanner.SetReadMode(YBScanner::READ_AT_SNAPSHOT));
-  ASSERT_OK(scanner.SetSnapshotRaw(ht1));
-  ASSERT_OK(scanner.Open());
-  scanner.Close();
-  uint64_t ht2 = client->GetLatestObservedHybridTime();
-  ASSERT_EQ(ht1, ht2);
-}
-
-TEST_F(ClientTest, TestClonePredicates) {
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(),
-                                         2, 0));
-  gscoped_ptr<YBPredicate> predicate(client_table_->NewComparisonPredicate(
-      "key",
-      YBPredicate::EQUAL,
-      YBValue::FromInt(1)));
-
-  gscoped_ptr<YBScanner> scanner(new YBScanner(client_table_.get()));
-  ASSERT_OK(scanner->AddConjunctPredicate(predicate->Clone()));
-  ASSERT_OK(scanner->Open());
-
-  int count = 0;
-  YBScanBatch batch;
-  while (scanner->HasMoreRows()) {
-    ASSERT_OK(scanner->NextBatch(&batch));
-    count += batch.NumRows();
-  }
-
-  ASSERT_EQ(count, 1);
-
-  scanner.reset(new YBScanner(client_table_.get()));
-  ASSERT_OK(scanner->AddConjunctPredicate(predicate->Clone()));
-  ASSERT_OK(scanner->Open());
-
-  count = 0;
-  while (scanner->HasMoreRows()) {
-    ASSERT_OK(scanner->NextBatch(&batch));
-    count += batch.NumRows();
-  }
-
-  ASSERT_EQ(count, 1);
 }
 
 // Test that scanners will retry after receiving ERROR_SERVER_TOO_BUSY from an
 // overloaded tablet server. Regression test for KUDU-1079.
 TEST_F(ClientTest, TestServerTooBusyRetry) {
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), FLAGS_test_scan_num_rows));
+  ASSERT_NO_FATALS(InsertTestRows(client_table_, FLAGS_test_scan_num_rows));
 
   // Introduce latency in each scan to increase the likelihood of
   // ERROR_SERVER_TOO_BUSY.
@@ -2672,6 +1935,10 @@ TEST_F(ClientTest, TestServerTooBusyRetry) {
   // Reduce the service queue length of each tablet server in order to increase
   // the likelihood of ERROR_SERVER_TOO_BUSY.
   FLAGS_tablet_server_svc_queue_length = 1;
+  // Set the backoff limits to be small for this test, so that we finish in a reasonable
+  // amount of time.
+  FLAGS_min_backoff_ms_exponent = 0;
+  FLAGS_max_backoff_ms_exponent = 3;
   for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
     MiniTabletServer* ts = cluster_->mini_tablet_server(i);
     ASSERT_OK(ts->Restart());
@@ -2684,8 +1951,7 @@ TEST_F(ClientTest, TestServerTooBusyRetry) {
   while (!stop) {
     scoped_refptr<yb::Thread> thread;
     ASSERT_OK(yb::Thread::Create("test", strings::Substitute("t$0", t++),
-                                   &ClientTest::CheckRowCount, this, client_table_.get(),
-                                   &thread));
+                                 &CheckRowCount, std::cref(client_table_), &thread));
     threads.push_back(thread);
 
     for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
@@ -2700,45 +1966,12 @@ TEST_F(ClientTest, TestServerTooBusyRetry) {
   }
 }
 
-TEST_F(ClientTest, TestLastErrorEmbeddedInScanTimeoutStatus) {
-  // For the random() calls that take place during scan retries.
-  SeedRandom();
-
-  ASSERT_NO_FATALS(InsertTestRows(client_table_.get(), FLAGS_test_scan_num_rows));
-
-  {
-    // Revert the latency injection flags at the end so the test exits faster.
-    google::FlagSaver saver;
-
-    // Restart, but inject latency so that startup is very slow.
-    FLAGS_log_inject_latency = true;
-    FLAGS_log_inject_latency_ms_mean = 1000;
-    FLAGS_log_inject_latency_ms_stddev = 0;
-    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-      MiniTabletServer* ts = cluster_->mini_tablet_server(i);
-      ASSERT_OK(ts->Restart());
-    }
-
-    // As the tservers are still starting up, the scan will retry until it
-    // times out. The actual error should be embedded in the returned status.
-    YBScanner scan(client_table_.get());
-    ASSERT_OK(scan.SetTimeoutMillis(1000));
-    Status s = scan.Open();
-    SCOPED_TRACE(s.ToString());
-    ASSERT_TRUE(s.IsTimedOut());
-    auto message = s.ToString(false);
-    ASSERT_STR_CONTAINS(message, "Illegal state (");
-    ASSERT_STR_CONTAINS(message, "): Tablet not RUNNING");
-  }
-}
-
 TEST_F(ClientTest, TestReadFromFollower) {
   // Create table and write some rows.
   const YBTableName kReadFromFollowerTable("TestReadFromFollower");
-  shared_ptr<YBTable> table;
-  ASSERT_NO_FATALS(CreateTable(kReadFromFollowerTable, 3, vector<const YBPartialRow*>(), &table,
-                               YBTableType::YQL_TABLE_TYPE));
-  ASSERT_NO_FATALS(InsertTestRows(table.get(), FLAGS_test_scan_num_rows));
+  TableHandle table;
+  ASSERT_NO_FATALS(CreateTable(kReadFromFollowerTable, 1, &table));
+  ASSERT_NO_FATALS(InsertTestRows(table, FLAGS_test_scan_num_rows));
 
   // Find the followers.
   GetTableLocationsRequestPB req;
@@ -2757,18 +1990,15 @@ TEST_F(ClientTest, TestReadFromFollower) {
   }
   ASSERT_EQ(cluster_->num_tablet_servers() - 1, followers.size());
 
-  rpc::MessengerBuilder bld("client");
-  auto client_messenger = bld.Build();
-  ASSERT_OK(client_messenger);
+  auto client_messenger =
+      CreateAutoShutdownMessengerHolder(ASSERT_RESULT(CreateMessenger("client")));
+  rpc::ProxyCache proxy_cache(client_messenger.get());
   for (const master::TSInfoPB& ts_info : followers) {
     // Try to read from followers.
-    auto endpoint = ParseEndpoint(ts_info.rpc_addresses(0).host(),
-                                  ts_info.rpc_addresses(0).port());
-    ASSERT_TRUE(endpoint.ok());
     auto tserver_proxy = std::make_unique<tserver::TabletServerServiceProxy>(
-        *client_messenger, *endpoint);
+        &proxy_cache, HostPortFromPB(ts_info.private_rpc_addresses(0)));
 
-    std::unique_ptr<QLRowBlock> rowBlock;
+    std::unique_ptr<QLRowBlock> row_block;
     ASSERT_OK(WaitFor([&]() -> bool {
       // Setup read request.
       tserver::ReadRequestPB req;
@@ -2788,6 +2018,7 @@ TEST_F(ClientTest, TestReadFromFollower) {
         rscol_desc->set_name((*selected_cols)[i].name());
         (*selected_cols)[i].type()->ToQLTypePB(rscol_desc->mutable_ql_type());
       }
+
       EXPECT_OK(tserver_proxy->Read(req, &resp, &controller));
 
       // Verify response.
@@ -2797,23 +2028,110 @@ TEST_F(ClientTest, TestReadFromFollower) {
       EXPECT_EQ(QLResponsePB_QLStatus_YQL_STATUS_OK, ql_resp.status());
       EXPECT_TRUE(ql_resp.has_rows_data_sidecar());
 
-      Slice rows_data;
       EXPECT_TRUE(controller.finished());
-      EXPECT_OK(controller.GetSidecar(ql_resp.rows_data_sidecar(), &rows_data));
+      Slice rows_data = EXPECT_RESULT(controller.GetSidecar(ql_resp.rows_data_sidecar()));
       yb::ql::RowsResult rowsResult(kReadFromFollowerTable, selected_cols, rows_data.ToBuffer());
-      rowBlock = rowsResult.GetRowBlock();
-      return FLAGS_test_scan_num_rows == rowBlock->row_count();
+      row_block = rowsResult.GetRowBlock();
+      return FLAGS_test_scan_num_rows == row_block->row_count();
     }, MonoDelta::FromSeconds(30), "Waiting for replication to followers"));
 
-    for (int i = 0; i < rowBlock->row_count(); i++) {
-      const QLRow& row = rowBlock->row(i);
-      ASSERT_EQ(i, row.column(0).int32_value());
-      ASSERT_EQ(i * 2, row.column(1).int32_value());
-      ASSERT_EQ(StringPrintf("hello %d", i), row.column(2).string_value());
-      ASSERT_EQ(i * 3, row.column(3).int32_value());
+    std::vector<bool> seen_key(row_block->row_count());
+    for (int i = 0; i < row_block->row_count(); i++) {
+      const QLRow& row = row_block->row(i);
+      auto key = row.column(0).int32_value();
+      ASSERT_LT(key, seen_key.size());
+      ASSERT_FALSE(seen_key[key]);
+      seen_key[key] = true;
+      ASSERT_EQ(key * 2, row.column(1).int32_value());
+      ASSERT_EQ(StringPrintf("hello %d", key), row.column(2).string_value());
+      ASSERT_EQ(key * 3, row.column(3).int32_value());
     }
   }
 }
 
+TEST_F(ClientTest, Capability) {
+  constexpr CapabilityId kFakeCapability = 0x9c40e9a7;
+
+  auto rt = ASSERT_RESULT(LookupFirstTabletFuture(client_table_.get()).get());
+  ASSERT_TRUE(rt.get() != nullptr);
+  auto tservers = rt->GetRemoteTabletServers();
+  ASSERT_EQ(tservers.size(), 3);
+  for (const auto& replica : tservers) {
+    // Capability is related to executable, so it should be present since we run mini cluster for
+    // this test.
+    ASSERT_TRUE(replica->HasCapability(CAPABILITY_ClientTest));
+
+    // Check that fake capability is not reported.
+    ASSERT_FALSE(replica->HasCapability(kFakeCapability));
+  }
+}
+
+TEST_F(ClientTest, TestCreateTableWithRangePartition) {
+  gscoped_ptr <YBTableCreator> table_creator(client_->NewTableCreator());
+  const std::string kPgsqlKeyspaceID = "1234";
+  const std::string kPgsqlKeyspaceName = "psql" + kKeyspaceName;
+  const std::string kPgsqlTableName = "pgsqlrangepartitionedtable";
+  const std::string kPgsqlTableId = "pgsqlrangepartitionedtableid";
+  const size_t kColIdx = 1;
+  const int64_t kKeyValue = 48238;
+  auto pgsql_table_name = YBTableName(kPgsqlKeyspaceID, kPgsqlKeyspaceName, kPgsqlTableName);
+
+  auto yql_table_name = YBTableName(kKeyspaceName, "yqlrangepartitionedtable");
+
+  YBSchemaBuilder schemaBuilder;
+  schemaBuilder.AddColumn("key")->PrimaryKey()->Type(yb::STRING)->NotNull();
+  schemaBuilder.AddColumn("value")->Type(yb::INT64)->NotNull();
+  YBSchema schema;
+  EXPECT_OK(client_->CreateNamespaceIfNotExists(kPgsqlKeyspaceName,
+                                                YQLDatabase::YQL_DATABASE_PGSQL,
+                                                "" /* creator_role_name */,
+                                                kPgsqlKeyspaceID));
+  // Create a PGSQL table using range partition.
+  EXPECT_OK(schemaBuilder.Build(&schema));
+  Status s = table_creator->table_name(pgsql_table_name)
+      .table_id(kPgsqlTableId)
+      .schema(&schema_)
+      .set_range_partition_columns({"key"})
+      .table_type(PGSQL_TABLE_TYPE)
+      .num_tablets(1)
+      .Create();
+  EXPECT_OK(s);
+
+  // Write to the PGSQL table.
+  shared_ptr<YBTable> pgsq_table;
+  EXPECT_OK(client_->OpenTable(kPgsqlTableId , &pgsq_table));
+  std::shared_ptr<YBPgsqlWriteOp> pgsql_write_op(pgsq_table->NewPgsqlInsert());
+  PgsqlWriteRequestPB* psql_write_request = pgsql_write_op->mutable_request();
+
+  psql_write_request->add_range_column_values()->mutable_value()->set_string_value("pgsql_key1");
+  PgsqlColumnValuePB* pgsql_column = psql_write_request->add_column_values();
+  // 1 is the index for column value.
+
+  pgsql_column->set_column_id(pgsq_table->schema().ColumnId(kColIdx));
+  pgsql_column->mutable_expr()->mutable_value()->set_int64_value(kKeyValue);
+  std::shared_ptr<YBSession> session = CreateSession(client_.get());
+  EXPECT_OK(session->Apply(pgsql_write_op));
+
+  // Create a YQL table using range partition.
+  s = table_creator->table_name(yql_table_name)
+      .schema(&schema_)
+      .set_range_partition_columns({"key"})
+      .table_type(YQL_TABLE_TYPE)
+      .num_tablets(1)
+      .Create();
+  EXPECT_OK(s);
+
+  // Write to the YQL table.
+  client::TableHandle table;
+  EXPECT_OK(table.Open(yql_table_name, client_.get()));
+  std::shared_ptr<YBqlWriteOp> write_op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+  QLWriteRequestPB* const req = write_op->mutable_request();
+  req->add_range_column_values()->mutable_value()->set_string_value("key1");
+  QLColumnValuePB* column = req->add_column_values();
+  // 1 is the index for column value.
+  column->set_column_id(pgsq_table->schema().ColumnId(kColIdx));
+  column->mutable_expr()->mutable_value()->set_int64_value(kKeyValue);
+  EXPECT_OK(session->Apply(write_op));
+}
 }  // namespace client
 }  // namespace yb

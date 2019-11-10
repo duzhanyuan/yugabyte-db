@@ -32,15 +32,18 @@
 package org.yb.client;
 
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import static org.yb.AssertionWrappers.fail;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import org.yb.YBTestRunner;
 
 /**
  * Tests {@link AsyncYBClient} with multiple masters.
  */
+@RunWith(value=YBTestRunner.class)
 public class TestMasterFailover extends BaseYBClientTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestMasterFailover.class);
   private static final String TABLE_NAME =
@@ -50,10 +53,15 @@ public class TestMasterFailover extends BaseYBClientTest {
   protected void afterStartingMiniCluster() throws Exception {
     super.afterStartingMiniCluster();
 
-    createTable(TABLE_NAME, basicSchema, new CreateTableOptions());
+    createTable(TABLE_NAME, hashKeySchema, new CreateTableOptions());
   }
 
-  @Test(timeout = 30000)
+  @Override
+  protected int overridableNumShardsPerTServer() {
+    return 1;
+  }
+
+  @Test(timeout = 60000)
   public void testKillLeader() throws Exception {
     int countMasters = masterHostPorts.size();
     if (countMasters < 3) {
@@ -63,24 +71,16 @@ public class TestMasterFailover extends BaseYBClientTest {
     }
     killMasterLeader();
 
-    // Test that we can open a previously created table after killing the leader master.
-    YBTable table = openTable(TABLE_NAME);
-    assertEquals(0, countRowsInScan(client.newScannerBuilder(table).build()));
-
     if (!waitForTServersAtMasterLeader()) {
       fail("Couldn't get all tablet servers heartbeating to new master leader.");
     }
 
     // Test that we can create a new table when one of the masters is down.
     String newTableName = TABLE_NAME + "-afterLeaderIsDead";
-    createTable(newTableName, basicSchema, new CreateTableOptions());
-    table = openTable(newTableName);
-    assertEquals(0, countRowsInScan(client.newScannerBuilder(table).build()));
+    createTable(newTableName, hashKeySchema, new CreateTableOptions());
 
     // Test that we can initialize a client when one of the masters specified in the
     // connection string is down.
     AsyncYBClient newClient = new AsyncYBClient.AsyncYBClientBuilder(masterAddresses).build();
-    table = newClient.openTable(newTableName).join(DEFAULT_SLEEP);
-    assertEquals(0, countRowsInScan(newClient.newScannerBuilder(table).build()));
   }
 }

@@ -38,6 +38,7 @@
 
 #include "yb/common/wire_protocol.pb.h"
 #include "yb/gutil/macros.h"
+#include "yb/master/catalog_manager.h"
 #include "yb/server/webserver.h"
 
 namespace yb {
@@ -45,6 +46,9 @@ namespace yb {
 class Schema;
 
 namespace master {
+
+static constexpr char kTserverAlive[] = "ALIVE";
+static constexpr char kTserverDead[] = "DEAD";
 
 class Master;
 struct TabletReplica;
@@ -56,16 +60,85 @@ class MasterPathHandlers {
  public:
   explicit MasterPathHandlers(Master* master)
     : master_(master),
-      output_precision_(4) {
+      output_precision_(6) {
   }
 
   ~MasterPathHandlers();
+
+  const string kYBOrange = "#f75821";
+  const string kYBDarkBlue = "#202951";
+  const string kYBLightBlue = "#3eb1cc";
+  const string kYBGray = "#5e647a";
 
   CHECKED_STATUS Register(Webserver* server);
 
   string BytesToHumanReadable (uint64_t bytes);
 
  private:
+  enum TableType {
+    kUserTable,
+    kIndexTable,
+    kSystemTable,
+    kNumTypes
+  };
+
+  const string kSystemPlatformNamespace = "system_platform";
+
+  struct TabletCounts {
+    uint32_t user_tablet_leaders = 0;
+    uint32_t user_tablet_followers = 0;
+    uint32_t system_tablet_leaders = 0;
+    uint32_t system_tablet_followers = 0;
+
+    void operator+=(const TabletCounts& other);
+  };
+
+  // Struct used to store the number of nodes and tablets in an availability zone.
+  struct ZoneTabletCounts {
+    TabletCounts tablet_counts;
+    uint32_t node_count = 1;
+    uint32_t active_tablets_count;
+
+    ZoneTabletCounts() = default;
+
+    // Create a ZoneTabletCounts object from the TabletCounts of a TServer (one node).
+    ZoneTabletCounts(const TabletCounts& tablet_counts, uint32_t active_tablets_count);
+
+    void operator+=(const ZoneTabletCounts& other);
+
+    typedef std::map<std::string, ZoneTabletCounts> ZoneTree;
+    typedef std::map<std::string, ZoneTree> RegionTree;
+    typedef std::map<std::string, RegionTree> CloudTree;
+  };
+
+  // Map of tserver UUID -> TabletCounts
+  typedef std::unordered_map<std::string, TabletCounts> TabletCountMap;
+
+  const string table_type_[3] = {"User", "Index", "System"};
+
+  const string kNoPlacementUUID = "NONE";
+
+  static inline void TServerTable(std::stringstream* output);
+
+  void TServerDisplay(const std::string& current_uuid,
+                      std::vector<std::shared_ptr<TSDescriptor>>* descs,
+                      TabletCountMap* tmap,
+                      std::stringstream* output);
+
+  // Outputs a ZoneTabletCounts::CloudTree as an html table with a heading.
+  static void DisplayTabletZonesTable(
+    const ZoneTabletCounts::CloudTree& counts,
+    std::stringstream* output
+  );
+
+  // Builds a "cloud -> region -> zone" tree of tablet and node counts.
+  // Each leaf of the tree is a ZoneTabletCounts struct corresponding to the
+  // unique availability zone identified by the path from the root to the leaf.
+  ZoneTabletCounts::CloudTree CalculateTabletCountsTree(
+    const std::vector<std::shared_ptr<TSDescriptor>>& descriptors,
+    const TabletCountMap& tablet_count_map
+  );
+
   void CallIfLeaderOrPrintRedirect(const Webserver::WebRequest& req, std::stringstream* output,
                                    const Webserver::PathHandlerCallback& callback);
 
@@ -77,12 +150,20 @@ class MasterPathHandlers {
                             std::stringstream* output,
                             bool skip_system_tables = false);
   void HandleTablePage(const Webserver::WebRequest& req,
-                       std::stringstream *output);
+                       std::stringstream* output);
+  void HandleTasksPage(const Webserver::WebRequest& req,
+                       std::stringstream* output);
   void HandleMasters(const Webserver::WebRequest& req,
                      std::stringstream* output);
   void HandleDumpEntities(const Webserver::WebRequest& req,
                           std::stringstream* output);
+  void HandleGetTserverStatus(const Webserver::WebRequest& req,
+                          std::stringstream* output);
   void HandleGetClusterConfig(const Webserver::WebRequest& req, std::stringstream* output);
+  void HandleHealthCheck(const Webserver::WebRequest& req, std::stringstream* output);
+
+  // Calcuates number of leaders/followers per table.
+  void CalculateTabletMap(TabletCountMap* tablet_map);
 
   // Convert location of peers to HTML, indicating the roles
   // of each tablet server in a consensus configuration.

@@ -23,29 +23,18 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/mpl/and.hpp>
 #include <boost/tti/has_type.hpp>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
 
 #include "yb/gutil/strings/numbers.h"
 
-// This utility actively use SFINAE (http://en.cppreference.com/w/cpp/language/sfinae)
-// technique to route ToString to correct implementation.
-namespace yb {
-
-#define HAS_MEMBER_FUNCTION(function) \
-    template<class T> \
-    struct BOOST_PP_CAT(HasMemberFunction_, function) { \
-      typedef int Yes; \
-      typedef struct { Yes array[2]; } No; \
-      typedef typename std::remove_reference<T>::type StrippedT; \
-      template<class U> static Yes Test(decltype(static_cast<U*>(nullptr)->function())*); \
-      template<class U> static No Test(...); \
-      static const bool value = sizeof(Yes) == sizeof(Test<StrippedT>(nullptr)); \
-    };
-
-// If class has ToString member function - use it.
-HAS_MEMBER_FUNCTION(ToString);
-HAS_MEMBER_FUNCTION(to_string);
+// We should use separate namespace for some checkers.
+// Because there could be cases when operator<< is available in yb namespace, but
+// unavailable to boost::lexical_cast.
+// For instance MonoDelta is implicitly constructible from std::chrono::duration
+// and has operator<<.
+// So when we are trying to convert std::chrono::duration to string, SupportsOutputToStream
+// reports true, but boost::lexical_cast cannot output std::chrono::duration to stream.
+// Because such operator<< could not be found using ADL.
+namespace yb_tostring {
 
 template <class T>
 struct SupportsOutputToStream {
@@ -60,6 +49,45 @@ struct SupportsOutputToStream {
   static constexpr bool value =
       sizeof(Test(nullptr, static_cast<const CleanedT*>(nullptr))) == sizeof(Yes);
 };
+
+#define HAS_FREE_FUNCTION(function) \
+  template <class T> \
+  struct BOOST_PP_CAT(HasFreeFunction_, function) { \
+    typedef int Yes; \
+    typedef struct { Yes array[2]; } No; \
+    typedef typename std::remove_cv<typename std::remove_reference<T>::type>::type CleanedT; \
+    \
+    template <class U> \
+    static auto Test(const U* u) -> decltype(function(*u), Yes(0)) {} \
+    static No Test(...) {} \
+    \
+    static constexpr bool value = \
+        sizeof(Test(static_cast<const CleanedT*>(nullptr))) == sizeof(Yes); \
+  };
+
+HAS_FREE_FUNCTION(to_string);
+
+} // namespace yb_tostring
+
+// This utility actively use SFINAE (http://en.cppreference.com/w/cpp/language/sfinae)
+// technique to route ToString to correct implementation.
+namespace yb {
+
+#define HAS_MEMBER_FUNCTION(function) \
+    template<class T> \
+    struct BOOST_PP_CAT(HasMemberFunction_, function) { \
+      typedef int Yes; \
+      typedef struct { Yes array[2]; } No; \
+      typedef typename std::remove_reference<T>::type StrippedT; \
+      template<class U> static Yes Test(typename std::remove_reference< \
+          decltype(static_cast<U*>(nullptr)->function())>::type*); \
+      template<class U> static No Test(...); \
+      static const bool value = sizeof(Yes) == sizeof(Test<StrippedT>(nullptr)); \
+    };
+
+// If class has ToString member function - use it.
+HAS_MEMBER_FUNCTION(ToString);
+HAS_MEMBER_FUNCTION(to_string);
 
 template <class T>
 typename std::enable_if<HasMemberFunction_ToString<T>::value, std::string>::type
@@ -123,7 +151,7 @@ class PointerToString {
 };
 
 template <>
-class PointerToString<void*> {
+class PointerToString<const void*> {
  public:
   static std::string Apply(const void* ptr) {
     if (ptr) {
@@ -135,6 +163,14 @@ class PointerToString<void*> {
     } else {
       return "<NULL>";
     }
+  }
+};
+
+template <>
+class PointerToString<void*> {
+ public:
+  static std::string Apply(const void* ptr) {
+    return PointerToString<const void*>::Apply(ptr);
   }
 };
 
@@ -193,7 +229,13 @@ class IsCollection : public has_type_const_iterator<
 };
 
 template <class T>
-typename std::enable_if<IsCollection<T>::value,
+typename std::enable_if<yb_tostring::HasFreeFunction_to_string<T>::value,
+                        std::string>::type ToString(const T& value) {
+  return to_string(value);
+}
+
+template <class T>
+typename std::enable_if<IsCollection<T>::value && !yb_tostring::HasFreeFunction_to_string<T>::value,
                         std::string>::type ToString(const T& value) {
   return CollectionToString(value);
 }
@@ -201,10 +243,13 @@ typename std::enable_if<IsCollection<T>::value,
 template <class T>
 typename std::enable_if<
     boost::mpl::and_<
-        boost::mpl::bool_<SupportsOutputToStream<T>::value>,
-        boost::mpl::bool_<!IsPointerLike<T>::value>,
-        boost::mpl::bool_<!std::is_integral<typename std::remove_reference<T>::type>::value>,
-        boost::mpl::bool_<!IsCollection<T>::value>
+        boost::mpl::bool_<yb_tostring::SupportsOutputToStream<T>::value>,
+        boost::mpl::bool_<!
+            (IsPointerLike<T>::value ||
+             std::is_integral<typename std::remove_reference<T>::type>::value ||
+             IsCollection<T>::value ||
+             HasMemberFunction_ToString<T>::value ||
+             HasMemberFunction_to_string<T>::value)>
     >::value,
     std::string>::type
 ToString(T&& value) {
@@ -260,6 +305,17 @@ std::string ToString(const std::tuple<Args...>& tuple) {
   return result;
 }
 
+template<class Rep, class Period>
+std::string ToString(const std::chrono::duration<Rep, Period>& duration) {
+  int64_t milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+  int64_t seconds = milliseconds / 1000;
+  milliseconds -= seconds * 1000;
+  return StringPrintf("%" PRId64 ".%03" PRId64 "s", seconds, milliseconds);
+}
+
+std::string ToString(const std::chrono::steady_clock::time_point& time_point);
+std::string ToString(const std::chrono::system_clock::time_point& time_point);
+
 template <class Collection>
 std::string CollectionToString(const Collection& collection) {
   std::string result = "[";
@@ -276,19 +332,9 @@ std::string CollectionToString(const Collection& collection) {
   return result;
 }
 
-template<class Rep, class Period>
-std::string ToString(const std::chrono::duration<Rep, Period>& duration) {
-  int64_t milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-  int64_t seconds = milliseconds / 1000;
-  milliseconds -= seconds * 1000;
-  return StringPrintf("%" PRId64 ".%03" PRId64 "s", seconds, milliseconds);
-}
-
-std::string ToString(const std::chrono::steady_clock::time_point& time_point);
-std::string ToString(const std::chrono::system_clock::time_point& time_point);
-
-inline std::string ToString(const boost::uuids::uuid& uuid) {
-  return boost::uuids::to_string(uuid);
+template <class T>
+std::string AsString(const T& t) {
+  return ToString(t);
 }
 
 } // namespace yb

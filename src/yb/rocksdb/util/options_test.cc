@@ -486,13 +486,13 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_OK(GetBlockBasedTableOptionsFromString(table_opt,
             "cache_index_and_filter_blocks=1;index_type=kHashSearch;"
             "checksum=kxxHash;hash_index_allow_collision=1;no_block_cache=1;"
-            "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
-            "block_size_deviation=8;block_restart_interval=4;"
-            "filter_policy=bloomfilter:4:true;whole_key_filtering=1;"
+            "block_cache=1M;block_cache_compressed=1k;block_size=1024;filter_block_size=4096;"
+            "block_size_deviation=8;block_restart_interval=4;index_block_size=16384;"
+            "min_keys_per_index_block=16;filter_policy=bloomfilter:4:true;whole_key_filtering=1;"
             "skip_table_builder_flush=1",
             &new_opt));
   ASSERT_TRUE(new_opt.cache_index_and_filter_blocks);
-  ASSERT_EQ(new_opt.index_type, BlockBasedTableOptions::kHashSearch);
+  ASSERT_EQ(new_opt.index_type, IndexType::kHashSearch);
   ASSERT_EQ(new_opt.checksum, ChecksumType::kxxHash);
   ASSERT_TRUE(new_opt.hash_index_allow_collision);
   ASSERT_TRUE(new_opt.no_block_cache);
@@ -501,8 +501,11 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
   ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL);
   ASSERT_EQ(new_opt.block_size, 1024UL);
+  ASSERT_EQ(new_opt.filter_block_size, 4096UL);
   ASSERT_EQ(new_opt.block_size_deviation, 8);
   ASSERT_EQ(new_opt.block_restart_interval, 4);
+  ASSERT_EQ(new_opt.index_block_size, 16384UL);
+  ASSERT_EQ(new_opt.min_keys_per_index_block, 16);
   ASSERT_TRUE(new_opt.filter_policy != nullptr);
   ASSERT_TRUE(new_opt.skip_table_builder_flush);
 
@@ -1504,7 +1507,7 @@ TEST_F(OptionsParserTest, EscapeOptionString) {
 
 // Only run the tests to verify new fields in options are settable through
 // string on limited platforms as it depends on behavior of compilers.
-#if defined(OS_LINUX) && !defined(__clang__)
+#if defined(__linux__) && !defined(__clang__)
 
 struct OffsetGap {
   size_t begin_offset;
@@ -1618,7 +1621,7 @@ Status GetFromString(BlockBasedTableOptions* source, BlockBasedTableOptions* des
       "checksum=kxxHash;hash_index_allow_collision=1;no_block_cache=1;"
       "block_cache=1M;block_cache_compressed=1k;block_size=1024;filter_block_size=16384;"
       "block_size_deviation=8;block_restart_interval=4; "
-      "index_block_restart_interval=4;"
+      "index_block_restart_interval=4;index_block_size=16384;min_keys_per_index_block=16;"
       "filter_policy=bloomfilter:4:true;whole_key_filtering=1;"
       "skip_table_builder_flush=1;format_version=1;"
       "hash_index_allow_collision=false;";
@@ -1700,7 +1703,12 @@ Status GetFromString(DBOptions* source, DBOptions* destination) {
   return GetDBOptionsFromString(*source, kOptionsString, destination);
 }
 
+// We want padding bytes to have the same values for test purposes, therefore we need to use
+// exactly the same saved default value instead of using CompactionOptionsUniversal().
+static CompactionOptionsUniversal kCompactionOptionsUniversalDefault;
+
 void InitDefault(ColumnFamilyOptions* options) {
+  options->compaction_options_universal = kCompactionOptionsUniversalDefault;
   // Deprecatd option which is not initialized. Need to set it to avoid
   // Valgrind error
   options->max_mem_compaction_level = 0;
@@ -1764,7 +1772,7 @@ Status GetFromString(ColumnFamilyOptions* source, ColumnFamilyOptions* destinati
   // GetColumnFamilyOptionsFromString():
   destination->rate_limit_delay_max_milliseconds = 33;
   destination->compaction_pri = CompactionPri::kOldestSmallestSeqFirst;
-  destination->compaction_options_universal = CompactionOptionsUniversal();
+  destination->compaction_options_universal = kCompactionOptionsUniversalDefault;
   destination->compression_opts = CompressionOptions();
   destination->hard_rate_limit = 0;
   destination->soft_rate_limit = 0;
@@ -1908,6 +1916,8 @@ TEST_F(OptionsParserTest, BlockBasedTableOptionsAllFieldsSettable) {
 TEST_F(OptionsParserTest, DBOptionsAllFieldsSettable) {
   const OffsetGaps kDBOptionsBlacklist = {
       BLACKLIST_ENTRY(DBOptions, env),
+      BLACKLIST_ENTRY(DBOptions, checkpoint_env),
+      BLACKLIST_ENTRY(DBOptions, priority_thread_pool_for_compactions_and_flushes),
       BLACKLIST_ENTRY(DBOptions, rate_limiter),
       BLACKLIST_ENTRY(DBOptions, sst_file_manager),
       BLACKLIST_ENTRY(DBOptions, info_log),
@@ -1920,6 +1930,10 @@ TEST_F(OptionsParserTest, DBOptionsAllFieldsSettable) {
       BLACKLIST_ENTRY(DBOptions, row_cache),
       BLACKLIST_ENTRY(DBOptions, wal_filter),
       BLACKLIST_ENTRY(DBOptions, boundary_extractor),
+      BLACKLIST_ENTRY(DBOptions, mem_table_flush_filter_factory),
+      BLACKLIST_ENTRY(DBOptions, log_prefix),
+      BLACKLIST_ENTRY(DBOptions, mem_tracker),
+      BLACKLIST_ENTRY(DBOptions, block_based_table_mem_tracker),
   };
 
   TestAllFieldsSettable<DBOptions>(kDBOptionsBlacklist);
@@ -1951,7 +1965,7 @@ TEST_F(OptionsParserTest, ColumnFamilyOptionsAllFieldsSettable) {
 
   TestAllFieldsSettable<ColumnFamilyOptions>(kColumnFamilyOptionsBlacklist);
 }
-#endif // OS_LINUX && !clang
+#endif // __linux__ && !clang
 #endif // !ROCKSDB_LITE
 
 }  // namespace rocksdb

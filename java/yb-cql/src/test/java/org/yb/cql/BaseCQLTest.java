@@ -16,39 +16,46 @@ import com.datastax.driver.core.*;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.fail;
 
 import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.ConsistencyLevel;
+import com.datastax.driver.core.QueryOptions;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.Statement;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SocketOptions;
+import com.datastax.driver.core.exceptions.InvalidQueryException;
+import com.datastax.driver.core.exceptions.OperationTimedOutException;
 import com.datastax.driver.core.exceptions.QueryValidationException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.yb.client.YBClient;
-import org.yb.master.Master;
 import org.yb.minicluster.BaseMiniClusterTest;
 import org.yb.minicluster.IOMetrics;
 import org.yb.minicluster.Metrics;
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
 import org.yb.minicluster.RocksDBMetrics;
 import org.yb.util.ServerInfo;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -60,20 +67,23 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   // Integer.MAX_VALUE seconds is the maximum allowed TTL by Cassandra.
   protected static final int MAX_TTL_SEC = Integer.MAX_VALUE;
 
-  protected static final String DEFAULT_KEYSPACE = "default_keyspace";
-
   protected static final String DEFAULT_TEST_KEYSPACE = "cql_test_keyspace";
 
   protected static final String TSERVER_READ_METRIC =
     "handler_latency_yb_tserver_TabletServerService_Read";
 
-  protected static final int PARTITION_POLICY_REFRESH_FREQUENCY_SECONDS = 10;
+  protected static final String TSERVER_SELECT_METRIC =
+      "handler_latency_yb_cqlserver_SQLProcessor_SelectStmt";
+
+  protected static final String TSERVER_FLUSHES_METRIC =
+      "handler_latency_yb_cqlserver_SQLProcessor_NumFlushesToExecute";
+
+  // CQL and Redis settings.
+  protected static boolean startCqlProxy = true;
+  protected static boolean startRedisProxy = false;
 
   protected Cluster cluster;
   protected Session session;
-
-  /** These keyspaces will be dropped in after the current test method (in the @After handler). */
-  protected Set<String> keyspacesToDrop = new TreeSet<>();
 
   float float_infinity_positive = createFloat(0, 0b11111111, 0);
   float float_infinity_negative = createFloat(1, 0b11111111, 0);
@@ -106,23 +116,45 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return Double.longBitsToDouble((sign << 63) | (exp << 52) | fraction);
   }
 
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flagMap = new TreeMap<>();
+
+    flagMap.put("start_cql_proxy", Boolean.toString(startCqlProxy));
+    flagMap.put("start_redis_proxy", Boolean.toString(startRedisProxy));
+
+    return flagMap;
+  }
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    for (Map.Entry<String, String> entry : getTServerFlags().entrySet()) {
+      builder.addCommonTServerArgs("--" + entry.getKey() + "=" + entry.getValue());
+    }
+    builder.enablePostgres(false);
+  }
+
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     LOG.info("BaseCQLTest.setUpBeforeClass is running");
-
+    BaseMiniClusterTest.tserverArgs.add("--client_read_write_timeout_ms=180000");
     // Disable extended peer check, to ensure "SELECT * FROM system.peers" works without
     // all columns.
     System.setProperty("com.datastax.driver.EXTENDED_PEER_CHECK", "false");
   }
 
   public Cluster.Builder getDefaultClusterBuilder() {
+    // Set default consistency level to strong consistency
+    QueryOptions queryOptions = new QueryOptions();
+    queryOptions.setConsistencyLevel(ConsistencyLevel.YB_STRONG);
     // Set a long timeout for CQL queries since build servers might be really slow (especially Mac
     // Mini).
     SocketOptions socketOptions = new SocketOptions();
-    socketOptions.setReadTimeoutMillis(60 * 1000);
-    socketOptions.setConnectTimeoutMillis(60 * 1000);
+    socketOptions.setReadTimeoutMillis(120 * 1000);
+    socketOptions.setConnectTimeoutMillis(120 * 1000);
     return Cluster.builder()
               .addContactPointsWithPorts(miniCluster.getCQLContactPoints())
+              .withQueryOptions(queryOptions)
               .withSocketOptions(socketOptions);
   }
 
@@ -133,6 +165,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   @Before
   public void setUpCqlClient() throws Exception {
     LOG.info("BaseCQLTest.setUpCqlClient is running");
+
     if (miniCluster == null) {
       final String errorMsg =
           "Mini-cluster must already be running by the time setUpCqlClient is invoked";
@@ -147,6 +180,31 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     }
     LOG.info("Connected to cluster: " + cluster.getMetadata().getClusterName());
     session = buildDefaultSession(cluster);
+
+    final int numTServers = miniCluster.getTabletServers().size();
+    final int expectedNumPeers = Math.max(0, Math.min(numTServers - 1, 2));
+    LOG.info("Waiting until system.peers contains at least " + expectedNumPeers + " entries (" +
+        "number of tablet servers: " + numTServers + ")");
+    int attemptsMade = 0;
+    boolean waitSuccessful = false;
+
+    while (attemptsMade < 30) {
+      int numPeers = 0;
+      for (Row row : execute("select peer from system.peers")) {
+        numPeers++;
+      }
+      if (numPeers >= expectedNumPeers) {
+        waitSuccessful = true;
+        break;
+      }
+      LOG.info("system.peers still contains only " + numPeers + " entries, waiting");
+      Thread.sleep(1000);
+    }
+    if (waitSuccessful) {
+      LOG.info("Succeeded waiting for " + expectedNumPeers + " peers to show up in system.peers");
+    } else {
+      LOG.warn("Timed out waiting for " + expectedNumPeers + " peers to show up in system.peers");
+    }
 
     // Create and use test keyspace to be able to use short table names later.
     createKeyspaceIfNotExists(DEFAULT_TEST_KEYSPACE);
@@ -176,6 +234,12 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   @After
   public void tearDownAfter() throws Exception {
     final String logPrefix = "BaseCQLTest.tearDownAfter: ";
+
+    if (miniCluster == null) {
+      LOG.info(logPrefix + "mini cluster has been destroyed");
+      return;
+    }
+
     LOG.info(logPrefix + "dropping tables / types / keyspaces");
 
     // Clean up all tables before end of each test to lower high-water-mark disk usage.
@@ -209,19 +273,23 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   protected void afterBaseCQLTestTearDown() throws Exception {
   }
 
-  protected void createTable(String test_table, String column_type) throws Exception {
-    LOG.info("CREATE TABLE " + test_table);
+  protected void createTable(String tableName, String columnType) throws Exception {
+    final long startTimeMs = System.currentTimeMillis();
+    LOG.info("CREATE TABLE " + tableName);
     String create_stmt = String.format("CREATE TABLE %s " +
                     " (h1 int, h2 %2$s, " +
                     " r1 int, r2 %2$s, " +
                     " v1 int, v2 %2$s, " +
                     " primary key((h1, h2), r1, r2));",
-            test_table, column_type);
+            tableName, columnType);
     session.execute(create_stmt);
+    long elapsedTimeMs = System.currentTimeMillis() - startTimeMs;
+    LOG.info("Table creation took " + elapsedTimeMs + " for table " + tableName +
+        " with column type " + columnType);
   }
 
   protected void createTable(String tableName) throws Exception {
-     createTable(tableName, "varchar");
+    createTable(tableName, "varchar");
   }
 
   public void setupTable(String tableName, int numRows) throws Exception {
@@ -234,30 +302,66 @@ public class BaseCQLTest extends BaseMiniClusterTest {
 
     LOG.info("INSERT INTO TABLE " + tableName);
     final long startTimeMs = System.currentTimeMillis();
-    long lastLogTimeMs = startTimeMs;
-    final int LOG_EVERY_MS = 15 * 1000;
+    final AtomicLong lastLogTimeMs = new AtomicLong(startTimeMs);
+    final int LOG_EVERY_MS = 5 * 1000;
     // INSERT: A valid statement with a column list.
     final PreparedStatement preparedStmt = session.prepare(
         "INSERT INTO " + tableName + "(h1, h2, r1, r2, v1, v2) VALUES(" +
             "?, ?, ?, ?, ?, ?);");
-    for (int idx = 0; idx < numRows; idx++) {
-      session.execute(preparedStmt.bind(
-          idx, "h" + idx, idx + 100, "r" + (idx + 100), idx + 1000, "v" + (idx + 1000)));
-      if (idx % 10 == 0) {
-        long currentTimeMs = System.currentTimeMillis();
-        if (currentTimeMs - lastLogTimeMs > LOG_EVERY_MS) {
-          // If we have to do this, we're probably running pretty slowly.
-          LOG.info("Inserted " + (idx + 1) + " rows out of " + numRows + " (" +
-              String.format("%.2f", (idx + 1) * 1000.0 / (currentTimeMs - startTimeMs)) +
-              " rows/second on average)."
-          );
-        }
-      }
+
+    final int numThreads = 4;
+    ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+    final AtomicInteger currentRowIndex = new AtomicInteger();
+    final AtomicInteger numInsertedRows = new AtomicInteger();
+    List<Future<Void>> futures = new ArrayList<>();
+    for (int i = 0; i < numThreads; ++i) {
+      Callable<Void> task =
+          () -> {
+            int idx;
+            while ((idx = currentRowIndex.get()) < numRows) {
+              if (!currentRowIndex.compareAndSet(idx, idx + 1)) {
+                // Not using incrementAndGet because we don't want currentRowIndex to become higher
+                // than numRows.
+                continue;
+              }
+              session.execute(preparedStmt.bind(
+                  idx, "h" + idx, idx + 100, "r" + (idx + 100), idx + 1000, "v" + (idx + 1000)));
+              numInsertedRows.incrementAndGet();
+              if (idx % 10 == 0) {
+                long currentTimeMs;
+                long currentLastLogTimeMs;
+                while ((currentTimeMs = System.currentTimeMillis()) -
+                       (currentLastLogTimeMs = lastLogTimeMs.get()) > LOG_EVERY_MS) {
+                  if (!lastLogTimeMs.compareAndSet(currentLastLogTimeMs, currentTimeMs)) {
+                    // Someone updated lastLogTimeMs concurrently.
+                    continue;
+                  }
+                  final int numRowsInsertedSoFar = numInsertedRows.get();
+                  LOG.info("Inserted " + numRowsInsertedSoFar + " rows out of " + numRows + " (" +
+                      String.format(
+                          "%.2f", numRowsInsertedSoFar * 1000.0 / (currentTimeMs - startTimeMs)) +
+                      " rows/second on average)."
+                  );
+                }
+              }
+            }
+            return null;
+          };
+      futures.add(executor.submit(task));
     }
 
+    // Wait for all writer threads to complete.
+    for (Future<Void> future : futures) {
+      future.get();
+    }
+    executor.shutdown();
+    executor.awaitTermination(10, TimeUnit.SECONDS);
+
     final long totalTimeMs = System.currentTimeMillis() - startTimeMs;
-    LOG.info("INSERT INTO TABLE " + tableName + " FINISHED: inserted " + numRows +
-             "(" + totalTimeMs + " ms, " +
+    assertEquals(numRows, currentRowIndex.get());
+    assertEquals(numRows, numInsertedRows.get());
+    LOG.info("INSERT INTO TABLE " + tableName + " FINISHED: inserted " + numInsertedRows.get() +
+             " rows (total time: " + totalTimeMs + " ms, " +
              String.format("%.2f", numRows * 1000.0 / totalTimeMs) + " rows/sec)");
   }
 
@@ -282,8 +386,14 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     LOG.info("INSERT INTO TABLE " + tableName + " FINISHED");
   }
 
+  protected void dropIndex(String indexName) throws Exception {
+    String dropStmt = String.format("DROP INDEX %s;", indexName);
+    session.execute(dropStmt);
+  }
+
   protected void dropTable(String tableName) throws Exception {
     String dropStmt = String.format("DROP TABLE %s;", tableName);
+    LOG.info("Executing drop table: " + dropStmt);
     session.execute(dropStmt);
   }
 
@@ -305,45 +415,35 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   }
 
   protected void dropTables() throws Exception {
-    if (miniCluster == null) {
+    if (cluster == null) {
       return;
     }
-    for (Master.ListTablesResponsePB.TableInfo tableInfo :
-        miniCluster.getClient().getTablesList().getTableInfoList()) {
-      // Drop all non-system tables.
-      String namespaceName = tableInfo.getNamespace().getName();
-      if (!IsSystemKeyspace(namespaceName) && !IsRedisKeyspace(namespaceName)) {
-        dropTable(namespaceName + "." + tableInfo.getName());
+    for (Row row : session.execute("SELECT keyspace_name, table_name FROM system_schema.tables")) {
+      if (!IsSystemKeyspace(row.getString("keyspace_name"))) {
+        dropTable(row.getString("keyspace_name") + "." + row.getString("table_name"));
       }
     }
   }
-
 
   protected void dropUDTypes() throws Exception {
     if (cluster == null) {
       return;
     }
-
-    for (KeyspaceMetadata keyspace : cluster.getMetadata().getKeyspaces()) {
-      if (!IsSystemKeyspace(keyspace.getName())) {
-        for (UserType udt : keyspace.getUserTypes()) {
-          dropUDType(keyspace.getName(), udt.getTypeName());
-        }
+    for (Row row : session.execute("SELECT keyspace_name, type_name FROM system_schema.types")) {
+      if (!IsSystemKeyspace(row.getString("keyspace_name"))) {
+        dropUDType(row.getString("keyspace_name"), row.getString("type_name"));
       }
     }
   }
 
   protected void dropKeyspaces() throws Exception {
-    if (keyspacesToDrop.isEmpty()) {
-      LOG.info("No keyspaces to drop after the test.");
+    if (cluster == null) {
+      return;
     }
-
-    // Copy the set of keyspaces to drop to avoid concurrent modification exception, because
-    // dropKeyspace will also remove them from the keyspacesToDrop.
-    final Set<String> keyspacesToDropCopy = new TreeSet<>();
-    keyspacesToDropCopy.addAll(keyspacesToDrop);
-    for (String keyspaceName : keyspacesToDropCopy) {
-      dropKeyspace(keyspaceName);
+    for (Row row : session.execute("SELECT keyspace_name FROM system_schema.keyspaces")) {
+      if (!IsSystemKeyspace(row.getString("keyspace_name"))) {
+        dropKeyspace(row.getString("keyspace_name"));
+      }
     }
   }
 
@@ -354,69 +454,61 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return iter;
   }
 
-  protected void runInvalidStmt(Statement stmt) {
+  protected Iterator<Row> runSelect(String select_stmt, Object... args) {
+    return runSelect(String.format(select_stmt, args));
+  }
+
+  protected String runInvalidQuery(Statement stmt) {
     try {
       session.execute(stmt);
       fail(String.format("Statement did not fail: %s", stmt));
+      return null; // Never happens, but keeps compiler happy
     } catch (QueryValidationException qv) {
       LOG.info("Expected exception", qv);
+      return qv.getCause().getMessage();
     }
   }
 
-  protected void runInvalidStmt(String stmt) {
-    runInvalidStmt(new SimpleStatement(stmt));
+  protected String runInvalidQuery(String stmt) {
+    return runInvalidQuery(new SimpleStatement(stmt));
   }
 
-  // generates a comprehensive map from valid date-time inputs to corresponding Date values
-  // includes both integer and string inputs --  used for Timestamp tests
-  public Map<String, Date> generateTimestampMap() {
-    Map<String, Date> ts_values = new HashMap();
-    Calendar cal = new GregorianCalendar();
-
-    // adding some Integer input values
-    cal.setTimeInMillis(631238400000L);
-    ts_values.put("631238400000", cal.getTime());
-    cal.setTimeInMillis(631238434123L);
-    ts_values.put("631238434123", cal.getTime());
-    cal.setTimeInMillis(631238445000L);
-    ts_values.put("631238445000", cal.getTime());
-
-    // generating String inputs as combinations valid components (date/time/frac_seconds/timezone)
-    int nr_entries = 3;
-    String[] dates = {"'1992-06-04", "'1992-6-4", "'1992-06-4"};
-    String[] times_no_sec = {"12:30", "15:30", "9:00"};
-    String[] times = {"12:30:45", "15:30:45", "9:00:45"};
-    String[] times_frac = {"12:30:45.1", "15:30:45.10", "9:00:45.100"};
-    // timezones correspond one-to-one with times
-    //   -- so that the UTC-normalized time is the same
-    String[] timezones = {" UTC'", "+03:00'", " UTC-03:30'"};
-    for (String date : dates) {
-      cal.setTimeZone(TimeZone.getTimeZone("GMT")); // resetting
-      cal.setTimeInMillis(0); // resetting
-      cal.set(1992, 5, 4); // Java Date month value starts at 0 not 1
-      ts_values.put(date + " UTC'", cal.getTime());
-
-      cal.set(Calendar.HOUR_OF_DAY, 12);
-      cal.set(Calendar.MINUTE, 30);
-      for (int i = 0; i < nr_entries; i++) {
-        String time = times_no_sec[i] + timezones[i];
-        ts_values.put(date + " " + time, cal.getTime());
-        ts_values.put(date + "T" + time, cal.getTime());
-      }
-      cal.set(Calendar.SECOND, 45);
-      for (int i = 0; i < nr_entries; i++) {
-        String time = times[i] + timezones[i];
-        ts_values.put(date + " " + time, cal.getTime());
-        ts_values.put(date + "T" + time, cal.getTime());
-      }
-      cal.set(Calendar.MILLISECOND, 100);
-      for (int i = 0; i < nr_entries; i++) {
-        String time = times_frac[i] + timezones[i];
-        ts_values.put(date + " " + time, cal.getTime());
-        ts_values.put(date + "T" + time, cal.getTime());
-      }
+  protected String runInvalidStmt(Statement stmt, Session s) {
+    try {
+      s.execute(stmt);
+      fail(String.format("Statement did not fail: %s", stmt));
+      return null; // Never happens, but keeps compiler happy
+    } catch (QueryValidationException qv) {
+      LOG.info("Expected exception", qv);
+      return qv.getCause().getMessage();
     }
-    return ts_values;
+  }
+
+  protected String runValidSelect(String stmt) {
+    ResultSet rs = session.execute(stmt);
+    String result = "";
+    for (Row row : rs) {
+      result += row.toString();
+    }
+    return result;
+  }
+
+  protected String runInvalidStmt(Statement stmt) {
+    return runInvalidStmt(stmt, session);
+  }
+
+  protected String runInvalidStmt(String stmt, Session s) {
+    return runInvalidStmt(new SimpleStatement(stmt), s);
+  }
+
+  protected String runInvalidStmt(String stmt) {
+    return runInvalidStmt(stmt, session);
+  }
+
+  protected void runInvalidStmt(String stmt, String errorSubstring) {
+    String errorMsg = runInvalidStmt(stmt);
+    assertTrue("Error message '" + errorMsg + "' should contain '" + errorSubstring + "'",
+               errorMsg.contains(errorSubstring));
   }
 
   protected void assertNoRow(String select_stmt) {
@@ -425,7 +517,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     assertFalse(iter.hasNext());
   }
 
-  protected void assertQuery(String stmt, String expectedResult) {
+  protected void assertQuery(Statement stmt, String expectedResult) {
     ResultSet rs = session.execute(stmt);
     String actualResult = "";
     for (Row row : rs) {
@@ -434,13 +526,70 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     assertEquals(expectedResult, actualResult);
   }
 
-  protected void assertQuery(String stmt, Set<String> expectedRows) {
+  protected void assertQuery(String stmt, String expectedResult) {
+    assertQuery(new SimpleStatement(stmt), expectedResult);
+  }
+
+  protected void assertQuery(Statement stmt, String expectedColumns, String expectedResult) {
     ResultSet rs = session.execute(stmt);
-    HashSet<String> actualRows = new HashSet<String>();
+    assertEquals(expectedColumns, rs.getColumnDefinitions().toString());
+    String actualResult = "";
+    for (Row row : rs) {
+      actualResult += row.toString();
+    }
+    assertEquals(expectedResult, actualResult);
+  }
+
+  protected void assertQuery(String stmt, String expectedColumns, String expectedResult) {
+    assertQuery(new SimpleStatement(stmt), expectedColumns, expectedResult);
+  }
+
+  protected void assertQuery(String stmt, Set<String> expectedRows) {
+    assertQuery(new SimpleStatement(stmt), expectedRows);
+  }
+
+  protected void assertQuery(Statement stmt, Set<String> expectedRows) {
+    ResultSet rs = session.execute(stmt);
+    Set<String> actualRows = new HashSet<>();
     for (Row row : rs) {
       actualRows.add(row.toString());
     }
     assertEquals(expectedRows, actualRows);
+  }
+
+  /**
+   * Assert the result of a query when the order of the rows is not enforced.
+   * To be used, for instance, when querying over multiple hashes where the order is defined by the
+   * hash function not just the values.
+   *
+   * @param stmt The (select) query to be executed
+   * @param expectedRows the expected rows in no particular order
+   */
+  protected void assertQueryRowsUnordered(String stmt, String... expectedRows) {
+    assertQuery(stmt, Arrays.stream(expectedRows).collect(Collectors.toSet()));
+  }
+
+  /**
+   * Assert the result of a query when the order of the rows is enforced.
+   * To be used, for instance, for queries where (range) column ordering (ASC/DESC) is being tested.
+   *
+   * @param stmt The (select) query to be executed
+   * @param expectedRows the rows in the expected order
+   */
+  protected void assertQueryRowsOrdered(String stmt, String... expectedRows) {
+    ResultSet rs = session.execute(stmt);
+    List<String> actualRows = new ArrayList<String>();
+    for (Row row : rs) {
+      actualRows.add(row.toString());
+    }
+    assertEquals(Arrays.stream(expectedRows).collect(Collectors.toList()), actualRows);
+  }
+
+  /** Checks that the query yields an error containing the given (case-insensitive) substring */
+  protected void assertQueryError(String stmt, String expectedErrorSubstring) {
+    String result = runInvalidStmt(stmt);
+    assertTrue("Query error '" + result + "' did not contain '" + expectedErrorSubstring + "'",
+        result.toLowerCase().contains(expectedErrorSubstring.toLowerCase()));
   }
 
   // blob type utils
@@ -464,23 +613,31 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return buffer;
   }
 
-  public ResultSet execute(String statement) throws Exception {
-    LOG.info("EXEC CQL: " + statement);
-    final ResultSet result = session.execute(statement);
-    LOG.info("EXEC CQL FINISHED: " + statement);
+  public ResultSet execute(String stmt, Session s) throws Exception {
+    LOG.info("EXEC CQL: " + stmt);
+    final ResultSet result = s.execute(stmt);
+    LOG.info("EXEC CQL FINISHED: " + stmt);
     return result;
   }
+
+  public ResultSet execute(String stmt) throws Exception { return execute(stmt, session); }
+
+  public void executeInvalid(String stmt, Session s) throws Exception {
+    LOG.info("EXEC INVALID CQL: " + stmt);
+    runInvalidStmt(stmt, s);
+    LOG.info("EXEC INVALID CQL FINISHED: " + stmt);
+  }
+
+  public void executeInvalid(String stmt) throws Exception { executeInvalid(stmt, session); }
 
   public void createKeyspace(String keyspaceName) throws Exception {
     String createKeyspaceStmt = "CREATE KEYSPACE \"" + keyspaceName + "\";";
     execute(createKeyspaceStmt);
-    keyspacesToDrop.add(keyspaceName);
   }
 
   public void createKeyspaceIfNotExists(String keyspaceName) throws Exception {
     String createKeyspaceStmt = "CREATE KEYSPACE IF NOT EXISTS \"" + keyspaceName + "\";";
     execute(createKeyspaceStmt);
-    keyspacesToDrop.add(keyspaceName);
   }
 
   public void useKeyspace(String keyspaceName) throws Exception {
@@ -491,7 +648,18 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   public void dropKeyspace(String keyspaceName) throws Exception {
     String deleteKeyspaceStmt = "DROP KEYSPACE \"" + keyspaceName + "\";";
     execute(deleteKeyspaceStmt);
-    keyspacesToDrop.remove(keyspaceName);
+  }
+
+  // Get metrics of all tservers.
+  public Map<MiniYBDaemon, Metrics> getAllMetrics() throws Exception {
+    Map<MiniYBDaemon, Metrics> initialMetrics = new HashMap<>();
+    for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
+      Metrics metrics = new Metrics(ts.getLocalhostIP(),
+                                    ts.getCqlWebPort(),
+                                    "server");
+      initialMetrics.put(ts, metrics);
+    }
+    return initialMetrics;
   }
 
   // Get IO metrics of all tservers.
@@ -523,14 +691,12 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return totalMetrics;
   }
 
-  public RocksDBMetrics getRocksDBMetric(String tableName) throws IOException {
-    Set<String> tabletIDs = new HashSet<>();
-    for (Row row : session.execute("SELECT id FROM system_schema.partitions " +
-                                   "WHERE keyspace_name = ? and table_name = ?;",
-                                   DEFAULT_TEST_KEYSPACE, tableName).all()) {
-      tabletIDs.add(ServerInfo.UUIDToHostString(row.getUUID("id")));
-    }
+  private Set<String> getTableIds(String keyspaceName, String tableName)  throws Exception {
+    return miniCluster.getClient().getTabletUUIDs(keyspaceName, tableName);
+  }
 
+  public RocksDBMetrics getRocksDBMetric(String tableName) throws Exception {
+    Set<String> tabletIds = getTableIds(DEFAULT_TEST_KEYSPACE, tableName);
     RocksDBMetrics metrics = new RocksDBMetrics();
     for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
       try {
@@ -543,7 +709,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
         for (JsonElement elem : tree.getAsJsonArray()) {
           JsonObject obj = elem.getAsJsonObject();
           if (obj.get("type").getAsString().equals("tablet") &&
-              tabletIDs.contains(obj.get("id").getAsString())) {
+              tabletIds.contains(obj.get("id").getAsString())) {
             metrics.add(new RocksDBMetrics(new Metrics(obj)));
           }
         }
@@ -553,4 +719,46 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     }
     return metrics;
   }
+
+  public int getTableCounterMetric(String keyspaceName,
+                                   String tableName,
+                                   String metricName) throws Exception {
+    int value = 0;
+    Set<String> tabletIds = getTableIds(keyspaceName, tableName);
+    for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
+      try {
+        URL url = new URL(String.format("http://%s:%d/metrics",
+                                        ts.getLocalhostIP(),
+                                        ts.getWebPort()));
+        Scanner scanner = new Scanner(url.openConnection().getInputStream());
+        JsonParser parser = new JsonParser();
+        JsonElement tree = parser.parse(scanner.useDelimiter("\\A").next());
+        for (JsonElement elem : tree.getAsJsonArray()) {
+          JsonObject obj = elem.getAsJsonObject();
+          if (obj.get("type").getAsString().equals("tablet") &&
+              tabletIds.contains(obj.get("id").getAsString())) {
+            value += new Metrics(obj).getCounter(metricName).value;
+          }
+        }
+      } catch (MalformedURLException e) {
+        throw new InternalError(e.getMessage());
+      }
+    }
+    return value;
+  }
+
+  public int getRestartsCount(String tableName) throws Exception {
+    return getTableCounterMetric(DEFAULT_TEST_KEYSPACE, tableName, "restart_read_requests");
+  }
+
+  public int getRetriesCount() throws Exception {
+    int totalSum = 0;
+    for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
+      totalSum += new Metrics(ts.getLocalhostIP(), ts.getCqlWebPort(), "server")
+                  .getHistogram("handler_latency_yb_cqlserver_SQLProcessor_NumRetriesToExecute")
+                  .totalSum;
+    }
+    return totalSum;
+  }
+
 }

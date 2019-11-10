@@ -44,9 +44,6 @@
 #include "yb/server/server_base.h"
 #include "yb/util/flag_tags.h"
 
-DECLARE_bool(use_mock_wall_clock);
-DECLARE_bool(use_hybrid_clock);
-
 using std::string;
 using std::unordered_set;
 
@@ -96,10 +93,15 @@ void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
 
   resp->set_old_value(old_val);
 
+  // The gflags library sets new values of flags without synchronization.
+  // TODO: patch gflags to use proper synchronization.
+  ANNOTATE_IGNORE_WRITES_BEGIN();
   // Try to set the new value.
   string ret = google::SetCommandLineOption(
       req->flag().c_str(),
       req->value().c_str());
+  ANNOTATE_IGNORE_WRITES_END();
+
   if (ret.empty()) {
     resp->set_result(SetFlagResponsePB::BAD_VALUE);
     resp->set_msg("Unable to set flag: bad value");
@@ -111,6 +113,20 @@ void GenericServiceImpl::SetFlag(const SetFlagRequestPB* req,
     resp->set_msg(ret);
   }
 
+  rpc.RespondSuccess();
+}
+
+void GenericServiceImpl::GetFlag(const GetFlagRequestPB* req,
+                                 GetFlagResponsePB* resp,
+                                 rpc::RpcContext rpc) {
+  // Validate that the flag exists and get the current value.
+  string val;
+  if (!google::GetCommandLineOption(req->flag().c_str(), &val)) {
+    resp->set_valid(false);
+    rpc.RespondSuccess();
+    return;
+  }
+  resp->set_value(val);
   rpc.RespondSuccess();
 }
 
@@ -133,26 +149,6 @@ void GenericServiceImpl::ServerClock(const ServerClockRequestPB* req,
                                      ServerClockResponsePB* resp,
                                      rpc::RpcContext rpc) {
   resp->set_hybrid_time(server_->clock()->Now().ToUint64());
-  rpc.RespondSuccess();
-}
-
-void GenericServiceImpl::SetServerWallClockForTests(const SetServerWallClockForTestsRequestPB *req,
-                                                    SetServerWallClockForTestsResponsePB *resp,
-                                                    rpc::RpcContext rpc) {
-  if (!FLAGS_use_hybrid_clock || !FLAGS_use_mock_wall_clock) {
-    LOG(WARNING) << "Error setting wall clock for tests. Server is not using HybridClock"
-        "or was not started with '--use_mock_wall_clock= true'";
-    resp->set_success(false);
-  }
-
-  server::HybridClock* clock = down_cast<server::HybridClock*>(server_->clock());
-  if (req->has_now_usec()) {
-    clock->SetMockClockWallTimeForTests(req->now_usec());
-  }
-  if (req->has_max_error_usec()) {
-    clock->SetMockMaxClockErrorForTests(req->max_error_usec());
-  }
-  resp->set_success(true);
   rpc.RespondSuccess();
 }
 

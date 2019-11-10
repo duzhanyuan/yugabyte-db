@@ -41,7 +41,6 @@
 #include <glog/logging.h>
 
 #include "yb/consensus/opid_util.h"
-#include "yb/consensus/ref_counted_replicate.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
@@ -70,6 +69,16 @@ DEFINE_bool(durable_wal_write, false,
             "Whether the Log/WAL should explicitly call fsync() after each write.");
 TAG_FLAG(durable_wal_write, stable);
 
+DEFINE_int32(interval_durable_wal_write_ms, 1000,
+            "Interval in ms after which the Log/WAL should explicitly call fsync(). "
+            "If 0 fsysnc() is not called.");
+TAG_FLAG(interval_durable_wal_write_ms, stable);
+
+DEFINE_int32(bytes_durable_wal_write_mb, 1,
+             "Amount of data in MB after which the Log/WAL should explicitly call fsync(). "
+             "If 0 fsysnc() is not called.");
+TAG_FLAG(bytes_durable_wal_write_mb, stable);
+
 DEFINE_bool(log_preallocate_segments, true,
             "Whether the WAL should preallocate the entire segment before writing to it");
 TAG_FLAG(log_preallocate_segments, advanced);
@@ -77,6 +86,14 @@ TAG_FLAG(log_preallocate_segments, advanced);
 DEFINE_bool(log_async_preallocate_segments, true,
             "Whether the WAL segments preallocation should happen asynchronously");
 TAG_FLAG(log_async_preallocate_segments, advanced);
+
+DECLARE_string(fs_data_dirs);
+
+DEFINE_bool(require_durable_wal_write, false, "Whether durable WAL write is required."
+    "In case you cannot write using O_DIRECT in WAL and data directories and this flag is set true"
+    "the system will deliberately crash with the appropriate error. If this flag is set false, "
+    "the system will soft downgrade the durable_wal_write flag.");
+TAG_FLAG(require_durable_wal_write, stable);
 
 namespace yb {
 namespace log {
@@ -114,8 +131,13 @@ LogOptions::LogOptions()
     : segment_size_bytes(FLAGS_log_segment_size_bytes == 0 ? FLAGS_log_segment_size_mb * 1_MB
                                                            : FLAGS_log_segment_size_bytes),
       durable_wal_write(FLAGS_durable_wal_write),
+      interval_durable_wal_write(FLAGS_interval_durable_wal_write_ms > 0 ?
+                                     MonoDelta::FromMilliseconds(
+                                         FLAGS_interval_durable_wal_write_ms) : MonoDelta()),
+      bytes_durable_wal_write_mb(FLAGS_bytes_durable_wal_write_mb),
       preallocate_segments(FLAGS_log_preallocate_segments),
-      async_preallocate_segments(FLAGS_log_async_preallocate_segments) {
+      async_preallocate_segments(FLAGS_log_async_preallocate_segments),
+      env(Env::Default()) {
 }
 
 Status ReadableLogSegment::Open(Env* env,
@@ -138,7 +160,9 @@ ReadableLogSegment::ReadableLogSegment(
       readable_to_offset_(0),
       readable_file_(std::move(readable_file)),
       is_initialized_(false),
-      footer_was_rebuilt_(false) {}
+      footer_was_rebuilt_(false) {
+  env_util::OpenFileForRandom(Env::Default(), path_, &readable_file_checkpoint_);
+}
 
 Status ReadableLogSegment::Init(const LogSegmentHeaderPB& header,
                                 const LogSegmentFooterPB& footer,
@@ -209,14 +233,13 @@ Status ReadableLogSegment::RebuildFooterByScanning() {
                "path", path_);
 
   DCHECK(!footer_.IsInitialized());
-  std::vector<std::unique_ptr<LogEntryPB>> entries;
-  int64_t end_offset = 0;
-  RETURN_NOT_OK(ReadEntries(&entries, &end_offset));
+  auto read_entries = ReadEntries();
+  RETURN_NOT_OK(read_entries.status);
 
-  footer_.set_num_entries(entries.size());
+  footer_.set_num_entries(read_entries.entries.size());
 
   // Rebuild the min/max replicate index (by scanning)
-  for (const auto& entry : entries) {
+  for (const auto& entry : read_entries.entries) {
     if (entry->has_replicate()) {
       int64_t index = entry->replicate().id().index();
       // TODO: common code with Log::UpdateFooterForBatch
@@ -232,13 +255,13 @@ Status ReadableLogSegment::RebuildFooterByScanning() {
   }
 
   DCHECK(footer_.IsInitialized());
-  DCHECK_EQ(entries.size(), footer_.num_entries());
+  DCHECK_EQ(read_entries.entries.size(), footer_.num_entries());
   footer_was_rebuilt_ = true;
 
-  readable_to_offset_.Store(end_offset);
+  readable_to_offset_.Store(read_entries.end_offset);
 
   LOG(INFO) << "Successfully rebuilt footer for segment: " << path_
-            << " (valid entries through byte offset " << end_offset << ")";
+            << " (valid entries through byte offset " << read_entries.end_offset << ")";
   return Status::OK();
 }
 
@@ -246,8 +269,7 @@ Status ReadableLogSegment::ReadFileSize() {
   // Check the size of the file.
   // Env uses uint here, even though we generally prefer signed ints to avoid
   // underflow bugs. Use a local to convert.
-  uint64_t size;
-  RETURN_NOT_OK_PREPEND(readable_file_->Size(&size), "Unable to read file size");
+  uint64_t size = VERIFY_RESULT_PREPEND(readable_file_->Size(), "Unable to read file size");
   file_size_.Store(size);
   if (size == 0) {
     VLOG(1) << "Log segment file $0 is zero-length: " << path();
@@ -282,7 +304,7 @@ Status ReadableLogSegment::ReadHeader() {
   // Read and parse the log segment header.
   RETURN_NOT_OK_PREPEND(ReadFully(readable_file_.get(), kLogSegmentHeaderMagicAndHeaderLength,
                                   header_size, &header_slice, header_space.data()),
-                        "Unable to read fully");
+                                      "Unable to read fully");
 
   RETURN_NOT_OK_PREPEND(pb_util::ParseFromArray(&header,
                                                 header_slice.data(),
@@ -315,8 +337,8 @@ bool IsAllZeros(const Slice& s) {
   // Walk a pointer through the slice instead of using s[i]
   // since this is way faster in debug mode builds. We also do some
   // manual unrolling for the same purpose.
-  const uint8_t* p = &s[0];
-  int rem = s.size();
+  const uint8_t* p = s.data();
+  size_t rem = s.size();
 
   while (rem >= 8) {
     if (UNALIGNED_LOAD64(p) != 0) return false;
@@ -428,9 +450,11 @@ Status ReadableLogSegment::ParseFooterMagicAndFooterLength(const Slice &data,
   return Status::OK();
 }
 
-Status ReadableLogSegment::ReadEntries(LogEntries* entries, int64_t* end_offset) {
+ReadEntriesResult ReadableLogSegment::ReadEntries() {
   TRACE_EVENT1("log", "ReadableLogSegment::ReadEntries",
                "path", path_);
+
+  ReadEntriesResult result;
 
   std::vector<int64_t> recent_offsets(4, -1);
   int batches_read = 0;
@@ -448,9 +472,7 @@ Status ReadableLogSegment::ReadEntries(LogEntries* entries, int64_t* end_offset)
       file_size() - footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :
       readable_to_offset;
 
-  if (end_offset != nullptr) {
-    *end_offset = offset;
-  }
+  result.end_offset = offset;
 
   int num_entries_read = 0;
   while (offset < read_up_to) {
@@ -470,20 +492,19 @@ Status ReadableLogSegment::ReadEntries(LogEntries* entries, int64_t* end_offset)
     if (PREDICT_FALSE(!s.ok())) {
       if (!s.IsCorruption()) {
         // IO errors should always propagate back
-        return s.CloneAndPrepend(Substitute("Error reading from log $0", path_));
+        result.status = s.CloneAndPrepend(Substitute("Error reading from log $0", path_));
+        return result;
       }
 
-      Status corruption_status = MakeCorruptionStatus(
-          batches_read, this_batch_offset, &recent_offsets,
-          *entries, s);
+      result.status = MakeCorruptionStatus(
+          batches_read, this_batch_offset, &recent_offsets, result.entries, s);
 
       // If we have a valid footer in the segment, then the segment was correctly
       // closed, and we shouldn't see any corruption anywhere (including the last
       // batch).
       if (HasFooter() && !footer_was_rebuilt_) {
-        LOG(WARNING) << "Found a corruption in a closed log segment: "
-                     << corruption_status.ToString();
-        return corruption_status;
+        LOG(WARNING) << "Found a corruption in a closed log segment: " << result.status;
+        return result;
       }
 
       // If we read a corrupt entry, but we don't have a footer, then it's
@@ -493,42 +514,141 @@ Status ReadableLogSegment::ReadEntries(LogEntries* entries, int64_t* end_offset)
       // if not, we just WARN it, since it's OK for the last entry to be partially
       // written.
       bool has_valid_entries;
-      RETURN_NOT_OK_PREPEND(ScanForValidEntryHeaders(offset, &has_valid_entries),
-                            "Scanning forward for valid entries");
+      auto status = ScanForValidEntryHeaders(offset, &has_valid_entries);
+      if (!status.ok()) {
+        result.status = s.CloneAndPrepend("Scanning forward for valid entries");
+      }
+
       if (has_valid_entries) {
-        return corruption_status;
+        return result;
       }
 
       LOG(INFO) << "Ignoring log segment corruption in " << path_ << " because "
                 << "there are no log entries following the corrupted one. "
                 << "The server probably crashed in the middle of writing an entry "
                 << "to the write-ahead log or downloaded an active log via remote bootstrap. "
-                << "Error detail: " << corruption_status.ToString();
+                << "Error detail: " << result.status.ToString();
       break;
     }
 
     if (VLOG_IS_ON(3)) {
       VLOG(3) << "Read Log entry batch: " << current_batch.DebugString();
     }
+    if (current_batch.has_committed_op_id()) {
+        result.committed_op_id = yb::OpId::FromPB(current_batch.committed_op_id());
+    }
+
     for (size_t i = 0; i < current_batch.entry_size(); ++i) {
-      entries->emplace_back(current_batch.mutable_entry(i));
+      result.entries.emplace_back(current_batch.mutable_entry(i));
+      DCHECK_NE(current_batch.mono_time(), 0);
+      LogEntryMetadata entry_metadata;
+      entry_metadata.offset = this_batch_offset;
+      entry_metadata.active_segment_sequence_number = header().sequence_number();
+      entry_metadata.entry_time = RestartSafeCoarseTimePoint::FromUInt64(current_batch.mono_time());
+      result.entry_metadata.emplace_back(std::move(entry_metadata));
       num_entries_read++;
     }
-    current_batch.mutable_entry()->ExtractSubrange(0,
-                                                   current_batch.entry_size(),
-                                                   nullptr);
-    if (end_offset != nullptr) {
-      *end_offset = offset;
-    }
+    current_batch.mutable_entry()->ExtractSubrange(0, current_batch.entry_size(), nullptr);
+    result.end_offset = offset;
   }
 
   if (footer_.IsInitialized() && footer_.num_entries() != num_entries_read) {
-    return STATUS(Corruption,
-      Substitute("Read $0 log entries from $1, but expected $2 based on the footer",
-                 num_entries_read, path_, footer_.num_entries()));
+    result.status = STATUS_FORMAT(
+        Corruption,
+        "Read $0 log entries from $1, but expected $2 based on the footer",
+        num_entries_read, path_, footer_.num_entries());
   }
 
-  return Status::OK();
+  result.status = Status::OK();
+  return result;
+}
+
+Result<std::pair<OpId, RestartSafeCoarseTimePoint>> ReadableLogSegment::ReadFirstEntryMetadata() {
+  TRACE_EVENT1("log", "ReadableLogSegment::ReadFirstOpId",
+               "path", path_);
+
+  int64_t offset = first_entry_offset();
+  int64_t readable_to_offset = readable_to_offset_.Load();
+  VLOG(1) << "Reading first entry from "
+          << path_ << ": offset=" << offset << " file_size="
+          << file_size() << " readable_to_offset=" << readable_to_offset;
+
+  // If we have a footer we only read up to it. If we don't we likely crashed
+  // and always read to the end.
+  int64_t read_up_to = (footer_.IsInitialized() && !footer_was_rebuilt_) ?
+      file_size() - footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :
+      readable_to_offset;
+
+  const int64_t this_batch_offset = offset;
+  std::vector<int64_t> recent_offsets(offset, -1);
+
+  LogEntryBatchPB current_batch;
+
+  // Read and validate the entry header first.
+  Status s;
+  faststring tmp_buf;
+  if (offset + kEntryHeaderSize < read_up_to) {
+    s = ReadEntryHeaderAndBatch(&offset, &tmp_buf, &current_batch);
+  } else {
+    s = STATUS(Corruption, Substitute("Truncated log entry at offset $0", offset));
+  }
+
+  if (PREDICT_FALSE(!s.ok())) {
+    if (!s.IsCorruption()) {
+      // IO errors should always propagate back
+      return s.CloneAndPrepend(Substitute("Error reading from log $0", path_));
+    }
+
+    LogEntries entries_empty;
+    Status cstatus = MakeCorruptionStatus(
+        0, this_batch_offset, &recent_offsets, entries_empty, s);
+
+    // If we have a valid footer in the segment, then the segment was correctly
+    // closed, and we shouldn't see any corruption anywhere (including the last
+    // batch).
+    if (HasFooter() && !footer_was_rebuilt_) {
+      LOG(WARNING) << "Found a corruption in a closed log segment: " << cstatus;
+      return cstatus;
+    }
+
+    // If we read a corrupt entry, but we don't have a footer, then it's
+    // possible that we crashed in the middle of writing an entry.
+    // In this case, we scan forward to see if there are any more valid looking
+    // entries after this one in the file. If there are, it's really a corruption.
+    // if not, we just WARN it, since it's OK for the last entry to be partially
+    // written.
+    bool has_valid_entries;
+    auto status = ScanForValidEntryHeaders(offset, &has_valid_entries);
+    if (!status.ok()) {
+      cstatus = s.CloneAndPrepend("Scanning forward for valid entries");
+    }
+
+    if (has_valid_entries) {
+      return cstatus;
+    }
+
+    LOG(INFO) << "Ignoring log segment corruption in " << path_ << " because "
+              << "there are no log entries following the corrupted one. "
+              << "The server probably crashed in the middle of writing an entry "
+              << "to the write-ahead log or downloaded an active log via remote bootstrap. "
+              << "Error detail: " << cstatus;
+  }
+
+  if (VLOG_IS_ON(3)) {
+    VLOG(3) << "Read Log entry batch: " << current_batch.DebugString();
+  }
+
+  if (!current_batch.has_committed_op_id()) {
+    return STATUS(NotFound, "Missing committed op ID in batch");
+  }
+  if (!current_batch.has_mono_time()) {
+    return STATUS(NotFound, "Missing mono time in batch");
+  }
+
+  yb::OpId op_id = yb::OpId::FromPB(current_batch.committed_op_id());
+  RestartSafeCoarseTimePoint time =
+          RestartSafeCoarseTimePoint::FromUInt64(current_batch.mono_time());
+  return std::make_pair(op_id, time);
 }
 
 Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries) {
@@ -548,7 +668,11 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
        offset += kChunkSize - kEntryHeaderSize) {
     int rem = std::min<int64_t>(file_size() - offset, kChunkSize);
     Slice chunk;
-    RETURN_NOT_OK(ReadFully(readable_file().get(), offset, rem, &chunk, &buf[0]));
+    // If encryption is enabled, need to use checkpoint file to read pre-allocated file since
+    // we want to preserve all 0s.
+    RETURN_NOT_OK(ReadFully(
+        readable_file_checkpoint().get(), offset + readable_file()->GetEncryptionHeaderSize(), rem,
+        &chunk, &buf[0]));
 
     // Optimization for the case where a chunk is all zeros -- this is common in the
     // case of pre-allocated files. This avoids a lot of redundant CRC calculation.
@@ -556,14 +680,19 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
       continue;
     }
 
+    if (readable_file()->IsEncrypted()) {
+      // If encryption enabled, decrypt the contents of the file.
+      RETURN_NOT_OK(ReadFully(readable_file().get(), offset, rem, &chunk, &buf[0]));
+    }
+
     // Check if this chunk has a valid entry header.
     for (int off_in_chunk = 0;
          off_in_chunk < chunk.size() - kEntryHeaderSize;
          off_in_chunk++) {
-      Slice potential_header = Slice(&chunk[off_in_chunk], kEntryHeaderSize);
+      Slice potential_header = Slice(chunk.data() + off_in_chunk, kEntryHeaderSize);
 
       EntryHeader header;
-      if (DecodeEntryHeader(potential_header, &header)) {
+      if (DecodeEntryHeader(potential_header, &header).ok()) {
         LOG(INFO) << "Found a valid entry header at offset " << (offset + off_in_chunk);
         *has_valid_entries = true;
         return Status::OK();
@@ -602,8 +731,6 @@ Status ReadableLogSegment::MakeCorruptionStatus(
       string opid_str;
       if (type == log::REPLICATE && entry->has_replicate()) {
         opid_str = consensus::OpIdToString(entry->replicate().id());
-      } else if (entry->has_commit() && entry->commit().has_commited_op_id()) {
-        opid_str = consensus::OpIdToString(entry->commit().commited_op_id());
       } else {
         opid_str = "<unknown>";
       }
@@ -630,22 +757,25 @@ Status ReadableLogSegment::ReadEntryHeader(int64_t *offset, EntryHeader* header)
                                   &slice, scratch),
                         "Could not read log entry header");
 
-  if (PREDICT_FALSE(!DecodeEntryHeader(slice, header))) {
-    return STATUS(Corruption, "CRC mismatch in log entry header");
-  }
+  RETURN_NOT_OK(DecodeEntryHeader(slice, header));
   *offset += slice.size();
   return Status::OK();
 }
 
-bool ReadableLogSegment::DecodeEntryHeader(const Slice& data, EntryHeader* header) {
+Status ReadableLogSegment::DecodeEntryHeader(const Slice& data, EntryHeader* header) {
   DCHECK_EQ(kEntryHeaderSize, data.size());
-  header->msg_length = DecodeFixed32(&data[0]);
-  header->msg_crc    = DecodeFixed32(&data[4]);
-  header->header_crc = DecodeFixed32(&data[8]);
+  header->msg_length = DecodeFixed32(data.data());
+  header->msg_crc    = DecodeFixed32(data.data() + 4);
+  header->header_crc = DecodeFixed32(data.data() + 8);
 
   // Verify the header.
-  uint32_t computed_crc = crc::Crc32c(&data[0], 8);
-  return computed_crc == header->header_crc;
+  uint32_t computed_crc = crc::Crc32c(data.data(), 8);
+  if (computed_crc != header->header_crc) {
+    return STATUS_FORMAT(
+        Corruption, "Invalid checksum in log entry head header: found=$0, computed=$1",
+        header->header_crc, computed_crc);
+  }
+  return Status::OK();
 }
 
 
@@ -776,7 +906,7 @@ Status WritableLogSegment::WriteEntryBatch(const Slice& data) {
   InlineEncodeFixed32(&header_buf[0], len);
 
   // Then the CRC of the message.
-  uint32_t msg_crc = crc::Crc32c(&data[0], data.size());
+  uint32_t msg_crc = crc::Crc32c(data.data(), data.size());
   InlineEncodeFixed32(&header_buf[4], msg_crc);
 
   // Then the CRC of the header
@@ -793,17 +923,22 @@ Status WritableLogSegment::WriteEntryBatch(const Slice& data) {
   return Status::OK();
 }
 
-
-void CreateBatchFromAllocatedOperations(const ReplicateMsgs& msgs,
-                                        LogEntryBatchPB* batch) {
-  LogEntryBatchPB entry_batch;
-  entry_batch.mutable_entry()->Reserve(msgs.size());
-  for (const auto& msg : msgs) {
-    LogEntryPB* entry_pb = entry_batch.add_entry();
+// Creates a LogEntryBatchPB from pre-allocated ReplicateMsgs managed using shared pointers. The
+// caller has to ensure these messages are not deleted twice, both by LogEntryBatchPB and by
+// the shared pointers.
+LogEntryBatchPB CreateBatchFromAllocatedOperations(const ReplicateMsgs& msgs) {
+  LogEntryBatchPB result;
+  result.set_mono_time(RestartSafeCoarseMonoClock().Now().ToUInt64());
+  result.mutable_entry()->Reserve(msgs.size());
+  for (const auto& msg_ptr : msgs) {
+    LogEntryPB* entry_pb = result.add_entry();
     entry_pb->set_type(log::REPLICATE);
-    entry_pb->set_allocated_replicate(msg.get());
+    // entry_pb does not actually own the ReplicateMsg object, even though it thinks it does,
+    // because we release it in ~LogEntryBatch. LogEntryBatchPB has a separate vector of shared
+    // pointers to messages.
+    entry_pb->set_allocated_replicate(msg_ptr.get());
   }
-  batch->Swap(&entry_batch);
+  return result;
 }
 
 bool IsLogFileName(const string& fname) {
@@ -827,5 +962,49 @@ bool IsLogFileName(const string& fname) {
   return true;
 }
 
+std::vector<std::string> ParseDirFlags(string flag_dirs, string flag_name) {
+  std::vector<std::string> paths = strings::Split(flag_dirs, ",", strings::SkipEmpty());
+  return paths;
+}
+
+Status CheckPathsAreODirectWritable(const std::vector<std::string> &paths) {
+  Env *def_env = Env::Default();
+  for (const auto &path : paths) {
+    RETURN_NOT_OK(CheckODirectTempFileCreationInDir(def_env, path));
+  }
+  return Status::OK();
+}
+
+Status CheckRelevantPathsAreODirectWritable() {
+  if (!FLAGS_log_dir.empty()) {
+    RETURN_NOT_OK_PREPEND(CheckPathsAreODirectWritable(ParseDirFlags(
+        FLAGS_log_dir, "--log_dir")), "Not all log_dirs are O_DIRECT Writable.");
+  }
+  RETURN_NOT_OK_PREPEND(CheckPathsAreODirectWritable(ParseDirFlags(
+      FLAGS_fs_data_dirs, "--data_dirs")), "Not all fs_data_dirs are O_DIRECT Writable.");
+
+  RETURN_NOT_OK_PREPEND(CheckPathsAreODirectWritable(ParseDirFlags(
+      FLAGS_fs_wal_dirs, "--wal_dirs")), "Not all fs_wal_dirs are O_DIRECT Writable.");
+  return Status::OK();
+}
+
+Status ModifyDurableWriteFlagIfNotODirect() {
+  if (FLAGS_durable_wal_write) {
+    Status s = CheckRelevantPathsAreODirectWritable();
+    if (!s.ok()) {
+      if (FLAGS_require_durable_wal_write) {
+        // Crash with appropriate error.
+        RETURN_NOT_OK_PREPEND(s, "require_durable_wal_write is set true, but O_DIRECT is "
+            "not allowed.")
+      } else {
+        // Report error but do not crash.
+        LOG(ERROR) << "O_DIRECT is not allowed in some of the directories. "
+            "Setting durable wal write flag to false.";
+        FLAGS_durable_wal_write = false;
+      }
+    }
+  }
+  return Status::OK();
+}
 }  // namespace log
 }  // namespace yb

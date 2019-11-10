@@ -40,6 +40,7 @@
 #include "yb/common/key_encoder.h"
 #include "yb/common/partial_row.h"
 #include "yb/common/ql_protocol.pb.h"
+#include "yb/common/pgsql_protocol.pb.h"
 #include "yb/common/row.h"
 #include "yb/common/schema.h"
 #include "yb/gutil/ref_counted.h"
@@ -47,16 +48,15 @@
 
 namespace yb {
 
-class ColumnRangePredicate;
 class ConstContiguousRow;
 class YBPartialRow;
 class PartitionSchemaPB;
 class TypeInfo;
 
 enum YBHashSchema {
-  kKuduHashSchema = 1, // Used only in some tests, should be removed once they are migrated to YbQL.
-  kMultiColumnHash = 2, // YbQL default hashing.
-  kRedisHash = 3 // Redis default hashing.
+  kMultiColumnHash = 1, // YQL default hashing.
+  kRedisHash = 2, // Redis default hashing.
+  kPgsqlHash = 3 // PGSQL default hashing.
 };
 
 // A Partition describes the set of rows that a Tablet is responsible for
@@ -88,6 +88,14 @@ class Partition {
     return partition_key_end_;
   }
 
+  void TEST_set_partition_key_start(const std::string& partition_key_start) {
+    partition_key_start_ = partition_key_start;
+  }
+
+  void TEST_set_partition_key_end(const std::string& partition_key_end) {
+    partition_key_end_ = partition_key_end;
+  }
+
   // Serializes a partition into a protobuf message.
   void ToPB(PartitionPB* pb) const;
 
@@ -97,7 +105,7 @@ class Partition {
   // to be created by the master process.
   static void FromPB(const PartitionPB& pb, Partition* partition);
 
-  bool ConstainsKey(const std::string& partition_key) const {
+  bool ContainsKey(const std::string& partition_key) const {
     return partition_key >= partition_key_start() &&
         (partition_key_end().empty() || partition_key < partition_key_end());
   }
@@ -153,11 +161,12 @@ class PartitionSchema {
  public:
 
   static constexpr int32_t kPartitionKeySize = 2;
+  static constexpr int32_t kMaxPartitionKey = std::numeric_limits<uint16_t>::max();
 
   // Deserializes a protobuf message into a partition schema.
   static CHECKED_STATUS FromPB(const PartitionSchemaPB& pb,
-                       const Schema& schema,
-                       PartitionSchema* partition_schema) WARN_UNUSED_RESULT;
+                               const Schema& schema,
+                               PartitionSchema* partition_schema) WARN_UNUSED_RESULT;
 
   // Serializes a partition schema into a protobuf message.
   void ToPB(PartitionSchemaPB* pb) const;
@@ -172,7 +181,10 @@ class PartitionSchema {
   CHECKED_STATUS EncodeKey(const google::protobuf::RepeatedPtrField<QLExpressionPB>& hash_values,
                            std::string* buf) const WARN_UNUSED_RESULT;
 
-      // Appends the row's encoded partition key into the provided buffer.
+  CHECKED_STATUS EncodeKey(const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>& hash_values,
+                           std::string* buf) const WARN_UNUSED_RESULT;
+
+  // Appends the row's encoded partition key into the provided buffer.
   // On failure, the buffer may have data partially appended.
   CHECKED_STATUS EncodeKey(const YBPartialRow& row, std::string* buf) const WARN_UNUSED_RESULT;
 
@@ -183,13 +195,17 @@ class PartitionSchema {
 
   // Creates the set of table partitions using multi column hash schema. In this schema, we divide
   // the [0, max_partition_key] range equally into the requested number of intervals.
-  CHECKED_STATUS CreatePartitions(
-      int32_t num_tablets,
-      std::vector<Partition>* partitions,
-      int32_t max_partition_key = std::numeric_limits<uint16_t>::max()) const WARN_UNUSED_RESULT;
+  CHECKED_STATUS CreatePartitions(int32_t num_tablets,
+                                  std::vector<Partition>* partitions,
+                                  int32_t max_partition_key = kMaxPartitionKey) const;
+
+  bool IsHashPartitioning() const {
+    return hash_schema_ != boost::none;
+  }
 
   YBHashSchema hash_schema() const {
-    return hash_schema_;
+    CHECK(hash_schema_);
+    return *hash_schema_;
   }
 
   // Encodes the given uint16 value into a 2 byte string.
@@ -205,18 +221,18 @@ class PartitionSchema {
   // buckets for each hash bucket component, multiplied by
   // (split_rows.size() + 1).
   CHECKED_STATUS CreatePartitions(const std::vector<YBPartialRow>& split_rows,
-                          const Schema& schema,
-                          std::vector<Partition>* partitions) const WARN_UNUSED_RESULT;
+                                  const Schema& schema,
+                                  std::vector<Partition>* partitions) const WARN_UNUSED_RESULT;
 
   // Tests if the partition contains the row.
   CHECKED_STATUS PartitionContainsRow(const Partition& partition,
-                              const YBPartialRow& row,
-                              bool* contains) const WARN_UNUSED_RESULT;
+                                      const YBPartialRow& row,
+                                      bool* contains) const WARN_UNUSED_RESULT;
 
   // Tests if the partition contains the row.
   CHECKED_STATUS PartitionContainsRow(const Partition& partition,
-                              const ConstContiguousRow& row,
-                              bool* contains) const WARN_UNUSED_RESULT;
+                                      const ConstContiguousRow& row,
+                                      bool* contains) const WARN_UNUSED_RESULT;
 
   // Returns a text description of the partition suitable for debug printing.
   std::string PartitionDebugString(const Partition& partition, const Schema& schema) const;
@@ -254,13 +270,13 @@ class PartitionSchema {
 
   // Encodes the specified columns of a row into lexicographic sort-order preserving format.
   static CHECKED_STATUS EncodeColumns(const YBPartialRow& row,
-                              const std::vector<ColumnId>& column_ids,
-                              std::string* buf);
+                                      const std::vector<ColumnId>& column_ids,
+                                      std::string* buf);
 
   // Encodes the specified columns of a row into lexicographic sort-order preserving format.
   static CHECKED_STATUS EncodeColumns(const ConstContiguousRow& row,
-                              const std::vector<ColumnId>& column_ids,
-                              std::string* buf);
+                                      const std::vector<ColumnId>& column_ids,
+                                      std::string* buf);
 
   // Hashes a compound string of all columns into a 16-bit integer.
   static uint16_t HashColumnCompoundValue(const string& compound);
@@ -276,14 +292,14 @@ class PartitionSchema {
   // Assigns the row to a hash bucket according to the hash schema.
   template<typename Row>
   static CHECKED_STATUS BucketForRow(const Row& row,
-                             const HashBucketSchema& hash_bucket_schema,
-                             int32_t* bucket);
+                                     const HashBucketSchema& hash_bucket_schema,
+                                     int32_t* bucket);
 
   // Private templated helper for PartitionContainsRow.
   template<typename Row>
   CHECKED_STATUS PartitionContainsRowImpl(const Partition& partition,
-                                  const Row& row,
-                                  bool* contains) const;
+                                          const Row& row,
+                                          bool* contains) const;
 
   // Appends the stringified range partition components of a partial row to a
   // vector.
@@ -291,7 +307,7 @@ class PartitionSchema {
   // If any columns of the range partition do not exist in the partial row,
   // processing stops and the provided default string piece is appended to the vector.
   void AppendRangeDebugStringComponentsOrString(const YBPartialRow& row,
-                                                StringPiece default_string,
+                                                GStringPiece default_string,
                                                 std::vector<std::string>* components) const;
 
   // Appends the stringified range partition components of a partial row to a
@@ -305,8 +321,8 @@ class PartitionSchema {
   // Decodes a range partition key into a partial row, with variable-length
   // fields stored in the arena.
   CHECKED_STATUS DecodeRangeKey(Slice* encode_key,
-                        YBPartialRow* partial_row,
-                        Arena* arena) const;
+                                YBPartialRow* partial_row,
+                                Arena* arena) const;
 
   // Decodes the hash bucket component of a partition key into its buckets.
   //
@@ -323,7 +339,7 @@ class PartitionSchema {
 
   std::vector<HashBucketSchema> hash_bucket_schemas_;
   RangeSchema range_schema_;
-  YBHashSchema hash_schema_ = YBHashSchema::kKuduHashSchema;
+  boost::optional<YBHashSchema> hash_schema_; // Defined only for table that is hash-partitioned.
 };
 
 } // namespace yb

@@ -77,35 +77,55 @@ ADD_YB_LIBRARY(ql_protocol_proto
   DEPS ${QL_PROTOCOL_PROTO_LIBS}
   NONLINK_DEPS ${QL_PROTOCOL_PROTO_TGTS})
 
+PROTOBUF_GENERATE_CPP(PGSQL_PROTOCOL_PROTO_SRCS
+                      PGSQL_PROTOCOL_PROTO_HDRS
+                      PGSQL_PROTOCOL_PROTO_TGTS
+                      SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+                      BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+                      PROTO_FILES pgsql_protocol.proto)
+set(PGSQL_PROTOCOL_PROTO_LIBS
+    yb_common_proto
+    ql_protocol_proto
+    protobuf)
+ADD_YB_LIBRARY(pgsql_protocol_proto
+               SRCS ${PGSQL_PROTOCOL_PROTO_SRCS}
+               DEPS ${PGSQL_PROTOCOL_PROTO_LIBS}
+               NONLINK_DEPS ${PGSQL_PROTOCOL_PROTO_TGTS})
+
 set(COMMON_SRCS
-  encoded_key.cc
-  generic_iterators.cc
   id_mapping.cc
-  iterator_stats.cc
+  entity_ids.cc
   key_encoder.cc
   partial_row.cc
   partition.cc
-  predicate_encoder.cc
-  rowblock.cc
-  row_changelist.cc
   row_key-util.cc
-  row_operations.cc
-  scan_predicate.cc
-  scan_spec.cc
   schema.cc
+  index.cc
+  jsonb.cc
+  json_util.cc
   hybrid_time.cc
   doc_hybrid_time.cc
+  consistent_read_point.cc
   transaction.cc
   types.cc
   wire_protocol.cc
-  yql_expression.cc
+  ql_bfunc.cc
+  ql_datatype.cc
+  ql_name.cc
   ql_type.cc
   ql_value.cc
-  ql_bfunc.cc
+  ql_protocol_util.cc
   ql_scanspec.cc
   ql_rowblock.cc
   ql_resultset.cc
-  ql_expr.cc)
+  ql_expr.cc
+  common_flags.cc
+  pgsql_error.cc
+  pgsql_resultset.cc
+  roles_permissions.cc
+  ybc_util.cc
+  ybc-internal.cc
+  )
 
 # Workaround for clang bug https://llvm.org/bugs/show_bug.cgi?id=23757
 # in which it incorrectly optimizes row_key-util.cc and causes incorrect results.
@@ -119,26 +139,36 @@ set(COMMON_LIBS
   wire_protocol_proto
   redis_protocol_proto
   ql_protocol_proto
+  pgsql_protocol_proto
   yb_util
   yb_bfql
+  yb_bfpg
   gutil)
+
+if (NOT APPLE)
+  if (USING_LINUXREW)
+    list(APPEND COMMON_LIBS libuuid)
+  else()
+    list(APPEND COMMON_LIBS uuid)
+  endif()
+endif()
 
 ADD_YB_LIBRARY(yb_common
   SRCS ${COMMON_SRCS}
   DEPS ${COMMON_LIBS})
-add_dependencies(yb_common yb_bfql)
+add_dependencies(yb_common yb_bfql yb_bfpg)
+
+add_library(yb_common_test_util
+            transaction-test-util.cc)
+target_link_libraries(yb_common_test_util
+                      yb_common)
 
 set(YB_TEST_LINK_LIBS yb_common ${YB_MIN_TEST_LIBS})
-ADD_YB_TEST(encoded_key-test)
-ADD_YB_TEST(generic_iterators-test)
 ADD_YB_TEST(id_mapping-test)
+ADD_YB_TEST(jsonb-test)
 ADD_YB_TEST(partial_row-test)
 ADD_YB_TEST(partition-test)
-ADD_YB_TEST(predicate-test)
-ADD_YB_TEST(predicate_encoder-test)
-ADD_YB_TEST(row_changelist-test)
 ADD_YB_TEST(row_key-util-test)
-ADD_YB_TEST(row_operations-test)
 ADD_YB_TEST(schema-test)
 ADD_YB_TEST(types-test)
 ADD_YB_TEST(wire_protocol-test)

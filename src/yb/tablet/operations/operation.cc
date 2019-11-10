@@ -32,31 +32,71 @@
 
 #include "yb/tablet/operations/operation.h"
 
+#include "yb/consensus/consensus.h"
+
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+
+#include "yb/util/size_literals.h"
+
 namespace yb {
 namespace tablet {
 
 using consensus::DriverType;
 
 Operation::Operation(std::unique_ptr<OperationState> state,
-                     DriverType type,
                      OperationType operation_type)
     : state_(std::move(state)),
-      type_(type),
       operation_type_(operation_type) {
 }
 
-OperationState::OperationState(TabletPeer* tablet_peer)
-    : tablet_peer_(tablet_peer),
-      completion_clbk_(new OperationCompletionCallback()),
-      hybrid_time_error_(0),
-      external_consistency_mode_(CLIENT_PROPAGATED) {
+void Operation::Start() {
+  DoStart();
+}
+
+std::string Operation::LogPrefix() const {
+  return Format("T $0 $1: ", state()->tablet()->tablet_id(), this);
+}
+
+Status Operation::Replicated(int64_t leader_term) {
+  Status complete_status = Status::OK();
+  RETURN_NOT_OK(DoReplicated(leader_term, &complete_status));
+  state()->CompleteWithStatus(complete_status);
+  return Status::OK();
+}
+
+void Operation::Aborted(const Status& status) {
+  state()->CompleteWithStatus(DoAborted(status));
+}
+
+void OperationState::CompleteWithStatus(const Status& status) const {
+  if (completion_clbk_) {
+    completion_clbk_->CompleteWithStatus(status);
+  }
+}
+
+void OperationState::SetError(const Status& status, tserver::TabletServerErrorPB::Code code) const {
+  if (completion_clbk_) {
+    completion_clbk_->set_error(status, code);
+  }
+}
+
+OperationState::OperationState(Tablet* tablet)
+    : tablet_(tablet) {
 }
 
 Arena* OperationState::arena() {
   if (!arena_) {
-    arena_.emplace(32 * 1024, 4 * 1024 * 1024);
+    arena_.emplace(32_KB, 4_MB);
   }
   return arena_.get_ptr();
+}
+
+void OperationState::set_consensus_round(
+    const scoped_refptr<consensus::ConsensusRound>& consensus_round) {
+  consensus_round_ = consensus_round;
+  op_id_ = consensus_round_->id();
+  UpdateRequestFromConsensusRound();
 }
 
 OperationState::~OperationState() {
@@ -64,9 +104,20 @@ OperationState::~OperationState() {
 
 void OperationState::set_hybrid_time(const HybridTime& hybrid_time) {
   // make sure we set the hybrid_time only once
-  std::lock_guard<simple_spinlock> l(txn_state_lock_);
-  DCHECK_EQ(hybrid_time_, HybridTime::kInvalidHybridTime);
+  std::lock_guard<simple_spinlock> l(mutex_);
+  DCHECK(!hybrid_time_.is_valid());
   hybrid_time_ = hybrid_time;
+}
+
+void OperationState::TrySetHybridTimeFromClock() {
+  std::lock_guard<simple_spinlock> l(mutex_);
+  if (!hybrid_time_.is_valid()) {
+    hybrid_time_ = tablet_->clock()->Now();
+  }
+}
+
+std::string OperationState::LogPrefix() const {
+  return Format("$0: ", this);
 }
 
 OperationCompletionCallback::OperationCompletionCallback()
@@ -80,6 +131,8 @@ void OperationCompletionCallback::set_error(const Status& status,
 }
 
 void OperationCompletionCallback::set_error(const Status& status) {
+  LOG_IF(DFATAL, !status_.ok()) << "OperationCompletionCallback changing from failure status: "
+                                << status_ << " => " << status;
   status_ = status;
 }
 
@@ -95,24 +148,7 @@ const tserver::TabletServerErrorPB::Code OperationCompletionCallback::error_code
   return code_;
 }
 
-void OperationCompletionCallback::OperationCompleted() {}
-
 OperationCompletionCallback::~OperationCompletionCallback() {}
-
-OperationMetrics::OperationMetrics()
-  : successful_inserts(0),
-    successful_updates(0),
-    successful_deletes(0),
-    commit_wait_duration_usec(0) {
-}
-
-void OperationMetrics::Reset() {
-  successful_inserts = 0;
-  successful_updates = 0;
-  successful_deletes = 0;
-  commit_wait_duration_usec = 0;
-}
-
 
 }  // namespace tablet
 }  // namespace yb

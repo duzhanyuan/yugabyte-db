@@ -36,12 +36,17 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/rpc/messenger.h"
+
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
 
 DEFINE_bool(checksum_cache_blocks, false, "Should the checksum scanners cache the read blocks");
 DEFINE_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
 DEFINE_int64(tablets_batch_size_max, 100, "How many tablets to get from the Master per RPC");
+DECLARE_int64(outbound_rpc_block_size);
+DECLARE_int64(outbound_rpc_memory_limit);
 
 namespace yb {
 namespace tools {
@@ -112,20 +117,13 @@ class ChecksumStepper {
         server_uuid_(std::move(server_uuid)),
         options_(std::move(options)),
         reporter_callback_(std::move(callback)),
-        proxy_(std::move(proxy)),
-        call_seq_id_(0),
-        checksum_(0) {
+        proxy_(std::move(proxy)) {
     DCHECK(proxy_);
   }
 
   void Start() {
-    Status s = SchemaToColumnPBs(schema_, &cols_,
-                                 SCHEMA_PB_WITHOUT_IDS | SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES);
-    if (!s.ok()) {
-      reporter_callback_.Run(s, 0);
-    } else {
-      SendRequest(kNewRequest);
-    }
+    SchemaToColumnPBs(schema_, &cols_, SCHEMA_PB_WITHOUT_IDS);
+    SendRequest();
   }
 
   void HandleResponse() {
@@ -140,58 +138,16 @@ class ChecksumStepper {
     }
 
     DCHECK(resp_.has_checksum());
-    checksum_ = resp_.checksum();
 
-    // Report back with results.
-    if (!resp_.has_more_results()) {
-      reporter_callback_.Run(s, checksum_);
-      return; // Deletes 'this'.
-    }
-
-    // We're not done scanning yet. Fetch the next chunk.
-    if (resp_.has_scanner_id()) {
-      scanner_id_ = resp_.scanner_id();
-    }
-    SendRequest(kContinueRequest);
-    ignore_result(deleter.release()); // We have more work to do.
+    reporter_callback_.Run(s, resp_.checksum());
   }
 
  private:
-  enum RequestType {
-    kNewRequest,
-    kContinueRequest
-  };
-
-  void SendRequest(RequestType type) {
-    switch (type) {
-      case kNewRequest: {
-        req_.set_call_seq_id(call_seq_id_);
-        req_.mutable_new_request()->mutable_projected_columns()->CopyFrom(cols_);
-        req_.mutable_new_request()->set_tablet_id(tablet_id_);
-        req_.mutable_new_request()->set_cache_blocks(FLAGS_checksum_cache_blocks);
-        if (options_.use_snapshot) {
-          req_.mutable_new_request()->set_read_mode(READ_AT_SNAPSHOT);
-          req_.mutable_new_request()->set_snap_hybrid_time(options_.snapshot_hybrid_time);
-        }
-        rpc_.set_timeout(GetDefaultTimeout());
-        break;
-      }
-      case kContinueRequest: {
-        req_.Clear();
-        resp_.Clear();
-        rpc_.Reset();
-
-        req_.set_call_seq_id(++call_seq_id_);
-        DCHECK(!scanner_id_.empty());
-        req_.mutable_continue_request()->set_scanner_id(scanner_id_);
-        req_.mutable_continue_request()->set_previous_checksum(checksum_);
-        break;
-      }
-      default:
-        LOG(FATAL) << "Unknown type";
-        break;
-    }
-    gscoped_ptr<ChecksumCallbackHandler> handler(new ChecksumCallbackHandler(this));
+  void SendRequest() {
+    req_.set_tablet_id(tablet_id_);
+    req_.set_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
+    rpc_.set_timeout(GetDefaultTimeout());
+    auto handler = std::make_unique<ChecksumCallbackHandler>(this);
     rpc::ResponseCallback cb = std::bind(&ChecksumCallbackHandler::Run, handler.get());
     proxy_->ChecksumAsync(req_, &resp_, &rpc_, cb);
     ignore_result(handler.release());
@@ -206,9 +162,6 @@ class ChecksumStepper {
   const ReportResultCallback reporter_callback_;
   const shared_ptr<tserver::TabletServerServiceProxy> proxy_;
 
-  uint32_t call_seq_id_;
-  string scanner_id_;
-  uint64_t checksum_;
   tserver::ChecksumRequestPB req_;
   tserver::ChecksumResponsePB resp_;
   RpcController rpc_;
@@ -238,11 +191,11 @@ Status RemoteYsckMaster::Connect() const {
   return generic_proxy_->Ping(req, &resp, &rpc);
 }
 
-Status RemoteYsckMaster::Build(const Endpoint& address, shared_ptr<YsckMaster>* master) {
+Status RemoteYsckMaster::Build(const HostPort& address, shared_ptr<YsckMaster>* master) {
   MessengerBuilder builder(kMessengerName);
-  auto messenger = builder.Build();
-  RETURN_NOT_OK(messenger);
-  master->reset(new RemoteYsckMaster(address, *messenger));
+  auto messenger = VERIFY_RESULT(builder.Build());
+  messenger->TEST_SetOutboundIpBase(VERIFY_RESULT(HostToAddress("127.0.0.1")));;
+  master->reset(new RemoteYsckMaster(address, std::move(messenger)));
   return Status::OK();
 }
 
@@ -255,12 +208,9 @@ Status RemoteYsckMaster::RetrieveTabletServers(TSMap* tablet_servers) {
   RETURN_NOT_OK(proxy_->ListTabletServers(req, &resp, &rpc));
   tablet_servers->clear();
   for (const master::ListTabletServersResponsePB_Entry& e : resp.servers()) {
-    HostPortPB addr = e.registration().common().rpc_addresses(0);
-    std::vector<Endpoint> addresses;
-    RETURN_NOT_OK(ParseAddressList(HostPort(addr.host(), addr.port()).ToString(),
-                                   tserver::TabletServer::kDefaultPort, &addresses));
-    shared_ptr<YsckTabletServer> ts(
-        new RemoteYsckTabletServer(e.instance_id().permanent_uuid(), addresses[0], messenger_));
+    const HostPortPB& addr = DesiredHostPort(e.registration().common(), CloudInfoPB());
+    shared_ptr<YsckTabletServer> ts(new RemoteYsckTabletServer(
+        e.instance_id().permanent_uuid(), HostPortFromPB(addr), proxy_cache_.get()));
     InsertOrDie(tablet_servers, ts->uuid(), ts);
   }
   return Status::OK();
@@ -280,15 +230,21 @@ Status RemoteYsckMaster::RetrieveTablesList(vector<shared_ptr<YsckTable> >* tabl
   for (const master::ListTablesResponsePB_TableInfo& info : resp.tables()) {
     Schema schema;
     int num_replicas = 0;
-    DCHECK(info.has_namespace_());
-    DCHECK(info.namespace_().has_name());
+    CHECK(info.has_namespace_());
+    CHECK(info.namespace_().has_name());
     YBTableName name(info.namespace_().name(), info.name());
-    RETURN_NOT_OK(GetTableInfo(name, &schema, &num_replicas));
-    LOG(INFO) << __func__ << ": name=" << name.ToString() << ", num_replicas=" << num_replicas;
-    shared_ptr<YsckTable> table(new YsckTable(name, schema, num_replicas, info.table_type()));
+    bool is_pg_table = false;
+    RETURN_NOT_OK(GetTableInfo(info.id(), &schema, &num_replicas, &is_pg_table));
+    if (is_pg_table) {
+      // Skip PostgreSQL tables in ysck for now. If we enable this, we'll have to fix lots of unit
+      // tests that expect a certain number of system tables.
+      continue;
+    }
+    auto table = std::make_shared<YsckTable>(
+        info.id(), name, schema, num_replicas, info.table_type());
     tables_temp.push_back(table);
   }
-  tables->assign(tables_temp.begin(), tables_temp.end());
+  *tables = std::move(tables_temp);
   return Status::OK();
 }
 
@@ -297,22 +253,24 @@ Status RemoteYsckMaster::RetrieveTabletsList(const shared_ptr<YsckTable>& table)
   bool more_tablets = true;
   string last_key;
   while (more_tablets) {
-    RETURN_NOT_OK(GetTabletsBatch(table->name(), &last_key, &tablets, &more_tablets));
+    RETURN_NOT_OK(GetTabletsBatch(table->id(), table->name(), &last_key, &tablets, &more_tablets));
   }
 
   table->set_tablets(tablets);
   return Status::OK();
 }
 
-Status RemoteYsckMaster::GetTabletsBatch(const YBTableName& table_name,
-                                         string* last_partition_key,
-                                         vector<shared_ptr<YsckTablet> >* tablets,
-                                         bool* more_tablets) {
+Status RemoteYsckMaster::GetTabletsBatch(
+    const TableId& table_id,
+    const YBTableName& table_name,
+    string* last_partition_key,
+    vector<shared_ptr<YsckTablet> >* tablets,
+    bool* more_tablets) {
   master::GetTableLocationsRequestPB req;
   master::GetTableLocationsResponsePB resp;
   RpcController rpc;
 
-  table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  req.mutable_table()->set_table_id(table_id);
   req.set_max_returned_locations(FLAGS_tablets_batch_size_max);
   req.set_partition_key_start(*last_partition_key);
 
@@ -333,9 +291,10 @@ Status RemoteYsckMaster::GetTabletsBatch(const YBTableName& table_name,
   if (resp.tablet_locations_size() != 0) {
     *last_partition_key = (resp.tablet_locations().end() - 1)->partition().partition_key_end();
   } else {
-    return STATUS(NotFound, Substitute(
-      "The Master returned 0 tablets for GetTableLocations of table $0 at start key $1",
-      table_name.ToString(), *(last_partition_key)));
+    return STATUS_FORMAT(
+        NotFound,
+        "The Master returned 0 tablets for GetTableLocations of table $0 at start key $1",
+        table_name.ToString(), *(last_partition_key));
   }
   if (last_partition_key->empty()) {
     *more_tablets = false;
@@ -343,21 +302,38 @@ Status RemoteYsckMaster::GetTabletsBatch(const YBTableName& table_name,
   return Status::OK();
 }
 
-Status RemoteYsckMaster::GetTableInfo(const YBTableName& table_name,
+Status RemoteYsckMaster::GetTableInfo(const TableId& table_id,
                                       Schema* schema,
-                                      int* num_replicas) {
+                                      int* num_replicas,
+                                      bool* is_pg_table) {
   master::GetTableSchemaRequestPB req;
   master::GetTableSchemaResponsePB resp;
   RpcController rpc;
 
-  table_name.SetIntoTableIdentifierPB(req.mutable_table());
+  req.mutable_table()->set_table_id(table_id);
 
   rpc.set_timeout(GetDefaultTimeout());
   RETURN_NOT_OK(proxy_->GetTableSchema(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
 
   RETURN_NOT_OK(SchemaFromPB(resp.schema(), schema));
   *num_replicas = resp.replication_info().live_replicas().num_replicas();
+
+  *is_pg_table = resp.table_type() == yb::TableType::PGSQL_TABLE_TYPE;
   return Status::OK();
+}
+
+RemoteYsckMaster::RemoteYsckMaster(
+    const HostPort& address, std::unique_ptr<rpc::Messenger>&& messenger)
+    : messenger_(std::move(messenger)),
+      proxy_cache_(new rpc::ProxyCache(messenger_.get())),
+      generic_proxy_(new server::GenericServiceProxy(proxy_cache_.get(), address)),
+      proxy_(new master::MasterServiceProxy(proxy_cache_.get(), address)) {}
+
+RemoteYsckMaster::~RemoteYsckMaster() {
+  messenger_->Shutdown();
 }
 
 } // namespace tools

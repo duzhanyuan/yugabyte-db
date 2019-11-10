@@ -32,13 +32,20 @@
 #ifndef YB_UTIL_VERSION_INFO_H
 #define YB_UTIL_VERSION_INFO_H
 
+#include <atomic>
+#include <mutex>
 #include <string>
 
 #include "yb/gutil/macros.h"
+#include "yb/util/status.h"
+#include "yb/util/version_info.pb.h"
 
 namespace yb {
 
-class VersionInfoPB;
+struct VersionData {
+  VersionInfoPB pb;
+  string json;
+};
 
 // Static functions related to fetching information about the current build.
 class VersionInfo {
@@ -49,12 +56,30 @@ class VersionInfo {
   // Get a multi-line string including version info, build time, etc.
   static std::string GetAllVersionInfo();
 
+  // Get a json object string including version info, build time, etc.
+  static std::string GetAllVersionInfoJson();
+
   // Set the version info in 'pb'.
   static void GetVersionInfoPB(VersionInfoPB* pb);
+
+  // Init version data.
+  static CHECKED_STATUS Init();
+
  private:
   // Get the git hash for this build. If the working directory was dirty when
   // YB was built, also appends "-dirty".
   static std::string GetGitHash();
+
+  static std::shared_ptr<const VersionData> GetVersionData();
+  static CHECKED_STATUS ReadVersionDataFromFile();
+
+  // Performs the initialization and stores its status into the given variable.
+  static void InitInternal(Status* status);
+
+  // Use this for lazy initialization.
+  static std::once_flag init_once_;
+
+  static std::shared_ptr<const VersionData> version_data_;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(VersionInfo);
 };

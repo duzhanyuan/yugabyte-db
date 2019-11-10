@@ -37,6 +37,10 @@
 
 #include "yb/client/client.h"
 #include "yb/client/client-internal.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/table_handle.h"
+
 #include "yb/common/schema.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
@@ -44,6 +48,8 @@
 #include "yb/util/net/net_util.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_util.h"
+
+using namespace std::literals;
 
 namespace yb {
 
@@ -57,7 +63,6 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 using client::YBTableName;
-using client::YBTableType;
 
 class MasterFailoverTest : public YBTest {
  public:
@@ -75,9 +80,6 @@ class MasterFailoverTest : public YBTest {
     // leader master failures (specifically, failures as result of
     // long pauses) more rapid.
 
-    // Set max missed heartbeats periods to 1.0 (down from 3.0).
-    opts_.extra_master_flags.push_back("--leader_failure_max_missed_heartbeat_periods=1.0");
-
     // Set the TS->master heartbeat timeout to 1 second (down from 15 seconds).
     opts_.extra_tserver_flags.push_back("--heartbeat_rpc_timeout_ms=1000");
     // Allow one TS heartbeat failure before retrying with back-off (down from 3).
@@ -93,6 +95,7 @@ class MasterFailoverTest : public YBTest {
   }
 
   void TearDown() override {
+    client_.reset();
     if (cluster_) {
       cluster_->Shutdown();
     }
@@ -106,8 +109,7 @@ class MasterFailoverTest : public YBTest {
     }
     cluster_.reset(new ExternalMiniCluster(opts_));
     ASSERT_OK(cluster_->Start());
-    YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
   }
 
   Status CreateTable(const YBTableName& table_name, CreateTableMode mode) {
@@ -140,14 +142,15 @@ class MasterFailoverTest : public YBTest {
   // requires that the table and tablet exist both on the masters and
   // the tablet servers.
   Status OpenTableAndScanner(const YBTableName& table_name) {
-    shared_ptr<YBTable> table;
-    RETURN_NOT_OK_PREPEND(client_->OpenTable(table_name, &table),
+    client::TableHandle table;
+    RETURN_NOT_OK_PREPEND(table.Open(table_name, client_.get()),
                           "Unable to open table " + table_name.ToString());
-    YBScanner scanner(table.get());
-    RETURN_NOT_OK_PREPEND(scanner.SetProjectedColumns(vector<string>()),
-                          "Unable to open an empty projection on " + table_name.ToString());
-    RETURN_NOT_OK_PREPEND(scanner.Open(),
-                          "Unable to open scanner on " + table_name.ToString());
+    client::TableRange range(table);
+    auto it = range.begin();
+    if (it != range.end()) {
+      ++it;
+    }
+
     return Status::OK();
   }
 
@@ -155,7 +158,7 @@ class MasterFailoverTest : public YBTest {
   int num_masters_;
   ExternalMiniClusterOptions opts_;
   gscoped_ptr<ExternalMiniCluster> cluster_;
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
 };
 
 // Test that synchronous CreateTable (issue CreateTable call and then
@@ -207,9 +210,9 @@ TEST_F(MasterFailoverTest, DISABLED_TestPauseAfterCreateTableIssued) {
   ASSERT_OK(cluster_->master(leader_idx)->Pause());
   ScopedResumeExternalDaemon resume_daemon(cluster_->master(leader_idx));
 
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromSeconds(90));
-  ASSERT_OK(client_->data_->WaitForCreateTableToFinish(client_.get(), table_name, deadline));
+  auto deadline = CoarseMonoClock::Now() + 90s;
+  ASSERT_OK(client_->data_->WaitForCreateTableToFinish(client_.get(), table_name, "" /* table_id */,
+                                                       deadline));
 
   ASSERT_OK(OpenTableAndScanner(table_name));
 }

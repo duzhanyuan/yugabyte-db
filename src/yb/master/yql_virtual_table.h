@@ -25,34 +25,58 @@ namespace yb {
 namespace master {
 
 // A YQL virtual table which is based on in memory data.
-class YQLVirtualTable : public common::QLStorageIf {
+class YQLVirtualTable : public common::YQLStorageIf {
  public:
   explicit YQLVirtualTable(const TableName& table_name,
                            const Master* const master,
                            const Schema& schema);
 
+  // Access methods.
+  const Schema& schema() const { return schema_; }
+
+  const TableName& table_name() const { return table_name_; }
+
+  //------------------------------------------------------------------------------------------------
+  // CQL Support.
+  //------------------------------------------------------------------------------------------------
+
   // Retrieves all the data for the yql virtual table in form of a QLRowBlock. This data is then
   // used by the iterator.
-  virtual CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                                      std::unique_ptr<QLRowBlock>* vtable) const = 0;
+  virtual Result<std::shared_ptr<QLRowBlock>> RetrieveData(
+      const QLReadRequestPB& request) const = 0;
 
   CHECKED_STATUS GetIterator(const QLReadRequestPB& request,
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,
-                             HybridTime req_hybrid_time,
-                             std::unique_ptr<common::QLRowwiseIteratorIf>* iter) const override;
-  CHECKED_STATUS BuildQLScanSpec(const QLReadRequestPB& request,
-                                  const HybridTime& hybrid_time,
-                                  const Schema& schema,
-                                  bool include_static_columns,
-                                  const Schema& static_projection,
-                                  std::unique_ptr<common::QLScanSpec>* spec,
-                                  std::unique_ptr<common::QLScanSpec>* static_row_spec,
-                                  HybridTime* req_hybrid_time) const override;
-  const Schema& schema() const { return schema_; }
+                             CoarseTimePoint deadline,
+                             const ReadHybridTime& read_time,
+                             const common::QLScanSpec& spec,
+                             std::unique_ptr<common::YQLRowwiseIteratorIf>* iter) const override;
 
-  const TableName& table_name() const { return table_name_; }
+  CHECKED_STATUS BuildYQLScanSpec(
+      const QLReadRequestPB& request,
+      const ReadHybridTime& read_time,
+      const Schema& schema,
+      bool include_static_columns,
+      const Schema& static_projection,
+      std::unique_ptr<common::QLScanSpec>* spec,
+      std::unique_ptr<common::QLScanSpec>* static_row_spec) const override;
+
+  //------------------------------------------------------------------------------------------------
+  // PGSQL Support.
+  //------------------------------------------------------------------------------------------------
+
+  CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+                             const Schema& projection,
+                             const Schema& schema,
+                             const TransactionOperationContextOpt& txn_op_context,
+                             CoarseTimePoint deadline,
+                             const ReadHybridTime& read_time,
+                             common::YQLRowwiseIteratorIf::UniPtr* iter) const override {
+    LOG(FATAL) << "Postgresql virtual tables are not yet implemented";
+    return Status::OK();
+  }
 
  protected:
   // Finds the given column name in the schema and updates the specified column in the given row
@@ -64,7 +88,7 @@ class YQLVirtualTable : public common::QLStorageIf {
       return STATUS_SUBSTITUTE(NotFound, "Couldn't find column $0 in schema", col_name);
     }
     const DataType data_type = schema_.column(column_index).type_info()->type();
-    *(row->mutable_column(column_index)) = util::GetValue(value, data_type);
+    row->SetColumn(column_index, util::GetValue(value, data_type));
     return Status::OK();
   }
 

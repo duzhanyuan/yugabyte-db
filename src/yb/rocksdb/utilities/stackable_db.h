@@ -16,8 +16,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_UTILITIES_STACKABLE_DB_H
-#define ROCKSDB_INCLUDE_ROCKSDB_UTILITIES_STACKABLE_DB_H
+#ifndef YB_ROCKSDB_UTILITIES_STACKABLE_DB_H
+#define YB_ROCKSDB_UTILITIES_STACKABLE_DB_H
 
 #pragma once
 #include <string>
@@ -230,6 +230,10 @@ class StackableDB : public DB {
     return db_->GetEnv();
   }
 
+  Env* GetCheckpointEnv() const override {
+    return db_->GetCheckpointEnv();
+  }
+
   using DB::GetOptions;
   virtual const Options& GetOptions(ColumnFamilyHandle* column_family) const
       override {
@@ -245,6 +249,11 @@ class StackableDB : public DB {
   virtual Status Flush(const FlushOptions& fopts,
                        ColumnFamilyHandle* column_family) override {
     return db_->Flush(fopts, column_family);
+  }
+
+  using DB::WaitForFlush;
+  virtual Status WaitForFlush(ColumnFamilyHandle* column_family) override {
+    return db_->WaitForFlush(column_family);
   }
 
   virtual Status SyncWAL() override {
@@ -265,8 +274,14 @@ class StackableDB : public DB {
     db_->GetLiveFilesMetaData(metadata);
   }
 
-  OpId GetFlushedOpId() override {
-    return db_->GetFlushedOpId();
+  UserFrontierPtr GetFlushedFrontier() override {
+    return db_->GetFlushedFrontier();
+  }
+
+  CHECKED_STATUS ModifyFlushedFrontier(
+      UserFrontierPtr values,
+      FrontierModificationMode mode) override {
+    return db_->ModifyFlushedFrontier(std::move(values), mode);
   }
 
   virtual void GetColumnFamilyMetaData(
@@ -335,4 +350,4 @@ class StackableDB : public DB {
 
 } //  namespace rocksdb
 
-#endif // ROCKSDB_INCLUDE_ROCKSDB_UTILITIES_STACKABLE_DB_H
+#endif // YB_ROCKSDB_UTILITIES_STACKABLE_DB_H

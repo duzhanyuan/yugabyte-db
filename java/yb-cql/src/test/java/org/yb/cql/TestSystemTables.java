@@ -16,13 +16,17 @@ package org.yb.cql;
 import java.nio.ByteBuffer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
+import com.datastax.driver.core.SimpleStatement;
 import com.google.common.net.HostAndPort;
 import org.junit.After;
 import org.junit.BeforeClass;
@@ -30,18 +34,24 @@ import org.junit.Test;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import org.yb.client.YBClient;
+import org.yb.minicluster.BaseMiniClusterTest;
 import org.yb.minicluster.Metrics;
 import org.yb.minicluster.MiniYBCluster;
 import org.yb.master.Master;
 import org.yb.minicluster.MiniYBDaemon;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertNull;
+import static org.yb.AssertionWrappers.assertNotEquals;
+import static org.yb.AssertionWrappers.assertNotNull;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestSystemTables extends BaseCQLTest {
 
   private static final String DEFAULT_SCHEMA_VERSION = "00000000-0000-0000-0000-000000000000";
@@ -104,8 +114,41 @@ public class TestSystemTables extends BaseCQLTest {
 
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
-    BaseCQLTest.tserverArgs = Arrays.asList(String.format("--placement_region=%s",
-      PLACEMENT_REGION), String.format("--placement_zone=%s", PLACEMENT_ZONE));
+    BaseMiniClusterTest.tserverArgs.add(
+        String.format("--placement_region=%s", PLACEMENT_REGION));
+    BaseMiniClusterTest.tserverArgs.add(
+        String.format("--placement_zone=%s", PLACEMENT_ZONE));
+  }
+
+  @Test
+  public void testSystemSizeEstimatesTable() throws Exception {
+    createTable("est_test");
+
+    Iterator<Row> rows = session.execute("SELECT * FROM system.size_estimates WHERE " +
+        "keyspace_name = '" + DEFAULT_TEST_KEYSPACE + "' AND table_name = 'est_test';").iterator();
+
+    long rangeStart;
+    long rangeEnd = Long.MIN_VALUE;
+    int idx = 0;
+    while (rows.hasNext()) {
+      Row row = rows.next();
+      // Range start should be equal to previous range end (starting from min long);
+      rangeStart = Long.parseLong(row.getString("range_start"));
+      assertEquals(rangeEnd, rangeStart);
+
+      // Range start should be strictly smaller than range end, except for the last range which
+      // cycles back to min long (because range end is an exclusive bound).
+      rangeEnd = Long.parseLong(row.getString("range_end"));
+      if (rows.hasNext()) {
+        assertTrue(rangeStart < rangeEnd);
+      } else {
+        assertEquals(Long.MIN_VALUE, rangeEnd);
+      }
+      idx++;
+    }
+
+    // Expecting one row per tablet.
+    assertEquals(NUM_TABLET_SERVERS * overridableNumShardsPerTServer(), idx);
   }
 
   @Test
@@ -247,8 +290,8 @@ public class TestSystemTables extends BaseCQLTest {
   public void testSystemKeyspacesAndTables() throws Exception {
     List <Row> results = session.execute(
       "SELECT * FROM system_schema.keyspaces;").all();
-    Set<String> expectedKeySpaces = new HashSet<>(Arrays.asList(DEFAULT_KEYSPACE,
-      DEFAULT_TEST_KEYSPACE, "system_schema", "system", "system_auth"));
+    Set<String> expectedKeySpaces = new HashSet<>(Arrays.asList(DEFAULT_TEST_KEYSPACE,
+      "system_schema", "system", "system_auth"));
     assertEquals(expectedKeySpaces.size(), results.size());
 
     for (Row row : results) {
@@ -263,7 +306,7 @@ public class TestSystemTables extends BaseCQLTest {
 
     results = session.execute(
       "SELECT * FROM system_schema.tables;").all();
-    assertEquals(13, results.size());
+    assertEquals(16, results.size());
     assertTrue(verifySystemSchemaTables(results, "system_schema", "aggregates"));
     assertTrue(verifySystemSchemaTables(results, "system_schema", "columns"));
     assertTrue(verifySystemSchemaTables(results, "system_schema", "functions"));
@@ -273,10 +316,13 @@ public class TestSystemTables extends BaseCQLTest {
     assertTrue(verifySystemSchemaTables(results, "system_schema", "views"));
     assertTrue(verifySystemSchemaTables(results, "system_schema", "keyspaces"));
     assertTrue(verifySystemSchemaTables(results, "system_schema", "tables"));
-    assertTrue(verifySystemSchemaTables(results, "system_schema", "partitions"));
+    assertTrue(verifySystemSchemaTables(results, "system", "partitions"));
     assertTrue(verifySystemSchemaTables(results, "system", "peers"));
     assertTrue(verifySystemSchemaTables(results, "system", "local"));
+    assertTrue(verifySystemSchemaTables(results, "system", "size_estimates"));
     assertTrue(verifySystemSchemaTables(results, "system_auth", "roles"));
+    assertTrue(verifySystemSchemaTables(results, "system_auth", "role_permissions"));
+    assertTrue(verifySystemSchemaTables(results, "system_auth", "resource_role_permissions_index"));
 
     // Create keyspace and table and verify it shows up.
     session.execute("CREATE KEYSPACE my_keyspace;");
@@ -377,6 +423,14 @@ public class TestSystemTables extends BaseCQLTest {
     // Verify SELECT * works.
     results = session.execute("SELECT * FROM system_schema.columns").all();
     assertTrue(results.size() > 9);
+
+    // Test counter column.
+    session.execute("CREATE TABLE counter_column (k int PRIMARY KEY, c counter);");
+    results = session.execute(String.format("SELECT * FROM system_schema.columns WHERE " +
+      "keyspace_name = '%s' AND table_name = 'counter_column'", DEFAULT_TEST_KEYSPACE)).all();
+    assertEquals(2, results.size());
+    verifyColumnSchema(results.get(0), "counter_column", "k", "partition_key", 0, "int", "none");
+    verifyColumnSchema(results.get(1), "counter_column", "c", "regular", -1, "counter", "none");
   }
 
   @Test
@@ -414,11 +468,10 @@ public class TestSystemTables extends BaseCQLTest {
     session.execute("CREATE TABLE test_keyspace.test_table (k int PRIMARY KEY);");
 
     // Select partitions of test table.
-    List<Row> partitions = session.execute("SELECT * FROM system_schema.partitions WHERE " +
+    List<Row> partitions = session.execute("SELECT * FROM system.partitions WHERE " +
                                            "keyspace_name = 'test_keyspace' AND " +
                                            "table_name = 'test_table';").all();
-    // Add 1 to account for tserver started in testSystemPeersTable().
-    assertEquals(miniCluster.getNumShardsPerTserver() * (NUM_TABLET_SERVERS + 1),
+    assertEquals(miniCluster.getNumShardsPerTserver() * NUM_TABLET_SERVERS,
                  partitions.size());
 
     HashSet<InetAddress> contactPoints = new HashSet<>();
@@ -462,4 +515,30 @@ public class TestSystemTables extends BaseCQLTest {
     // Verify the last end_key is empty.
     assertFalse(endKey.hasRemaining());
   }
+
+  private List<String> getRowsAsStringList(ResultSet rs) {
+    return rs.all().stream().map(Row::toString).collect(Collectors.toList());
+  }
+
+  @Test
+  public void testLimitOffsetPageSize() throws Exception {
+    SimpleStatement select_all = new SimpleStatement("select * from system_schema.columns");
+    ResultSet rs = session.execute(select_all);
+    List<String> all_rows = getRowsAsStringList(rs);
+
+    rs = session.execute("select * from system_schema.columns limit 15");
+    assertEquals(all_rows.subList(0, 15), getRowsAsStringList(rs));
+
+    rs = session.execute("select * from system_schema.columns offset 15 limit 30");
+    assertEquals(all_rows.subList(15, 45), getRowsAsStringList(rs));
+
+    rs = session.execute("select * from system_schema.columns offset 45");
+    assertEquals(all_rows.subList(45, all_rows.size()), getRowsAsStringList(rs));
+
+    // Paging is not supported for system tables so page size should be ignored (return all rows).
+    select_all.setFetchSize(10);
+    rs = session.execute(select_all);
+    assertEquals(all_rows, getRowsAsStringList(rs));
+  }
+
 }

@@ -32,9 +32,15 @@
 #include "yb/docdb/value_type.h"
 #include "yb/util/decimal.h"
 #include "yb/util/timestamp.h"
+#include "yb/util/algorithm_util.h"
 
 namespace yb {
 namespace docdb {
+
+// Used for extending a list.
+// PREPEND prepends the arguments one by one (PREPEND a b c) will prepend [c b a] to the list,
+// while PREPEND_BLOCK prepends the arguments together, so it will prepend [a b c] to the list.
+  YB_DEFINE_ENUM(ListExtendOrder, (APPEND)(PREPEND_BLOCK)(PREPEND))
 
 // A necessary use of a forward declaration to avoid circular inclusion.
 class SubDocument;
@@ -43,17 +49,16 @@ enum class SystemColumnIds : ColumnIdRep {
   kLivenessColumn = 0  // Stores the TTL for QL rows inserted using an INSERT statement.
 };
 
-enum class SortOrder : int8_t {
-  kAscending = 0,
-  kDescending
-};
-
 class PrimitiveValue {
  public:
-  static const PrimitiveValue kInvalidPrimitiveValue;
+  static const PrimitiveValue kInvalid;
   static const PrimitiveValue kTombstone;
+  static const PrimitiveValue kObject;
+  // Flags for jsonb.
+  // Indicates that the stored jsonb is the complete jsonb value and not a partial update to jsonb.
+  static constexpr int64_t kCompleteJsonb = 1;
 
-  PrimitiveValue() : type_(ValueType::kNull) {
+  PrimitiveValue() : type_(ValueType::kNullLow) {
   }
 
   explicit PrimitiveValue(ValueType value_type);
@@ -62,6 +67,9 @@ class PrimitiveValue {
     if (other.type_ == ValueType::kString || other.type_ == ValueType::kStringDescending) {
       type_ = other.type_;
       new(&str_val_) std::string(other.str_val_);
+    } else if (other.type_ == ValueType::kJsonb) {
+      type_ = other.type_;
+      new(&json_val_) std::string(other.json_val_);
     } else if (other.type_ == ValueType::kInetaddress
         || other.type_ == ValueType::kInetaddressDescending) {
       type_ = other.type_;
@@ -69,6 +77,9 @@ class PrimitiveValue {
     } else if (other.type_ == ValueType::kDecimal || other.type_ == ValueType::kDecimalDescending) {
       type_ = other.type_;
       new(&decimal_val_) std::string(other.decimal_val_);
+    } else if (other.type_ == ValueType::kVarInt || other.type_ == ValueType::kVarIntDescending) {
+      type_ = other.type_;
+      new(&varint_val_) std::string(other.varint_val_);
     } else if (other.type_ == ValueType::kUuid || other.type_ == ValueType::kUuidDescending) {
       type_ = other.type_;
       new(&uuid_val_) Uuid(std::move((other.uuid_val_)));
@@ -76,7 +87,7 @@ class PrimitiveValue {
       type_ = other.type_;
       frozen_val_ = new FrozenContainer(*(other.frozen_val_));
     } else {
-      memmove(this, &other, sizeof(PrimitiveValue));
+      memmove(static_cast<void*>(this), &other, sizeof(PrimitiveValue));
     }
     ttl_seconds_ = other.ttl_seconds_;
     write_time_ = other.write_time_;
@@ -176,9 +187,6 @@ class PrimitiveValue {
   // ColumnSchema::SortingType::kDescending gets converted to SortOrder::kDescending.
   static SortOrder SortOrderFromColumnSchemaSortingType(ColumnSchema::SortingType sorting_type);
 
-  // Construct a primitive value from a Slice containing a Kudu value.
-  static PrimitiveValue FromKuduValue(DataType data_type, Slice slice);
-
   // Construct a primitive value from a QLValuePB.
   static PrimitiveValue FromQLValuePB(const QLValuePB& value,
                                       ColumnSchema::SortingType sorting_type);
@@ -187,15 +195,6 @@ class PrimitiveValue {
   static void ToQLValuePB(const PrimitiveValue& pv,
                           const std::shared_ptr<QLType>& ql_type,
                           QLValuePB* ql_val);
-
-  // Construct a primitive value from a QLExpressionPB.
-  static PrimitiveValue FromQLExpressionPB(const QLExpressionPB& ql_expr,
-                                           ColumnSchema::SortingType sorting_type);
-
-  // Set a primitive value in a QLExpressionPB.
-  static void ToQLExpressionPB(const PrimitiveValue& pv,
-                               const std::shared_ptr<QLType>& ql_type,
-                               QLExpressionPB* ql_expr);
 
   ValueType value_type() const { return type_; }
 
@@ -209,10 +208,14 @@ class PrimitiveValue {
   ~PrimitiveValue() {
     if (type_ == ValueType::kString || type_ == ValueType::kStringDescending) {
       str_val_.~basic_string();
+    } else if (type_ == ValueType::kJsonb) {
+      json_val_.~basic_string();
     } else if (type_ == ValueType::kInetaddress || type_ == ValueType::kInetaddressDescending) {
       delete inetaddress_val_;
     } else if (type_ == ValueType::kDecimal || type_ == ValueType::kDecimalDescending) {
       decimal_val_.~basic_string();
+    } else if (type_ == ValueType::kVarInt || type_ == ValueType::kVarIntDescending) {
+      varint_val_.~basic_string();
     } else if (type_ == ValueType::kFrozen) {
       delete frozen_val_;
     }
@@ -233,13 +236,17 @@ class PrimitiveValue {
   static PrimitiveValue Float(float f, SortOrder sort_order = SortOrder::kAscending);
   // decimal_str represents a human readable string representing the decimal number, e.g. "0.03".
   static PrimitiveValue Decimal(const std::string& decimal_str, SortOrder sort_order);
+  static PrimitiveValue VarInt(const std::string& varint_str, SortOrder sort_order);
   static PrimitiveValue ArrayIndex(int64_t index);
   static PrimitiveValue UInt16Hash(uint16_t hash);
   static PrimitiveValue SystemColumnId(ColumnId column_id);
   static PrimitiveValue SystemColumnId(SystemColumnIds system_column_id);
   static PrimitiveValue Int32(int32_t v, SortOrder sort_order = SortOrder::kAscending);
+  static PrimitiveValue UInt32(uint32_t v, SortOrder sort_order = SortOrder::kAscending);
+  static PrimitiveValue UInt64(uint64_t v, SortOrder sort_order = SortOrder::kAscending);
   static PrimitiveValue TransactionId(Uuid transaction_id);
-  static PrimitiveValue IntentTypeValue(IntentType intent_type);
+  static PrimitiveValue TableId(Uuid table_id);
+  static PrimitiveValue Jsonb(const std::string& json);
 
   KeyBytes ToKeyBytes() const;
 
@@ -257,6 +264,10 @@ class PrimitiveValue {
 
   bool IsTombstoneOrPrimitive() const {
     return IsPrimitiveValueType(type_) || type_ == ValueType::kTombstone;
+  }
+
+  bool IsInfinity() const {
+    return type_ == ValueType::kHighest || type_ == ValueType::kLowest;
   }
 
   int CompareTo(const PrimitiveValue& other) const;
@@ -277,10 +288,6 @@ class PrimitiveValue {
     return ValueType::kString == type_ || ValueType::kStringDescending == type_;
   }
 
-  bool IsValidType() const {
-    return type_ != ValueType::kInvalidValueType;
-  }
-
   bool IsDouble() const {
     return ValueType::kDouble == type_ || ValueType::kDoubleDescending == type_;
   }
@@ -295,13 +302,26 @@ class PrimitiveValue {
     return int32_val_;
   }
 
+  uint32_t GetUInt32() const {
+    DCHECK(ValueType::kUInt32 == type_ || ValueType::kUInt32Descending == type_);
+    return uint32_val_;
+  }
+
   int64_t GetInt64() const {
     DCHECK(ValueType::kInt64 == type_ || ValueType::kInt64Descending == type_);
     return int64_val_;
   }
 
+  uint64_t GetUInt64() const {
+    DCHECK(ValueType::kUInt64 == type_ || ValueType::kUInt64Descending == type_);
+    return uint64_val_;
+  }
+
   uint16_t GetUInt16() const {
-    DCHECK(ValueType::kUInt16Hash == type_ || ValueType::kIntentType == type_);
+    DCHECK(ValueType::kUInt16Hash == type_ ||
+           ValueType::kObsoleteIntentTypeSet == type_ ||
+           ValueType::kObsoleteIntentType == type_ ||
+           ValueType::kIntentTypeSet == type_);
     return uint16_val_;
   }
 
@@ -320,6 +340,11 @@ class PrimitiveValue {
     return decimal_val_;
   }
 
+  const std::string& GetVarInt() const {
+    DCHECK(ValueType::kVarInt == type_ || ValueType::kVarIntDescending == type_);
+    return varint_val_;
+  }
+
   Timestamp GetTimestamp() const {
     DCHECK(ValueType::kTimestamp == type_ || ValueType::kTimestampDescending == type_);
     return timestamp_val_;
@@ -330,9 +355,14 @@ class PrimitiveValue {
     return inetaddress_val_;
   }
 
+  const std::string& GetJson() const {
+    DCHECK(type_ == ValueType::kJsonb);
+    return json_val_;
+  }
+
   const Uuid& GetUuid() const {
     DCHECK(type_ == ValueType::kUuid || type_ == ValueType::kUuidDescending ||
-        type_ == ValueType::kTransactionId);
+           type_ == ValueType::kTransactionId || type_ == ValueType::kTableId);
     return uuid_val_;
   }
 
@@ -345,12 +375,12 @@ class PrimitiveValue {
     return CompareTo(other) < 0;
   }
 
-  bool operator >(const PrimitiveValue& other) const {
-    return CompareTo(other) > 0;
-  }
-
   bool operator <=(const PrimitiveValue& other) const {
     return CompareTo(other) <= 0;
+  }
+
+  bool operator >(const PrimitiveValue& other) const {
+    return CompareTo(other) > 0;
   }
 
   bool operator >=(const PrimitiveValue& other) const {
@@ -361,11 +391,20 @@ class PrimitiveValue {
 
   bool operator!=(const PrimitiveValue& other) const { return !(*this == other); }
 
+  ListExtendOrder GetExtendOrder() const {
+    return extend_order_;
+  }
+
   int64_t GetTtl() const {
     return ttl_seconds_;
   }
 
+  bool IsWriteTimeSet() const {
+    return write_time_ != kUninitializedWriteTime;
+  }
+
   int64_t GetWriteTime() const {
+    DCHECK_NE(kUninitializedWriteTime, write_time_);
     return write_time_;
   }
 
@@ -373,23 +412,37 @@ class PrimitiveValue {
     ttl_seconds_ = ttl_seconds;
   }
 
-  void SetWritetime(const int64_t write_time) {
+  void SetExtendOrder(const ListExtendOrder extend_order) const {
+    extend_order_ = extend_order;
+  }
+
+  void SetWriteTime(const int64_t write_time) {
     write_time_ = write_time;
   }
   typedef std::vector<PrimitiveValue> FrozenContainer;
 
  protected:
 
-  // Column attributes
-  int64_t ttl_seconds_;
-  int64_t write_time_;
+  static constexpr int64_t kUninitializedWriteTime = std::numeric_limits<int64_t>::min();
+
+  // Column attributes.
+  int64_t ttl_seconds_ = -1;
+  int64_t write_time_ = kUninitializedWriteTime;
+
+  // TODO: make PrimitiveValue extend SubDocument and put this field
+  // in SubDocument.
+  // This field gives the extension order of elements of a list and
+  // is applicable only to SubDocuments of type kArray.
+  mutable ListExtendOrder extend_order_ = ListExtendOrder::APPEND;
 
   ValueType type_;
 
   // TODO: do we have to worry about alignment here?
   union {
     int32_t int32_val_;
+    uint32_t uint32_val_;
     int64_t int64_val_;
+    uint64_t uint64_val_;
     uint16_t uint16_val_;
     DocHybridTime hybrid_time_val_;
     std::string str_val_;
@@ -403,6 +456,8 @@ class PrimitiveValue {
     void* complex_data_structure_;
     ColumnId column_id_val_;
     std::string decimal_val_;
+    std::string varint_val_;
+    std::string json_val_;
   };
 
  private:
@@ -424,10 +479,17 @@ class PrimitiveValue {
         || other->type_ == ValueType::kInetaddressDescending) {
       type_ = other->type_;
       inetaddress_val_ = new InetAddress(std::move(*(other->inetaddress_val_)));
+    } else if (other->type_ == ValueType::kJsonb) {
+      type_ = other->type_;
+      new(&json_val_) std::string(std::move(other->json_val_));
     } else if (other->type_ == ValueType::kDecimal ||
-               other->type_ == ValueType::kDecimalDescending) {
+        other->type_ == ValueType::kDecimalDescending) {
       type_ = other->type_;
       new(&decimal_val_) std::string(std::move(other->decimal_val_));
+    } else if (other->type_ == ValueType::kVarInt ||
+        other->type_ == ValueType::kVarIntDescending) {
+      type_ = other->type_;
+      new(&varint_val_) std::string(std::move(other->varint_val_));
     } else if (other->type_ == ValueType::kUuid || other->type_ == ValueType::kUuidDescending) {
       type_ = other->type_;
       new(&uuid_val_) Uuid(std::move((other->uuid_val_)));
@@ -437,14 +499,14 @@ class PrimitiveValue {
     } else {
       // Non-string primitive values only have plain old data. We are assuming there is no overlap
       // between the two objects, so we're using memcpy instead of memmove.
-      memcpy(this, other, sizeof(PrimitiveValue));
+      memcpy(static_cast<void*>(this), other, sizeof(PrimitiveValue));
 #ifndef NDEBUG
       // We could just leave the old object as is for it to be in a "valid but unspecified" state.
       // However, in debug mode we clear the old object's state to make sure we don't attempt to use
       // it.
-      memset(other, 0xab, sizeof(PrimitiveValue));
+      memset(static_cast<void*>(other), 0xab, sizeof(PrimitiveValue));
       // Restore the type. There should be no deallocation for non-string types anyway.
-      other->type_ = ValueType::kNull;
+      other->type_ = ValueType::kNullLow;
 #endif
     }
   }
@@ -469,7 +531,7 @@ template <class T, class ...U>
 inline void AppendPrimitiveValues(std::vector<PrimitiveValue>* dest,
                                   T first_arg,
                                   U... more_args) {
-  dest->push_back(PrimitiveValue(first_arg));
+  dest->emplace_back(first_arg);
   AppendPrimitiveValues(dest, more_args...);
 }
 

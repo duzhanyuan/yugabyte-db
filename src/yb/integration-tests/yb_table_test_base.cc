@@ -12,8 +12,16 @@
 //
 
 #include "yb/integration-tests/yb_table_test_base.h"
-#include "yb/redisserver/redis_parser.h"
-#include "yb/redisserver/redis_constants.h"
+
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/yb_op.h"
+
+#include "yb/common/ql_value.h"
+
+#include "yb/yql/redis/redisserver/redis_parser.h"
+#include "yb/yql/redis/redisserver/redis_constants.h"
 #include "yb/util/curl_util.h"
 
 using std::unique_ptr;
@@ -24,9 +32,6 @@ namespace yb {
 using client::YBClient;
 using client::YBClientBuilder;
 using client::YBColumnSchema;
-using client::KuduInsert;
-using client::YBScanner;
-using client::YBScanBatch;
 using client::YBSchemaBuilder;
 using client::YBSession;
 using client::YBTableCreator;
@@ -48,10 +53,6 @@ int YBTableTestBase::num_tablet_servers() {
 
 int YBTableTestBase::num_tablets() {
   return CalcNumTablets(num_tablet_servers());
-}
-
-int YBTableTestBase::num_replicas() {
-  return std::min(num_tablet_servers(), 3);
 }
 
 int YBTableTestBase::session_timeout_ms() {
@@ -77,6 +78,9 @@ bool YBTableTestBase::use_external_mini_cluster() {
 YBTableTestBase::YBTableTestBase() {
 }
 
+void YBTableTestBase::BeforeCreateTable() {
+}
+
 void YBTableTestBase::SetUp() {
   YBTest::SetUp();
 
@@ -86,6 +90,7 @@ void YBTableTestBase::SetUp() {
     opts.num_masters = num_masters();
     opts.master_rpc_ports = master_rpc_ports();
     opts.num_tablet_servers = num_tablet_servers();
+    CustomizeExternalMiniCluster(&opts);
 
     external_mini_cluster_.reset(new ExternalMiniCluster(opts));
     mini_cluster_status = external_mini_cluster_->Start();
@@ -105,6 +110,9 @@ void YBTableTestBase::SetUp() {
   ASSERT_OK(mini_cluster_status);
 
   CreateClient();
+
+  BeforeCreateTable();
+
   CreateTable();
   OpenTable();
 }
@@ -115,6 +123,7 @@ void YBTableTestBase::TearDown() {
   // Fetch the tablet server metrics page after we delete the table. [ENG-135].
   FetchTSMetricsPage();
 
+  client_.reset();
   if (use_external_mini_cluster()) {
     external_mini_cluster_->Shutdown();
   } else {
@@ -135,28 +144,27 @@ void YBTableTestBase::CreateClient() {
   client_ = CreateYBClient();
 }
 
-shared_ptr<yb::client::YBClient> YBTableTestBase::CreateYBClient() {
-  shared_ptr<yb::client::YBClient> client;
+std::unique_ptr<YBClient> YBTableTestBase::CreateYBClient() {
   YBClientBuilder builder;
   builder.default_rpc_timeout(MonoDelta::FromMilliseconds(client_rpc_timeout_ms()));
   if (use_external_mini_cluster()) {
-    CHECK_OK(external_mini_cluster_->CreateClient(&builder, &client));
+    return CHECK_RESULT(external_mini_cluster_->CreateClient(&builder));
   } else {
-    CHECK_OK(mini_cluster_->CreateClient(&builder, &client));
+    return CHECK_RESULT(mini_cluster_->CreateClient(&builder));
   }
-  return client;
 }
 
 void YBTableTestBase::OpenTable() {
-  ASSERT_OK(client_->OpenTable(table_name(), &table_));
+  ASSERT_OK(table_.Open(table_name(), client_.get()));
   session_ = NewSession();
 }
 
-void YBTableTestBase::CreateRedisTable(shared_ptr<yb::client::YBClient> client,
-                                       YBTableName table_name) {
-  ASSERT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name()));
+void YBTableTestBase::CreateRedisTable(YBTableName table_name) {
+  ASSERT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name(),
+                                                YQLDatabase::YQL_DATABASE_REDIS));
   ASSERT_OK(NewTableCreator()->table_name(table_name)
                 .table_type(YBTableType::REDIS_TABLE_TYPE)
+                .num_tablets(CalcNumTablets(3))
                 .Create());
 }
 
@@ -165,7 +173,7 @@ void YBTableTestBase::CreateTable() {
     ASSERT_OK(client_->CreateNamespaceIfNotExists(table_name().namespace_name()));
 
     YBSchemaBuilder b;
-    b.AddColumn("k")->Type(BINARY)->NotNull()->PrimaryKey();
+    b.AddColumn("k")->Type(BINARY)->NotNull()->HashPrimaryKey();
     b.AddColumn("v")->Type(BINARY)->NotNull();
     ASSERT_OK(b.Build(&schema_));
 
@@ -181,28 +189,21 @@ void YBTableTestBase::DeleteTable() {
   }
 }
 
-shared_ptr<YBSession> YBTableTestBase::NewSession(bool read_only) {
-  shared_ptr<YBSession> session = client_->NewSession(read_only);
-  session->SetTimeoutMillis(session_timeout_ms());
-  CHECK_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+shared_ptr<YBSession> YBTableTestBase::NewSession() {
+  shared_ptr<YBSession> session = client_->NewSession();
+  session->SetTimeout(MonoDelta::FromMilliseconds(session_timeout_ms()));
   return session;
 }
 
 void YBTableTestBase::PutKeyValue(YBSession* session, string key, string value) {
-  shared_ptr<KuduInsert> insert(table_->NewInsert());
-  ASSERT_OK(insert->mutable_row()->SetBinary("k", key));
-  ASSERT_OK(insert->mutable_row()->SetBinary("v", value));
-  ASSERT_OK(session->Apply(insert));
-  ASSERT_OK(session->Flush());
+  auto insert = table_.NewInsertOp();
+  QLAddStringHashValue(insert->mutable_request(), key);
+  table_.AddStringColumnValue(insert->mutable_request(), "v", value);
+  ASSERT_OK(session->ApplyAndFlush(insert));
 }
 
 void YBTableTestBase::PutKeyValue(string key, string value) {
   PutKeyValue(session_.get(), key, value);
-}
-
-void YBTableTestBase::ConfigureScanner(YBScanner* scanner) {
-  ASSERT_OK(scanner->SetSelection(YBClient::ReplicaSelection::LEADER_ONLY));
-  ASSERT_OK(scanner->SetProjectedColumns({ "k", "v" }));
 }
 
 void YBTableTestBase::RestartCluster() {
@@ -212,17 +213,14 @@ void YBTableTestBase::RestartCluster() {
   ASSERT_NO_FATALS(OpenTable());
 }
 
-void YBTableTestBase::GetScanResults(YBScanner* scanner, vector<pair<string, string>>* result_kvs) {
-  while (scanner->HasMoreRows()) {
-    vector<YBScanBatch::RowPtr> rows;
-    ASSERT_OK(scanner->NextBatch(&rows));
-    for (auto row : rows) {
-      Slice returned_key, returned_value;
-      ASSERT_OK(row.GetBinary("k", &returned_key));
-      ASSERT_OK(row.GetBinary("v", &returned_value));
-      result_kvs->emplace_back(make_pair(returned_key.ToString(), returned_value.ToString()));
-    }
+std::vector<std::pair<std::string, std::string>> YBTableTestBase::GetScanResults(
+    const client::TableRange& range) {
+  std::vector<std::pair<std::string, std::string>> result;
+  for (const auto& row : range) {
+    result.emplace_back(row.column(0).binary_value(), row.column(1).binary_value());
   }
+  std::sort(result.begin(), result.end());
+  return result;
 }
 
 void YBTableTestBase::FetchTSMetricsPage() {
@@ -249,7 +247,6 @@ void YBTableTestBase::FetchTSMetricsPage() {
 
 std::unique_ptr<client::YBTableCreator> YBTableTestBase::NewTableCreator() {
   unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
-  table_creator->num_replicas(num_replicas());
   if (num_tablets() > 0) {
     table_creator->num_tablets(num_tablets());
   }

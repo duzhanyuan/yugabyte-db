@@ -50,6 +50,7 @@
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/common/entity_ids.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus.proxy.h"
 #include "yb/consensus/opid_util.h"
@@ -102,8 +103,10 @@ struct TServerDetails {
 typedef std::unordered_multimap<std::string, TServerDetails*> TabletReplicaMap;
 
 // uuid -> tablet server map.
-typedef std::unordered_map<TServerId, std::unique_ptr<TServerDetails>> TabletServerMap;
-typedef std::unordered_map<TServerId, TServerDetails*> TabletServerMapUnowned;
+typedef std::unordered_map<TabletServerId, std::unique_ptr<TServerDetails>> TabletServerMap;
+typedef std::unordered_map<TabletServerId, TServerDetails*> TabletServerMapUnowned;
+
+YB_STRONGLY_TYPED_BOOL(MustBeCommitted);
 
 // Returns possibly the simplest imaginable schema, with a single int key column.
 client::YBSchema SimpleIntKeyYBSchema();
@@ -112,7 +115,7 @@ client::YBSchema SimpleIntKeyYBSchema();
 // Note: The bare-pointer TServerDetails values must be deleted by the caller!
 // Consider using ValueDeleter (in gutil/stl_util.h) for that.
 Status CreateTabletServerMap(master::MasterServiceProxy* master_proxy,
-                             const std::shared_ptr<rpc::Messenger>& messenger,
+                             rpc::ProxyCache* proxy_cache,
                              TabletServerMap* ts_map);
 
 // Gets a vector containing the latest OpId for each of the given replicas.
@@ -145,23 +148,31 @@ TabletServerMapUnowned CreateTabletServerMapUnowned(const TabletServerMap& table
 //
 // If actual_index is not nullptr, the index that the servers have agreed on is written to
 // actual_index. If the servers fail to agree, it is set to zero.
+//
+// If must_be_committed is true, we require committed OpIds to also be the same across all servers
+// and be the same as last received OpIds. This will make sure all followers know that all entries
+// they received are committed, and we can actually read those entries from the followers.
+// One place where this makes a difference is LinkedListTest.TestLoadWhileOneServerDownAndVerify.
 Status WaitForServersToAgree(const MonoDelta& timeout,
                              const TabletServerMap& tablet_servers,
                              const TabletId& tablet_id,
                              int64_t minimum_index,
-                             int64_t* actual_index = nullptr);
+                             int64_t* actual_index = nullptr,
+                             MustBeCommitted must_be_committed = MustBeCommitted::kFalse);
 
 Status WaitForServersToAgree(const MonoDelta& timeout,
                              const TabletServerMapUnowned& tablet_servers,
                              const TabletId& tablet_id,
                              int64_t minimum_index,
-                             int64_t* actual_index = nullptr);
+                             int64_t* actual_index = nullptr,
+                             MustBeCommitted must_be_committed = MustBeCommitted::kFalse);
 
 Status WaitForServersToAgree(const MonoDelta& timeout,
                              const vector<TServerDetails*>& tablet_servers,
                              const string& tablet_id,
                              int64_t minimum_index,
-                             int64_t* actual_index = nullptr);
+                             int64_t* actual_index = nullptr,
+                             MustBeCommitted must_be_committed = MustBeCommitted::kFalse);
 
 // Wait until all specified replicas have logged at least the given index.
 // Unlike WaitForServersToAgree(), the servers do not actually have to converge
@@ -170,6 +181,13 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
                                   const TabletId& tablet_id,
                                   const std::vector<TServerDetails*>& replicas,
                                   const MonoDelta& timeout);
+
+// Wait until the number of alive tservers is equal to n_tservers. An alive tserver is a tserver
+// that has heartbeated the master at least once in the last FLAGS_raft_heartbeat_interval_ms
+// milliseconds.
+Status WaitUntilNumberOfAliveTServersEqual(int n_tservers,
+                                           master::MasterServiceProxy* master_proxy,
+                                           const MonoDelta& timeout);
 
 // Get the consensus state from the given replica.
 Status GetConsensusState(const TServerDetails* replica,
@@ -208,14 +226,25 @@ Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
                                      const MonoDelta& timeout,
                                      CommittedEntryType type = CommittedEntryType::ANY);
 
-// Wait until the last committed OpId has index greater than 'opid_index' and store new value there.
-// The value pointed by 'opid_index' should not change during execution.
+// Wait until the last committed OpId index is greater than 'opid_index' and store the new index in
+// the same variable.
+// The value pointed by 'opid_index' should not change during the execution of this function.
 // 'type' - type of committed entry for check.
-Status WaitUntilCommittedOpIdIndexGrow(int64_t* opid_index,
-                                       TServerDetails* replica,
-                                       const TabletId& tablet_id,
-                                       const MonoDelta& timeout,
-                                       CommittedEntryType type = CommittedEntryType::ANY);
+Status WaitUntilCommittedOpIdIndexIsGreaterThan(int64_t* opid_index,
+                                                TServerDetails* replica,
+                                                const TabletId& tablet_id,
+                                                const MonoDelta& timeout,
+                                                CommittedEntryType type = CommittedEntryType::ANY);
+
+// Wait until the last committed OpId index is at least equal to 'opid_index' and store the index
+// in the same variable.
+// The value pointed by 'opid_index' should not change during the execution of this function.
+// 'type' - type of committed entry for check.
+Status WaitUntilCommittedOpIdIndexIsAtLeast(int64_t* opid_index,
+                                            TServerDetails* replica,
+                                            const TabletId& tablet_id,
+                                            const MonoDelta& timeout,
+                                            CommittedEntryType type = CommittedEntryType::ANY);
 
 // Returns:
 // Status::OK() if the replica is alive and leader of the consensus configuration.
@@ -257,9 +286,12 @@ Status FindTabletLeader(const vector<TServerDetails*>& tservers,
 // 'timeout' only refers to the RPC asking the peer to start an election. The
 // StartElection() RPC does not block waiting for the results of the election,
 // and neither does this call.
-Status StartElection(const TServerDetails* replica,
-                     const TabletId& tablet_id,
-                     const MonoDelta& timeout);
+Status StartElection(
+    const TServerDetails* replica,
+    const TabletId& tablet_id,
+    const MonoDelta& timeout,
+    consensus::TEST_SuppressVoteRequest suppress_vote_request =
+        consensus::TEST_SuppressVoteRequest::kFalse);
 
 // Cause a leader to step down on the specified server.
 // 'timeout' refers to the RPC timeout waiting synchronously for stepdown to
@@ -280,7 +312,6 @@ Status LeaderStepDown(const TServerDetails* replica,
 // write_type.
 Status WriteSimpleTestRow(const TServerDetails* replica,
                           const TabletId& tablet_id,
-                          RowOperationsPB::Type write_type,
                           int32_t key,
                           int32_t int_val,
                           const std::string& string_val,
@@ -348,7 +379,7 @@ Status WaitForNumTabletsOnTS(
 // Wait until the specified replica is in the specified state.
 Status WaitUntilTabletInState(TServerDetails* ts,
                               const TabletId& tablet_id,
-                              tablet::TabletStatePB state,
+                              tablet::RaftGroupStatePB state,
                               const MonoDelta& timeout);
 
 // Wait until the specified tablet is in RUNNING state.

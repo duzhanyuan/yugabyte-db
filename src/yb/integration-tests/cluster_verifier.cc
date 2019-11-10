@@ -38,9 +38,11 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
-#include "yb/client/row_result.h"
+#include "yb/client/table_handle.h"
+
 #include "yb/gutil/strings/substitute.h"
 #include "yb/integration-tests/mini_cluster_base.h"
+#include "yb/rpc/messenger.h"
 #include "yb/tools/ysck_remote.h"
 #include "yb/util/monotime.h"
 #include "yb/util/test_util.h"
@@ -60,7 +62,6 @@ using client::YBTableName;
 ClusterVerifier::ClusterVerifier(MiniClusterBase* cluster)
   : cluster_(cluster),
     checksum_options_(ChecksumOptions()) {
-  checksum_options_.use_snapshot = false;
 }
 
 ClusterVerifier::~ClusterVerifier() {
@@ -75,12 +76,12 @@ void ClusterVerifier::SetScanConcurrency(int concurrency) {
 }
 
 void ClusterVerifier::CheckCluster() {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
+  MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(checksum_options_.timeout);
 
   Status s;
   double sleep_time = 0.1;
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  while (MonoTime::Now().ComesBefore(deadline)) {
     s = DoYsck();
     if (s.ok()) {
       break;
@@ -116,30 +117,23 @@ Status ClusterVerifier::DoYsck() {
 
 void ClusterVerifier::CheckRowCount(const YBTableName& table_name,
                                     ComparisonMode mode,
-                                    int expected_row_count) {
-  ASSERT_OK(DoCheckRowCount(table_name, mode, expected_row_count));
+                                    int expected_row_count,
+                                    YBConsistencyLevel consistency) {
+  ASSERT_OK(DoCheckRowCount(table_name, mode, expected_row_count, consistency));
 }
 
 Status ClusterVerifier::DoCheckRowCount(const YBTableName& table_name,
                                         ComparisonMode mode,
-                                        int expected_row_count) {
-  std::shared_ptr<client::YBClient> client;
-  client::YBClientBuilder builder;
-  RETURN_NOT_OK_PREPEND(cluster_->CreateClient(&builder,
-                                               &client),
-                        "Unable to connect to cluster");
-  std::shared_ptr<client::YBTable> table;
-  RETURN_NOT_OK_PREPEND(client->OpenTable(table_name, &table),
-                        "Unable to open table");
-  client::YBScanner scanner(table.get());
-  CHECK_OK(scanner.SetProjectedColumns(vector<string>()));
-  RETURN_NOT_OK_PREPEND(scanner.Open(), "Unable to open scanner");
-  int count = 0;
-  vector<client::YBRowResult> rows;
-  while (scanner.HasMoreRows()) {
-    RETURN_NOT_OK_PREPEND(scanner.NextBatch(&rows), "Unable to read from scanner");
-    count += rows.size();
-  }
+                                        int expected_row_count,
+                                        YBConsistencyLevel consistency) {
+  auto client = VERIFY_RESULT_PREPEND(
+      cluster_->CreateClient(), "Unable to connect to cluster");
+
+  client::TableHandle table;
+  RETURN_NOT_OK_PREPEND(table.Open(table_name, client.get()), "Unable to open table");
+  client::TableIteratorOptions options;
+  options.consistency = consistency;
+  size_t count = boost::size(client::TableRange(table, options));
 
   if (mode == AT_LEAST && count < expected_row_count) {
     return STATUS(Corruption, Substitute("row count $0 is not at least expected value $1",
@@ -155,12 +149,12 @@ void ClusterVerifier::CheckRowCountWithRetries(const YBTableName& table_name,
                                                ComparisonMode mode,
                                                int expected_row_count,
                                                const MonoDelta& timeout) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
+  MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(timeout);
   Status s;
   while (true) {
-    s = DoCheckRowCount(table_name, mode, expected_row_count);
-    if (s.ok() || deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    s = DoCheckRowCount(table_name, mode, expected_row_count, YBConsistencyLevel::STRONG);
+    if (s.ok() || deadline.ComesBefore(MonoTime::Now())) break;
     LOG(WARNING) << "CheckRowCount() has not succeeded yet: " << s.ToString()
                  << "... will retry";
     SleepFor(MonoDelta::FromMilliseconds(100));

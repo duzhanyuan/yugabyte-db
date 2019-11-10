@@ -11,7 +11,7 @@
 // under the License.
 //
 
-// Utilities for encoding and decoding key/value pairs that are used in the document DB code.
+// Utilities for encoding and decoding key/value pairs that are used in the DocDB code.
 
 #ifndef YB_DOCDB_DOC_KV_UTIL_H_
 #define YB_DOCDB_DOC_KV_UTIL_H_
@@ -25,6 +25,7 @@
 #include "yb/common/schema.h"
 #include "yb/gutil/endian.h"
 #include "yb/util/decimal.h"
+#include "yb/util/kv_util.h"
 #include "yb/util/memcmpable_varint.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status.h"
@@ -34,11 +35,6 @@ namespace yb {
 namespace docdb {
 
 constexpr int kEncodedKeyStrTerminatorSize = 2;
-
-// We are flipping the sign bit of 64-bit integers appearing as object keys in a document so that
-// negative numbers sort earlier.
-constexpr uint64_t kInt64SignBitFlipMask = 0x8000000000000000L;
-constexpr uint32_t kInt32SignBitFlipMask = 0x80000000;
 
 // Checks whether the given RocksDB key belongs to a document identified by the given encoded
 // document key (a key that has already had zero characters escaped). This is done simply by
@@ -62,108 +58,22 @@ CHECKED_STATUS CheckHybridTimeSizeAndValueType(
 // @param hybrid_time Where to store the hybrid time. Undefined in case of failure.
 yb::Status ConsumeHybridTimeFromKey(rocksdb::Slice* slice, DocHybridTime* hybrid_time);
 
-inline void AppendBigEndianUInt64(uint64_t u, std::string* dest) {
-  char buf[sizeof(uint64_t)];
-  BigEndian::Store64(buf, u);
-  dest->append(buf, sizeof(buf));
-}
-
-inline void AppendBigEndianUInt32(uint32_t u, std::string* dest) {
-  char buf[sizeof(uint32_t)];
-  BigEndian::Store32(buf, u);
-  dest->append(buf, sizeof(buf));
-}
-
-// Encode and append the given signed 64-bit integer to the destination string holding a RocksDB
-// key being constructed. We are flipping the sign bit so that negative numbers sort before positive
-// ones.
-inline void AppendInt64ToKey(int64_t val, std::string* dest) {
-  char buf[sizeof(uint64_t)];
-  // Flip the sign bit so that negative values sort before positive ones when compared as
-  // big-endian byte sequences.
-  BigEndian::Store64(buf, val ^ kInt64SignBitFlipMask);
-  dest->append(buf, sizeof(buf));
-}
-
-inline int64_t DecodeInt64FromKey(const rocksdb::Slice& slice) {
-  uint64_t v = BigEndian::Load64(slice.data());
-  return v ^ kInt64SignBitFlipMask;
-}
-
-inline void AppendInt32ToKey(int32_t val, std::string* dest) {
-  char buf[sizeof(int32_t)];
-  BigEndian::Store32(buf, val ^ kInt32SignBitFlipMask);
-  dest->append(buf, sizeof(buf));
-}
-
 inline void AppendUInt16ToKey(uint16_t val, std::string* dest) {
   char buf[sizeof(uint16_t)];
   BigEndian::Store16(buf, val);
   dest->append(buf, sizeof(buf));
 }
 
-inline void AppendFloatToKey(float val, std::string* dest, bool descending = false) {
+inline void AppendUInt32ToKey(uint32_t val, std::string* dest) {
   char buf[sizeof(uint32_t)];
-  uint32_t v = *(reinterpret_cast<uint32_t*>(&val));
-  if (v >> 31) { // This is the sign bit: better than using val >= 0 (because -0, nulls denormals).
-    v = ~v;
-  } else {
-    v ^= kInt32SignBitFlipMask;
-  }
-
-  if (descending) {
-    // flip the bits to reverse the order.
-    v = ~v;
-  }
-  BigEndian::Store32(buf, v);
+  BigEndian::Store32(buf, val);
   dest->append(buf, sizeof(buf));
 }
 
-inline float DecodeFloatFromKey(const rocksdb::Slice& slice, bool descending = false) {
-  uint32_t v = BigEndian::Load32(slice.data());
-  if (descending) {
-    // Flip the bits.
-    v = ~v;
-  }
-
-  if (v >> 31) { // This is the sign bit: better than using val >= 0 (because -0, nulls denormals).
-    v ^= kInt32SignBitFlipMask;
-  } else {
-    v = ~v;
-  }
-  return *(reinterpret_cast<float*>(&v));
-}
-
-inline void AppendDoubleToKey(double val, std::string* dest, bool descending = false) {
+inline void AppendUInt64ToKey(uint64_t val, std::string* dest) {
   char buf[sizeof(uint64_t)];
-  uint64_t v = *(reinterpret_cast<uint64_t*>(&val));
-  if (v >> 63) { // This is the sign bit: better than using val >= 0 (because -0, nulls denormals).
-    v = ~v;
-  } else {
-    v ^= kInt64SignBitFlipMask;
-  }
-
-  if (descending) {
-    // flip the bits to reverse the order.
-    v = ~v;
-  }
-  BigEndian::Store64(buf, v);
+  BigEndian::Store64(buf, val);
   dest->append(buf, sizeof(buf));
-}
-
-inline double DecodeDoubleFromKey(const rocksdb::Slice& slice, bool descending = false) {
-  uint64_t v = BigEndian::Load64(slice.data());
-  if (descending) {
-    // Flip the bits.
-    v = ~v;
-  }
-
-  if (v >> 63) { // This is the sign bit: better than using val >= 0 (because -0, nulls denormals).
-    v ^= kInt64SignBitFlipMask;
-  } else {
-    v = ~v;
-  }
-  return *(reinterpret_cast<double*>(&v));
 }
 
 inline void AppendColumnIdToKey(ColumnId val, std::string* dest) {
@@ -225,7 +135,6 @@ std::string DecodeZeroEncodedStr(std::string encoded_str);
 //   result - the resulting decoded string
 yb::Status DecodeComplementZeroEncodedStr(rocksdb::Slice* slice, std::string* result);
 
-
 // We try to use up to this number of characters when converting raw bytes to strings for debug
 // purposes.
 constexpr int kShortDebugStringLength = 40;
@@ -238,23 +147,6 @@ std::string ToShortDebugStr(rocksdb::Slice slice);
 inline std::string ToShortDebugStr(const std::string& raw_str) {
   return ToShortDebugStr(rocksdb::Slice(raw_str));
 }
-
-// Determines whether or not the TTL for a key has expired, given the ttl for the key, its hybrid
-// time and the hybrid_time we're reading at. The result is stored in has_expired.
-CHECKED_STATUS HasExpiredTTL(const HybridTime& key_hybrid_time, const MonoDelta& ttl,
-                             const HybridTime& read_hybrid_time, bool* has_expired);
-
-// Computes the table level TTL, given a schema.
-const MonoDelta TableTTL(const Schema& schema);
-
-// Computes the effective TTL by combining the column level TTL with the table level TTL.
-const MonoDelta ComputeTTL(const MonoDelta& value_ttl, const MonoDelta& table_ttl);
-
-// Utility function that computes the effective TTL directly given a schema
-const MonoDelta ComputeTTL(const MonoDelta& value_ttl, const Schema& schema);
-
-// Cassandra considers a TTL of zero as resetting the TTL.
-static const uint64_t kResetTTL = 0;
 
 }  // namespace docdb
 }  // namespace yb

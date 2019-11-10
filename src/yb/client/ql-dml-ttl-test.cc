@@ -12,7 +12,14 @@
 //
 
 #include "yb/client/ql-dml-test-base.h"
-#include "yb/ql/util/statement_result.h"
+
+#include "yb/client/client.h"
+#include "yb/client/session.h"
+#include "yb/client/table_handle.h"
+
+#include "yb/common/ql_value.h"
+
+#include "yb/yql/cql/ql/util/statement_result.h"
 
 namespace yb {
 namespace client {
@@ -38,54 +45,52 @@ class QLDmlTTLTest : public QLDmlTestBase {
     b.AddColumn("c3")->Type(INT32);
     b.AddColumn("c4")->Type(STRING);
 
-    table_.Create(kTableName, client_.get(), &b);
+    ASSERT_OK(table_.Create(kTableName, CalcNumTablets(3), client_.get(), &b));
   }
 
   TableHandle table_;
 };
 
 TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
+  const YBSessionPtr session(NewSession());
   {
     // insert into t (k, c1, c2) values (1, 1, "yuga-hello") using ttl 2;
-    const shared_ptr<YBqlWriteOp> op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const YBqlWriteOpPtr op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
-    table_.SetInt32Expression(req->add_hashed_column_values(), 1);
-    table_.SetInt32ColumnValue(req->add_column_values(), "c1", 1);
-    table_.SetStringColumnValue(req->add_column_values(), "c2", "yuga-hello");
+    QLAddInt32HashValue(req, 1);
+    table_.AddInt32ColumnValue(req, "c1", 1);
+    table_.AddStringColumnValue(req, "c2", "yuga-hello");
     req->set_ttl(2 * 1000);
-    const shared_ptr<YBSession> session(client_->NewSession(false /* read_only */));
-    CHECK_OK(session->Apply(op));
+    CHECK_OK(session->ApplyAndFlush(op));
 
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
   }
 
   {
     // insert into t (k, c3, c4) values (1, 2, "yuga-hi") using ttl 4;
-    const shared_ptr<YBqlWriteOp> op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const YBqlWriteOpPtr op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
-    table_.SetInt32Expression(req->add_hashed_column_values(), 1);
-    table_.SetInt32ColumnValue(req->add_column_values(), "c3", 2);
-    table_.SetStringColumnValue(req->add_column_values(), "c4", "yuga-hi");
+    QLAddInt32HashValue(req, 1);
+    table_.AddInt32ColumnValue(req, "c3", 2);
+    table_.AddStringColumnValue(req, "c4", "yuga-hi");
     req->set_ttl(4 * 1000);
-    const shared_ptr<YBSession> session(client_->NewSession(false /* read_only */));
-    CHECK_OK(session->Apply(op));
+    CHECK_OK(session->ApplyAndFlush(op));
 
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
   }
 
   {
     // select * from t where k = 1;
-    const shared_ptr<YBqlReadOp> op = table_.NewReadOp();
+    const YBqlReadOpPtr op = table_.NewReadOp();
     auto* const req = op->mutable_request();
-    table_.SetInt32Expression(req->add_hashed_column_values(), 1);
+    QLAddInt32HashValue(req, 1);
     table_.AddColumns(kAllColumns, req);
 
-    const shared_ptr<YBSession> session(client_->NewSession(true /* read_only */));
-    CHECK_OK(session->Apply(op));
+    CHECK_OK(session->ApplyAndFlush(op));
 
     // Expect all 4 columns (c1, c2, c3, c4) to be valid right now.
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
-    unique_ptr<QLRowBlock> rowblock(RowsResult(op.get()).GetRowBlock());
+    auto rowblock = RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(rowblock->row_count(), 1);
     const auto& row = rowblock->row(0);
     EXPECT_EQ(row.column(0).int32_value(), 1);
@@ -100,17 +105,16 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
   {
     // select * from t where k = 1;
-    const shared_ptr<YBqlReadOp> op = table_.NewReadOp();
+    const YBqlReadOpPtr op = table_.NewReadOp();
     auto* const req = op->mutable_request();
-    table_.SetInt32Expression(req->add_hashed_column_values(), 1);
+    QLAddInt32HashValue(req, 1);
     table_.AddColumns(kAllColumns, req);
 
-    const shared_ptr<YBSession> session(client_->NewSession(true /* read_only */));
-    CHECK_OK(session->Apply(op));
+    CHECK_OK(session->ApplyAndFlush(op));
 
     // Expect columns (c1, c2) to be null and (c3, c4) to be valid right now.
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
-    unique_ptr<QLRowBlock> rowblock(RowsResult(op.get()).GetRowBlock());
+    auto rowblock = RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(rowblock->row_count(), 1);
     const auto& row = rowblock->row(0);
     EXPECT_EQ(row.column(0).int32_value(), 1);
@@ -125,20 +129,19 @@ TEST_F(QLDmlTTLTest, TestInsertWithTTL) {
 
   {
     // select * from t where k = 1;
-    const shared_ptr<YBqlReadOp> op = table_.NewReadOp();
+    const YBqlReadOpPtr op = table_.NewReadOp();
     auto* const req = op->mutable_request();
-    table_.SetInt32Expression(req->add_hashed_column_values(), 1);
+    QLAddInt32HashValue(req, 1);
     table_.AddColumns(kAllColumns, req);
 
-    const shared_ptr<YBSession> session(client_->NewSession(true /* read_only */));
-    CHECK_OK(session->Apply(op));
+    CHECK_OK(session->ApplyAndFlush(op));
 
     // Expect all 4 columns (c1, c2, c3, c4) to be null.
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
-    unique_ptr<QLRowBlock> rowblock(RowsResult(op.get()).GetRowBlock());
+    auto rowblock = RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(rowblock->row_count(), 0);
   }
-
 }
+
 }  // namespace client
 }  // namespace yb

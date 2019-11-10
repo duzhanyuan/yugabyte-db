@@ -34,10 +34,19 @@
 #ifndef YB_UTIL_OBJECT_POOL_H
 #define YB_UTIL_OBJECT_POOL_H
 
-#include <glog/logging.h>
 #include <stdint.h>
-#include "yb/gutil/manual_constructor.h"
+
+#include <thread>
+#include <functional>
+
+#include <boost/container/stable_vector.hpp>
+#include <boost/lockfree/stack.hpp>
+
+#include <glog/logging.h>
+
 #include "yb/gutil/gscoped_ptr.h"
+#include "yb/gutil/manual_constructor.h"
+#include "yb/gutil/sysinfo.h"
 
 namespace yb {
 
@@ -177,6 +186,66 @@ class ReturnToPool {
   ObjectPool<T> *pool_;
 };
 
+template <class T>
+class ThreadSafeObjectPool {
+ public:
+  typedef std::function<T*()> Factory;
+  typedef std::function<void(T*)> Deleter;
+
+  explicit ThreadSafeObjectPool(Factory factory, Deleter deleter = std::default_delete<T>())
+      : factory_(std::move(factory)), deleter_(std::move(deleter)) {
+    // Need the actual number of CPUs, so we do not use the Gflag value
+    auto num_cpus = base::RawNumCPUs();
+    pools_.reserve(num_cpus);
+    while (pools_.size() != num_cpus) {
+      pools_.emplace_back(50);
+    }
+  }
+
+  ~ThreadSafeObjectPool() {
+    T* object;
+    for (auto& pool : pools_) {
+      while (pool.pop(object)) {
+        deleter_(object);
+      }
+    }
+  }
+
+  T* Take() {
+    auto& pool = pools_[GetCPU()];
+    T* result;
+    if (pool.pop(result)) {
+      return result;
+    }
+    return factory_();
+  }
+
+  void Release(T* value) {
+    auto& pool = pools_[GetCPU()];
+    if (!pool.bounded_push(value)) {
+      deleter_(value);
+    }
+  }
+
+ private:
+  size_t GetCPU() const {
+#if defined(__APPLE__)
+    // OSX doesn't have a way to get the CPU, so we'll pick a random one.
+    return std::hash<std::thread::id>()(std::this_thread::get_id()) % pools_.size();
+#else
+    size_t cpu = sched_getcpu();
+    DCHECK_LT(cpu, pools_.size());
+    return cpu;
+#endif // defined(__APPLE__)
+  }
+
+  typedef boost::lockfree::stack<T*> Pool;
+
+  Factory factory_;
+  Deleter deleter_;
+  boost::container::stable_vector<Pool> pools_;
+};
 
 } // namespace yb
-#endif
+
+#endif // YB_UTIL_OBJECT_POOL_H

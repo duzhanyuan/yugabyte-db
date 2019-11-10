@@ -53,5 +53,38 @@ This is my
       )#"));
 }
 
+TEST(StringTrimTest, TestTrimCppComments) {
+  ASSERT_EQ(
+      R"#(
+Line1
+
+Line2
+)#",
+      TrimCppComments(R"#(
+Line1  // This is a comment
+
+Line2  // This is a comment too
+)#")
+      );
+}
+
+TEST(StringTrimTest, TrimTrailingWhitespaceFromEveryLine) {
+  ASSERT_EQ(
+      "Line1\nLine2\nLine3\n",
+      TrimTrailingWhitespaceFromEveryLine("Line1   \nLine2\nLine3   \n"));
+  ASSERT_EQ(
+      "Line1\nLine2\nLine3",
+      TrimTrailingWhitespaceFromEveryLine("Line1   \nLine2\nLine3   "));
+  ASSERT_EQ(
+      "Line1  // Some C++ comment\nLine2\n",
+      TrimTrailingWhitespaceFromEveryLine("Line1  // Some C++ comment   \nLine2   \n"));
+  ASSERT_EQ(
+      "Line1  // Some C++ comment\nLine2",
+      TrimTrailingWhitespaceFromEveryLine("Line1  // Some C++ comment   \nLine2   "));
+  ASSERT_EQ(
+      "\n  Line2\nLine3\n",
+      TrimTrailingWhitespaceFromEveryLine("\n  Line2\nLine3   \n"));
+}
+
 }  // namespace util
 }  // namespace yb

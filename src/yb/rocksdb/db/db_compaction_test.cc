@@ -21,13 +21,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <atomic>
+
 #include "yb/rocksdb/db/db_test_util.h"
 #include "yb/rocksdb/port/stack_trace.h"
 #include "yb/rocksdb/experimental.h"
 #include "yb/rocksdb/utilities/convenience.h"
 #include "yb/rocksdb/util/sync_point.h"
+#include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/random_util.h"
+#include "yb/util/test_util.h"
 
 DECLARE_bool(flush_rocksdb_on_shutdown);
+
+using std::atomic;
+using namespace std::literals;
 
 namespace rocksdb {
 
@@ -57,34 +66,6 @@ class DBCompactionTestWithParam
 };
 
 namespace {
-class OnFileDeletionListener : public EventListener {
- public:
-  OnFileDeletionListener() :
-      matched_count_(0),
-      expected_file_name_("") {}
-
-  void SetExpectedFileName(
-      const std::string file_name) {
-    expected_file_name_ = file_name;
-  }
-
-  void VerifyMatchedCount(size_t expected_value) {
-    ASSERT_EQ(matched_count_, expected_value);
-  }
-
-  void OnTableFileDeleted(
-      const TableFileDeletionInfo& info) override {
-    if (expected_file_name_ != "") {
-      ASSERT_EQ(expected_file_name_, info.file_path);
-      expected_file_name_ = "";
-      matched_count_++;
-    }
-  }
-
- private:
-  size_t matched_count_;
-  std::string expected_file_name_;
-};
 
 class FlushedFileCollector : public EventListener {
  public:
@@ -241,22 +222,23 @@ void TestFlushedOpId(bool compact, DBCompactionTest* test) {
   options.compaction_style = kCompactionStyleUniversal;
   options.num_levels = 1;
   options.initial_seqno = 100500;
+  options.boundary_extractor = test::MakeBoundaryValuesExtractor();
 
   test->DestroyAndReopen(options);
 
-  OpId last_op_id;
   const size_t kNumBatches = 4;
   for (size_t i = 0; i != kNumBatches; ++i) {
     WriteBatch batch;
-    last_op_id = OpId(1, 1 + i);
-    batch.SetUserOpId(last_op_id);
+    test::TestUserFrontiers frontiers(1 + i, 1 + i);
+    batch.SetFrontiers(&frontiers);
     batch.Put(std::to_string(i), std::to_string(-i));
 
     WriteOptions write_options;
     write_options.disableWAL = true;
     test->dbfull()->Write(write_options, &batch);
     test->dbfull()->TEST_FlushMemTable(true);
-    ASSERT_EQ(last_op_id, test->dbfull()->GetFlushedOpId());
+    ASSERT_EQ(1 + i,
+              down_cast<test::TestUserFrontier&>(*test->dbfull()->GetFlushedFrontier()).Value());
   }
 
   std::vector<LiveFileMetaData> files;
@@ -276,7 +258,8 @@ void TestFlushedOpId(bool compact, DBCompactionTest* test) {
 
   ASSERT_OK(test->TryReopen(options));
 
-  ASSERT_EQ(last_op_id, test->dbfull()->GetFlushedOpId());
+  ASSERT_EQ(kNumBatches,
+            down_cast<test::TestUserFrontier&>(*test->dbfull()->GetFlushedFrontier()).Value());
 }
 
 } // namespace
@@ -287,6 +270,51 @@ TEST_F(DBCompactionTest, LastFlushedOpId) {
 
 TEST_F(DBCompactionTest, LastFlushedOpIdWithCompaction) {
   TestFlushedOpId(true /* compact */, this);
+}
+
+TEST_F(DBCompactionTest, Checkpoint) {
+  std::atomic<int> checkpoints(0);
+
+  yb::TestThreadHolder thread_holder;
+
+  thread_holder.AddThread([this, &stop = thread_holder.stop_flag()] {
+    yb::SetFlagOnExit set_flag(&stop);
+
+    int key = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+      WriteBatch batch;
+      ++key;
+      batch.Put(std::to_string(key), std::to_string(-key));
+
+      WriteOptions write_options;
+      write_options.disableWAL = true;
+      dbfull()->Write(write_options, &batch);
+      dbfull()->TEST_FlushMemTable(true);
+    }
+  });
+
+  thread_holder.AddThread([this, &stop = thread_holder.stop_flag(), &checkpoints] {
+    yb::SetFlagOnExit set_flag(&stop);
+
+    auto checkpoint_dir = test::TmpDir(env_) + "/checkpoint_" + yb::RandomHumanReadableString(10);
+    while (!stop.load(std::memory_order_acquire)) {
+      ASSERT_OK(checkpoint::CreateCheckpoint(dbfull(), checkpoint_dir));
+
+      auto options = CurrentOptions();
+      DB* checkpoint_db_raw_ptr = nullptr;
+      options.create_if_missing = false;
+      ASSERT_OK(rocksdb::DB::Open(options, checkpoint_dir, &checkpoint_db_raw_ptr));
+      std::unique_ptr<rocksdb::DB> checkpoint_db(checkpoint_db_raw_ptr);
+      checkpoint_db.reset();
+
+      ASSERT_OK(DestroyDB(checkpoint_dir, options));
+      ++checkpoints;
+    }
+  });
+
+  thread_holder.WaitAndStop(5s);
+
+  LOG(INFO) << "Total checkpoints: " << checkpoints.load(std::memory_order_acquire);
 }
 
 TEST_F(DBCompactionTest, SkipStatsUpdateTest) {
@@ -682,7 +710,8 @@ TEST_F(DBCompactionTest, BGCompactionsAllowed) {
 }
 
 TEST_F(DBCompactionTest, ClogSingleCompactionQueue) {
-  int slowdown_writes = 0, stop_writes = 0;
+  atomic<int> slowdown_writes{0};
+  atomic<int> stop_writes{0};
 
   rocksdb::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::NotifyOnFlushCompleted::TriggeredWriteStop",
@@ -760,8 +789,10 @@ TEST_F(DBCompactionTest, ClogSingleCompactionQueue) {
 }
 
 TEST_F(DBCompactionTest, ClogMultipleCompactionQueues) {
-  int slowdown_writes = 0, stop_writes = 0;
-  int num_large_compactions = 0, num_small_compactions = 0;
+  atomic<int> slowdown_writes{0};
+  atomic<int> stop_writes{0};
+  atomic<int> num_large_compactions{0};
+  atomic<int> num_small_compactions{0};
 
   // Create several column families. Make large compaction triggers in all
   // but one of them and see no slowdown in writes when small compactions
@@ -837,11 +868,6 @@ TEST_F(DBCompactionTest, ClogMultipleCompactionQueues) {
   ASSERT_EQ(num_small_compactions, 0);
   int num_large_compactions_before_small_flushes = num_large_compactions;
 
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
-      {"DBImpl:BackgroundCompaction:LargeCompaction",
-          "DBImpl:BackgroundCompaction:SmallCompaction"}
-  });
-
   for (int num = 0; num < options.level0_stop_writes_trigger; num++) {
     for (int i = 0; i < kNumKeysPerSmallFile; i++) {
       ASSERT_OK(Put(3, Key(i), ""));
@@ -857,7 +883,7 @@ TEST_F(DBCompactionTest, ClogMultipleCompactionQueues) {
 
   rocksdb::SyncPoint::GetInstance()->DisableProcessing();
 
-  ASSERT_GT(num_small_compactions, options.level0_stop_writes_trigger);
+  ASSERT_GE(num_small_compactions, options.level0_stop_writes_trigger);
   ASSERT_GT(num_large_compactions, num_large_compactions_before_small_flushes);
 }
 
@@ -2196,7 +2222,7 @@ TEST_F(DBCompactionTest, FilesDeletedAfterCompaction) {
   } while (ChangeCompactOptions());
 }
 
-// Check level comapction with compact files
+// Check level compaction with compact files
 TEST_P(DBCompactionTestWithParam, DISABLED_CompactFilesOnLevelCompaction) {
   const int kTestKeySize = 16;
   const int kTestValueSize = 984;

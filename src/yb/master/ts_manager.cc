@@ -35,11 +35,12 @@
 #include <mutex>
 #include <vector>
 
-#include <boost/thread/shared_mutex.hpp>
 #include "yb/gutil/map-util.h"
 #include "yb/master/master.pb.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/util/flag_tags.h"
+#include "yb/common/wire_protocol.h"
+#include "yb/util/shared_lock.h"
 
 DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,
              "The period of time that a Master can go without receiving a heartbeat from a "
@@ -61,14 +62,15 @@ TSManager::~TSManager() {
 }
 
 Status TSManager::LookupTS(const NodeInstancePB& instance,
-                           shared_ptr<TSDescriptor>* ts_desc) {
-  boost::shared_lock<rw_spinlock> l(lock_);
-  const shared_ptr<TSDescriptor>* found_ptr =
+                           TSDescriptorPtr* ts_desc) {
+  SharedLock<decltype(lock_)> l(lock_);
+
+  const TSDescriptorPtr* found_ptr =
     FindOrNull(servers_by_id_, instance.permanent_uuid());
-  if (!found_ptr) {
+  if (!found_ptr || (*found_ptr)->IsRemoved()) {
     return STATUS(NotFound, "unknown tablet server ID", instance.ShortDebugString());
   }
-  const shared_ptr<TSDescriptor>& found = *found_ptr;
+  const TSDescriptorPtr& found = *found_ptr;
 
   if (instance.instance_seqno() != found->latest_seqno()) {
     return STATUS(NotFound, "mismatched instance sequence number", instance.ShortDebugString());
@@ -79,61 +81,156 @@ Status TSManager::LookupTS(const NodeInstancePB& instance,
 }
 
 bool TSManager::LookupTSByUUID(const string& uuid,
-                               std::shared_ptr<TSDescriptor>* ts_desc) {
-  boost::shared_lock<rw_spinlock> l(lock_);
-  return FindCopy(servers_by_id_, uuid, ts_desc);
+                               TSDescriptorPtr* ts_desc) {
+  SharedLock<decltype(lock_)> l(lock_);
+  const TSDescriptorPtr* found_ptr = FindOrNull(servers_by_id_, uuid);
+  if (!found_ptr || (*found_ptr)->IsRemoved()) {
+    return false;
+  }
+  *ts_desc = *found_ptr;
+  return true;
+}
+
+bool HasSameHostPort(const google::protobuf::RepeatedPtrField<HostPortPB>& old_addresses,
+                     const google::protobuf::RepeatedPtrField<HostPortPB>& new_addresses) {
+  for (const auto& old_address : old_addresses) {
+    for (const auto& new_address : new_addresses) {
+      if (old_address.host() == new_address.host() && old_address.port() == new_address.port())
+        return true;
+    }
+  }
+
+  return false;
 }
 
 Status TSManager::RegisterTS(const NodeInstancePB& instance,
                              const TSRegistrationPB& registration,
-                             std::shared_ptr<TSDescriptor>* desc) {
-  std::lock_guard<rw_spinlock> l(lock_);
+                             CloudInfoPB local_cloud_info,
+                             rpc::ProxyCache* proxy_cache) {
+  std::lock_guard<decltype(lock_)> l(lock_);
   const string& uuid = instance.permanent_uuid();
 
-  if (!ContainsKey(servers_by_id_, uuid)) {
-    gscoped_ptr<TSDescriptor> new_desc;
-    RETURN_NOT_OK(TSDescriptor::RegisterNew(instance, registration, &new_desc));
-    InsertOrDie(&servers_by_id_, uuid, shared_ptr<TSDescriptor>(new_desc.release()));
+  auto it = servers_by_id_.find(uuid);
+  if (it == servers_by_id_.end()) {
+    // Check if a server with the same host and port already exists.
+    for (const auto& map_entry : servers_by_id_) {
+      const auto ts_info = map_entry.second->GetTSInformationPB();
+
+      if (HasSameHostPort(ts_info->registration().common().private_rpc_addresses(),
+                          registration.common().private_rpc_addresses()) ||
+          HasSameHostPort(ts_info->registration().common().broadcast_addresses(),
+                          registration.common().broadcast_addresses())) {
+        if (ts_info->tserver_instance().instance_seqno() >= instance.instance_seqno()) {
+          // Skip adding the node since we already have a node with the same rpc address and
+          // a higher sequence number.
+          LOG(WARNING) << "Skipping registration for TS " << instance.ShortDebugString()
+              << " since an entry with same host/port but a higher sequence number exists "
+              << ts_info->ShortDebugString();
+          return Status::OK();
+        } else {
+          LOG(WARNING) << "Removing entry: " << ts_info->ShortDebugString()
+              << " since we received registration for a tserver with a higher sequence number: "
+              << instance.ShortDebugString();
+          // Mark the old node to be removed, since we have a newer sequence number.
+          map_entry.second->SetRemoved();
+        }
+      }
+    }
+
+    auto new_desc = VERIFY_RESULT(TSDescriptor::RegisterNew(
+        instance, registration, std::move(local_cloud_info), proxy_cache));
+    InsertOrDie(&servers_by_id_, uuid, std::move(new_desc));
     LOG(INFO) << "Registered new tablet server { " << instance.ShortDebugString()
-              << " } with Master";
+              << " } with Master, full list: " << yb::ToString(servers_by_id_);
+
   } else {
-    const shared_ptr<TSDescriptor>& found = FindOrDie(servers_by_id_, uuid);
-    RETURN_NOT_OK(found->Register(instance, registration));
+    RETURN_NOT_OK(it->second->Register(
+        instance, registration, std::move(local_cloud_info), proxy_cache));
     LOG(INFO) << "Re-registered known tablet server { " << instance.ShortDebugString()
-              << " } with Master";
+              << " }: " << registration.ShortDebugString();
   }
 
   return Status::OK();
 }
 
-void TSManager::GetAllDescriptors(vector<shared_ptr<TSDescriptor> > *descs) const {
+void TSManager::GetDescriptors(std::function<bool(const TSDescriptorPtr&)> condition,
+                               TSDescriptorVector* descs) const {
   descs->clear();
-  boost::shared_lock<rw_spinlock> l(lock_);
-  AppendValuesFromMap(servers_by_id_, descs);
-}
+  SharedLock<decltype(lock_)> l(lock_);
 
-bool TSManager::IsTSLive(const shared_ptr<TSDescriptor>& ts) const {
-  return ts->TimeSinceHeartbeat().ToMilliseconds() <
-         GetAtomicFlag(&FLAGS_tserver_unresponsive_timeout_ms);
-}
-
-void TSManager::GetAllLiveDescriptors(vector<shared_ptr<TSDescriptor> > *descs) const {
-  descs->clear();
-
-  boost::shared_lock<rw_spinlock> l(lock_);
   descs->reserve(servers_by_id_.size());
   for (const TSDescriptorMap::value_type& entry : servers_by_id_) {
-    const shared_ptr<TSDescriptor>& ts = entry.second;
-    if (IsTSLive(ts)) {
+    const TSDescriptorPtr& ts = entry.second;
+    if (condition(ts)) {
       descs->push_back(ts);
     }
   }
 }
 
-const std::shared_ptr<TSDescriptor> TSManager::GetTSDescriptor(const HostPortPB& host_port) const {
-  boost::shared_lock<rw_spinlock> l(lock_);
+void TSManager::GetAllDescriptors(TSDescriptorVector* descs) const {
+  GetDescriptors([](const TSDescriptorPtr& ts) -> bool { return !ts->IsRemoved(); }, descs);
+}
+
+bool TSManager::IsTSLive(const TSDescriptorPtr& ts) {
+  return ts->TimeSinceHeartbeat().ToMilliseconds() <
+         GetAtomicFlag(&FLAGS_tserver_unresponsive_timeout_ms) && !ts->IsRemoved();
+}
+
+void TSManager::GetAllLiveDescriptors(TSDescriptorVector* descs,
+    const BlacklistSet blacklist) const {
+  GetDescriptors([blacklist](const TSDescriptorPtr& ts) -> bool {
+    return IsTSLive(ts) && !IsTsBlacklisted(ts, blacklist); }, descs);
+}
+
+void TSManager::GetAllReportedDescriptors(TSDescriptorVector* descs) const {
+  GetDescriptors([](const TSDescriptorPtr& ts)
+                   -> bool { return IsTSLive(ts) && ts->has_tablet_report(); }, descs);
+}
+
+bool TSManager::IsTsInCluster(const TSDescriptorPtr& ts, string cluster_uuid) {
+  return ts->placement_uuid() == cluster_uuid;
+}
+
+bool TSManager::IsTsBlacklisted(const TSDescriptorPtr& ts,
+    const BlacklistSet blacklist) {
+  if (blacklist.empty()) {
+    return false;
+  }
+  for (const auto tserver : blacklist) {
+    HostPortPB hp;
+    HostPortToPB(tserver, &hp);
+    if (ts->IsRunningOn(hp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TSManager::GetAllLiveDescriptorsInCluster(TSDescriptorVector* descs,
+    string placement_uuid,
+    const BlacklistSet blacklist,
+    bool primary_cluster) const {
+  descs->clear();
+  SharedLock<decltype(lock_)> l(lock_);
+
+  descs->reserve(servers_by_id_.size());
   for (const TSDescriptorMap::value_type& entry : servers_by_id_) {
-    const shared_ptr<TSDescriptor>& ts = entry.second;
+    const TSDescriptorPtr& ts = entry.second;
+    // ts_in_cluster true if there's a matching config and tserver placement uuid or
+    // if we're getting primary nodes and the tserver placement uuid is empty.
+    bool ts_in_cluster = (IsTsInCluster(ts, placement_uuid) ||
+                         (primary_cluster && ts->placement_uuid().empty()));
+    if (IsTSLive(ts) && !IsTsBlacklisted(ts, blacklist) && ts_in_cluster) {
+      descs->push_back(ts);
+    }
+  }
+}
+
+const TSDescriptorPtr TSManager::GetTSDescriptor(const HostPortPB& host_port) const {
+  SharedLock<decltype(lock_)> l(lock_);
+
+  for (const TSDescriptorMap::value_type& entry : servers_by_id_) {
+    const TSDescriptorPtr& ts = entry.second;
     if (IsTSLive(ts) && ts->IsRunningOn(host_port)) {
       return ts;
     }
@@ -143,10 +240,20 @@ const std::shared_ptr<TSDescriptor> TSManager::GetTSDescriptor(const HostPortPB&
 }
 
 int TSManager::GetCount() const {
-  boost::shared_lock<rw_spinlock> l(lock_);
-  return servers_by_id_.size();
+  SharedLock<decltype(lock_)> l(lock_);
+
+  return GetCountUnlocked();
+}
+
+int TSManager::GetCountUnlocked() const {
+  size_t count = 0;
+  for (const auto& map_entry : servers_by_id_) {
+    if (!map_entry.second->IsRemoved()) {
+      count++;
+    }
+  }
+  return count;
 }
 
 } // namespace master
 } // namespace yb
-

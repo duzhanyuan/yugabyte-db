@@ -31,35 +31,40 @@
 //
 package org.yb.client;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
-import static org.yb.Common.HostPortPB;
-import static org.yb.client.RowResult.timestampToString;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertNotEquals;
+import static org.yb.AssertionWrappers.assertNotNull;
+import static org.yb.AssertionWrappers.assertTrue;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.Executors;
+import java.util.*;
 
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.ColumnSchema;
-import org.yb.Schema;
+import org.yb.Common.HostPortPB;
 import org.yb.Common.TableType;
+import org.yb.Schema;
 import org.yb.Type;
+import org.yb.master.Master;
+import org.yb.minicluster.MiniYBCluster;
+import org.yb.tserver.Tserver.TabletServerErrorPB;
 
 import com.google.common.net.HostAndPort;
 
+import com.google.protobuf.ByteString;
+
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+import org.yb.util.Timeouts;
+
+@RunWith(value=YBTestRunner.class)
 public class TestYBClient extends BaseYBClientTest {
-  private static final Logger LOG = LoggerFactory.getLogger(BaseYBClientTest.class);
+  protected static final Logger LOG = LoggerFactory.getLogger(TestYBClient.class);
 
   private String tableName;
 
@@ -76,33 +81,7 @@ public class TestYBClient extends BaseYBClientTest {
   }
 
   private void waitForMasterLeader() throws Exception {
-    syncClient.waitForMasterLeader(TestUtils.adjustTimeoutForBuildType(10000));
-  }
-
-  private Schema createManyStringsSchema() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(4);
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.STRING).key(true).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.STRING).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.STRING).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c3", Type.STRING).nullable(true).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c4", Type.STRING).nullable(true).build());
-    return new Schema(columns);
-  }
-
-  private Schema createSchemaWithBinaryColumns() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.BINARY).key(true).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.STRING).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c2", Type.DOUBLE).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c3", Type.BINARY).nullable(true).build());
-    return new Schema(columns);
-  }
-
-  private Schema createSchemaWithTimestampColumns() {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.TIMESTAMP).key(true).build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.TIMESTAMP).nullable(true).build());
-    return new Schema(columns);
+    syncClient.waitForMasterLeader(Timeouts.adjustTimeoutSecForBuildType(10000));
   }
 
   /**
@@ -114,6 +93,113 @@ public class TestYBClient extends BaseYBClientTest {
     LOG.info("Starting testIsLoadBalanced");
     IsLoadBalancedResponse resp = syncClient.getIsLoadBalanced(0 /* numServers */);
     assertFalse(resp.hasError());
+  }
+
+  /**
+   * Test load balancer idle check.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testIsLoadBalancerIdle() throws Exception {
+    LOG.info("Starting testIsLoadBalancerIdle");
+    IsLoadBalancerIdleResponse resp = syncClient.getIsLoadBalancerIdle();
+    assertFalse(resp.hasError());
+  }
+
+  /**
+   * Test that we can create and destroy client objects (to catch leaking resources).
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testClientCreateDestroy() throws Exception {
+    LOG.info("Starting testClientCreateDestroy");
+    YBClient myClient = null;
+    for (int i = 0 ; i < 1000; i++) {
+      AsyncYBClient aClient = new AsyncYBClient.AsyncYBClientBuilder(masterAddresses)
+                                .build();
+      myClient = new YBClient(aClient);
+      myClient.close();
+      myClient = null;
+    }
+  }
+
+  /**
+   * Test Waiting for load balance, with simulated errors.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testWaitForLoadBalance() throws Exception {
+    syncClient.injectWaitError();
+    boolean isBalanced = syncClient.waitForLoadBalance(Long.MAX_VALUE, 0);
+    assertTrue(isBalanced);
+  }
+
+  /**
+   * Test Waiting for load balancer idle, with simulated errors.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testWaitForLoadBalancerIdle() throws Exception {
+    syncClient.injectWaitError();
+    boolean isIdle = syncClient.waitForLoadBalancerIdle(Long.MAX_VALUE);
+    assertTrue(isIdle);
+  }
+
+  private void testServerReady(HostAndPort hp, boolean isTserver) throws Exception {
+    testServerReady(hp, isTserver, false /* slowMaster */);
+  }
+
+  private void testServerReady(HostAndPort hp, boolean isTserver, boolean slowMaster)
+      throws Exception {
+    IsServerReadyResponse resp = syncClient.isServerReady(hp, isTserver);
+    assertFalse(resp.hasError());
+    assertEquals(resp.getNumNotRunningTablets(), slowMaster ? 1 : 0);
+    assertEquals(resp.getCode(), TabletServerErrorPB.Code.UNKNOWN_ERROR);
+    assertEquals(resp.getTotalTablets(), isTserver ? 0 : 1);
+  }
+
+  /**
+   * Test to check tserver readiness status.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testTServerReady() throws Exception {
+    for (HostAndPort thp : miniCluster.getTabletServers().keySet()) {
+      testServerReady(thp, true);
+    }
+  }
+
+  /**
+   * Test to check master readiness status.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testMasterReady() throws Exception {
+    for (HostAndPort mhp : miniCluster.getMasters().keySet()) {
+      testServerReady(mhp, false);
+    }
+  }
+
+  /**
+   * Test to check master not ready status.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testMasterNotReady() throws Exception {
+    destroyMiniCluster();
+    List<String> masterArgs = new ArrayList<String>();
+    masterArgs.add("--simulate_slow_system_tablet_bootstrap_secs=20");
+    List<List<String>> tserverArgs = new ArrayList<List<String>>();
+    int numServers = 3;
+    for (int i = 1; i <= numServers; i++) {
+      tserverArgs.add(Arrays.asList());
+    }
+    createMiniCluster(numServers, masterArgs, tserverArgs);
+    miniCluster.restart(false /* waitForMasterLeader */);
+
+    for (HostAndPort mhp : miniCluster.getMasters().keySet()) {
+      testServerReady(mhp, false, true);
+    }
   }
 
   /**
@@ -171,6 +257,30 @@ public class TestYBClient extends BaseYBClientTest {
   }
 
   /**
+   * Test for Master Configuration Change operation using host/port.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testChangeMasterConfigWithHostPort() throws Exception {
+    int numBefore = miniCluster.getNumMasters();
+    List<HostAndPort> hostports = miniCluster.getMasterHostPorts();
+    HostAndPort leaderHp = BaseYBClientTest.findLeaderMasterHostPort();
+    HostAndPort nonLeaderHp = null;
+    for (HostAndPort hp : hostports) {
+      if (!hp.equals(leaderHp)) {
+        nonLeaderHp = hp;
+        break;
+      }
+    }
+    LOG.info("Using host/port {}/{}.",nonLeaderHp.getHostText(), nonLeaderHp.getPort());
+    ChangeConfigResponse resp = syncClient.changeMasterConfig(
+        nonLeaderHp.getHostText(), nonLeaderHp.getPort(), false, true);
+    assertFalse(resp.hasError());
+    ListMastersResponse listResp = syncClient.listMasters();
+    assertEquals(listResp.getMasters().size(), numBefore - 1);
+  }
+
+  /**
    * Test for Master Configuration Change which triggers a leader step down operation.
    * @throws Exception
    */
@@ -202,8 +312,13 @@ public class TestYBClient extends BaseYBClientTest {
     int numBefore = listResp.getMasters().size();
     LeaderStepDownResponse resp = syncClient.masterLeaderStepDown();
     assertFalse(resp.hasError());
-    // Sleep to give time for re-election completion. TODO: Add api for election completion.
+    // We might have failed due to election taking too long in this instance: https://goo.gl/xYmZDb.
     Thread.sleep(6000);
+    TestUtils.waitFor(
+        () -> {
+          return syncClient.getLeaderMasterUUID() != null;
+        }, 20000);
+
     String newLeaderUuid = syncClient.getLeaderMasterUUID();
     assertNotNull(newLeaderUuid);
     listResp = syncClient.listMasters();
@@ -310,6 +425,89 @@ public class TestYBClient extends BaseYBClientTest {
     assertEquals(3, resp.getConfig().getReplicationInfo().getLiveReplicas().getNumReplicas());
   }
 
+  @Test(timeout = 100000)
+  public void testAffinitizedLeaders() throws Exception {
+    destroyMiniCluster();
+    List<List<String>> tserverArgs = new ArrayList<List<String>>();
+    tserverArgs.add(Arrays.asList(
+        "--placement_cloud=testCloud", "--placement_region=testRegion", "--placement_zone=testZone0"));
+    tserverArgs.add(Arrays.asList(
+        "--placement_cloud=testCloud", "--placement_region=testRegion", "--placement_zone=testZone1"));
+    tserverArgs.add(Arrays.asList(
+        "--placement_cloud=testCloud", "--placement_region=testRegion", "--placement_zone=testZone2"));
+    createMiniCluster(3, tserverArgs);
+    LOG.info("created mini cluster");
+
+    List<org.yb.Common.CloudInfoPB> leaders = new ArrayList<org.yb.Common.CloudInfoPB>();
+
+    org.yb.Common.CloudInfoPB.Builder cloudInfoBuilder = org.yb.Common.CloudInfoPB.newBuilder().
+    setPlacementCloud("testCloud").setPlacementRegion("testRegion");
+
+    org.yb.Common.CloudInfoPB ci0 = cloudInfoBuilder.setPlacementZone("testZone0").build();
+    org.yb.Common.CloudInfoPB ci1 = cloudInfoBuilder.setPlacementZone("testZone1").build();
+    org.yb.Common.CloudInfoPB ci2 = cloudInfoBuilder.setPlacementZone("testZone2").build();
+
+    // First, making the first two zones affinitized leaders.
+    leaders.add(ci0);
+    leaders.add(ci1);
+
+    ModifyClusterConfigAffinitizedLeaders operation =
+        new ModifyClusterConfigAffinitizedLeaders(syncClient, leaders);
+    try {
+      operation.doCall();
+    } catch (Exception e) {
+      LOG.warn("Failed with error:", e);
+      assertTrue(false);
+    }
+
+    List<ColumnSchema> columns = new ArrayList<>(hashKeySchema.getColumns());
+    Schema newSchema = new Schema(columns);
+    CreateTableOptions tableOptions = new CreateTableOptions().setNumTablets(8);
+    YBTable table = syncClient.createTable(DEFAULT_KEYSPACE_NAME, "AffinitizedLeaders", newSchema, tableOptions);
+
+    assertTrue(syncClient.waitForAreLeadersOnPreferredOnlyCondition(DEFAULT_TIMEOUT_MS));
+
+    leaders.clear();
+    //Now make only the third zone an affinitized leader.
+    leaders.add(ci2);
+
+    operation = new ModifyClusterConfigAffinitizedLeaders(syncClient, leaders);
+    try {
+      operation.doCall();
+    } catch (Exception e) {
+      LOG.warn("Failed with error:", e);
+      assertTrue(false);
+    }
+
+    assertTrue(syncClient.waitForAreLeadersOnPreferredOnlyCondition(DEFAULT_TIMEOUT_MS));
+
+    // Now have no affinitized leaders, should balance 2, 3, 3.
+    leaders.clear();
+    operation = new ModifyClusterConfigAffinitizedLeaders(syncClient, leaders);
+    try {
+      operation.doCall();
+    } catch (Exception e) {
+      LOG.warn("Failed with error:", e);
+      assertTrue(false);
+    }
+
+    assertTrue(syncClient.waitForAreLeadersOnPreferredOnlyCondition(DEFAULT_TIMEOUT_MS));
+
+    // Now balance all affinitized leaders, should take no balancing steps.
+    leaders.add(ci0);
+    leaders.add(ci1);
+    leaders.add(ci2);
+    operation = new ModifyClusterConfigAffinitizedLeaders(syncClient, leaders);
+    try {
+      operation.doCall();
+    } catch (Exception e) {
+      LOG.warn("Failed with error:", e);
+      assertTrue(false);
+    }
+
+    assertTrue(syncClient.waitForAreLeadersOnPreferredOnlyCondition(DEFAULT_TIMEOUT_MS));
+  }
+
   /**
    * Test creating, opening and deleting a redis table through a YBClient.
    */
@@ -317,18 +515,17 @@ public class TestYBClient extends BaseYBClientTest {
   public void testRedisTable() throws Exception {
     LOG.info("Starting testRedisTable");
     String redisTableName = YBClient.REDIS_DEFAULT_TABLE_NAME;
-    YBTable table = syncClient.createRedisTable(redisTableName, 16);
+    YBTable table = syncClient.createRedisTable(redisTableName);
     assertFalse(syncClient.getTablesList().getTablesList().isEmpty());
     assertTrue(syncClient.getTablesList().getTablesList().contains(redisTableName));
     assertEquals(TableType.REDIS_TABLE_TYPE, table.getTableType());
-    assertEquals(16, table.getTabletsLocations(100000).size());
 
-    table = syncClient.openTable(redisTableName, YBClient.REDIS_KEYSPACE_NAME);
+    table = syncClient.openTable(YBClient.REDIS_KEYSPACE_NAME, redisTableName);
     assertEquals(redisSchema.getColumnCount(), table.getSchema().getColumnCount());
     assertEquals(TableType.REDIS_TABLE_TYPE, table.getTableType());
-    assertEquals(YBClient.REDIS_KEYSPACE_NAME, table.getKeySpace());
+    assertEquals(YBClient.REDIS_KEYSPACE_NAME, table.getKeyspace());
 
-    syncClient.deleteTable(redisTableName, YBClient.REDIS_KEYSPACE_NAME);
+    syncClient.deleteTable(YBClient.REDIS_KEYSPACE_NAME, redisTableName);
     assertFalse(syncClient.getTablesList().getTablesList().contains(tableName));
   }
 
@@ -350,161 +547,44 @@ public class TestYBClient extends BaseYBClientTest {
   public void testCreateDeleteTable() throws Exception {
     LOG.info("Starting testCreateDeleteTable");
     // Check that we can create a table.
-    syncClient.createTable(tableName, basicSchema, new CreateTableOptions(),
-                           YBClient.DEFAULT_KEYSPACE_NAME);
+    syncClient.createTable(DEFAULT_KEYSPACE_NAME, tableName, hashKeySchema,
+                           new CreateTableOptions());
     assertFalse(syncClient.getTablesList().getTablesList().isEmpty());
     assertTrue(syncClient.getTablesList().getTablesList().contains(tableName));
 
     // Check that we can delete it.
-    syncClient.deleteTable(tableName, YBClient.DEFAULT_KEYSPACE_NAME);
+    syncClient.deleteTable(DEFAULT_KEYSPACE_NAME, tableName);
     assertFalse(syncClient.getTablesList().getTablesList().contains(tableName));
 
     // Check that we can re-recreate it, with a different schema.
-    List<ColumnSchema> columns = new ArrayList<>(basicSchema.getColumns());
+    List<ColumnSchema> columns = new ArrayList<>(hashKeySchema.getColumns());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("one more", Type.STRING).build());
     Schema newSchema = new Schema(columns);
-    syncClient.createTable(tableName, newSchema);
+    syncClient.createTable(DEFAULT_KEYSPACE_NAME, tableName, newSchema);
 
     // Check that we can open a table and see that it has the new schema.
-    YBTable table = syncClient.openTable(tableName);
+    YBTable table = syncClient.openTable(DEFAULT_KEYSPACE_NAME, tableName);
     assertEquals(newSchema.getColumnCount(), table.getSchema().getColumnCount());
-
-    // Check that the block size parameter we specified in the schema is respected.
-    assertEquals(4096, newSchema.getColumn("column3_s").getDesiredBlockSize());
-    assertEquals(ColumnSchema.Encoding.DICT_ENCODING,
-                 newSchema.getColumn("column3_s").getEncoding());
-    assertEquals(ColumnSchema.CompressionAlgorithm.LZ4,
-                 newSchema.getColumn("column3_s").getCompressionAlgorithm());
   }
 
   /**
-   * Test inserting and retrieving string columns.
+   * Test proper number of tables is returned by YBClient.
    */
   @Test(timeout = 100000)
-  public void testStrings() throws Exception {
-    LOG.info("Starting testStrings");
-    Schema schema = createManyStringsSchema();
-    syncClient.createTable(tableName, schema);
+  public void testGetTablesList() throws Exception {
+    LOG.info("Starting testGetTablesList");
+    assertTrue(syncClient.getTablesList().getTableInfoList().isEmpty());
 
-    YBSession session = syncClient.newSession();
-    YBTable table = syncClient.openTable(tableName);
-    for (int i = 0; i < 100; i++) {
-      Insert insert = table.newInsert();
-      PartialRow row = insert.getRow();
-      row.addString("key", String.format("key_%02d", i));
-      row.addString("c2", "c2_" + i);
-      if (i % 2 == 1) {
-        row.addString("c3", "c3_" + i);
-      }
-      row.addString("c4", "c4_" + i);
-      // NOTE: we purposefully add the strings in a non-left-to-right
-      // order to verify that we still place them in the right position in
-      // the row.
-      row.addString("c1", "c1_" + i);
-      session.apply(insert);
-      if (i % 50 == 0) {
-        session.flush();
-      }
-    }
-    session.flush();
+    // Check that YEDIS tables are created and retrieved properly.
+    String redisTableName = YBClient.REDIS_DEFAULT_TABLE_NAME;
+    YBTable table = syncClient.createRedisTable(redisTableName);
+    assertFalse(syncClient.getTablesList().getTablesList().isEmpty());
+    assertTrue(syncClient.getTablesList().getTablesList().contains(redisTableName));
 
-    List<String> rowStrings = scanTableToStrings(table);
-    assertEquals(100, rowStrings.size());
-    assertEquals(
-        "STRING key=key_03, STRING c1=c1_3, STRING c2=c2_3, STRING c3=c3_3, STRING c4=c4_3",
-        rowStrings.get(3));
-    assertEquals(
-        "STRING key=key_04, STRING c1=c1_4, STRING c2=c2_4, STRING c3=NULL, STRING c4=c4_4",
-        rowStrings.get(4));
-  }
-
-  /**
-   * Test to verify that we can write in and read back UTF8.
-   */
-  @Test(timeout = 100000)
-  public void testUTF8() throws Exception {
-    LOG.info("Starting testUTF8");
-    Schema schema = createManyStringsSchema();
-    syncClient.createTable(tableName, schema);
-
-    YBSession session = syncClient.newSession();
-    YBTable table = syncClient.openTable(tableName);
-    Insert insert = table.newInsert();
-    PartialRow row = insert.getRow();
-    row.addString("key", "กขฃคฅฆง"); // some thai
-    row.addString("c1", "✁✂✃✄✆"); // some icons
-
-    row.addString("c2", "hello"); // some normal chars
-    row.addString("c4", "🐱"); // supplemental plane
-    session.apply(insert);
-    session.flush();
-
-    List<String> rowStrings = scanTableToStrings(table);
-    assertEquals(1, rowStrings.size());
-    assertEquals(
-        "STRING key=กขฃคฅฆง, STRING c1=✁✂✃✄✆, STRING c2=hello, STRING c3=NULL, STRING c4=🐱",
-        rowStrings.get(0));
-  }
-
-  /**
-   * Creates a local client that we auto-close while buffering one row, then makes sure that after
-   * closing that we can read the row.
-   */
-  @Test(timeout = 100000)
-  public void testAutoClose() throws Exception {
-    LOG.info("Starting testAutoClose");
-    try (YBClient localClient = new YBClient.YBClientBuilder(masterAddresses).build()) {
-      localClient.createTable(tableName, basicSchema);
-      YBTable table = localClient.openTable(tableName);
-      YBSession session = localClient.newSession();
-
-      session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
-      Insert insert = createBasicSchemaInsert(table, 0);
-      session.apply(insert);
-    }
-
-    YBTable table = syncClient.openTable(tableName);
-    AsyncYBScanner scanner = new AsyncYBScanner.AsyncYBScannerBuilder(client, table).build();
-    assertEquals(1, countRowsInScan(scanner));
-  }
-
-  @Test(timeout = 100000)
-  public void testCustomNioExecutor() throws Exception {
-    LOG.info("Starting testCustomNioExecutor");
-    long startTime = System.nanoTime();
-    final YBClient localClient = new YBClient.YBClientBuilder(masterAddresses)
-        .nioExecutors(Executors.newFixedThreadPool(1), Executors.newFixedThreadPool(2))
-        .bossCount(1)
-        .workerCount(2)
-        .build();
-    long buildTime = (System.nanoTime() - startTime) / 1000000000L;
-    assertTrue("Building YBClient is slow, maybe netty get stuck", buildTime < 3);
-    localClient.createTable(tableName, basicSchema);
-    Thread[] threads = new Thread[4];
-    for (int t = 0; t < 4; t++) {
-      final int id = t;
-      threads[t] = new Thread(new Runnable() {
-        @Override
-        public void run() {
-          try {
-            YBTable table = localClient.openTable(tableName);
-            YBSession session = localClient.newSession();
-            session.setFlushMode(SessionConfiguration.FlushMode.AUTO_FLUSH_SYNC);
-            for (int i = 0; i < 100; i++) {
-              Insert insert = createBasicSchemaInsert(table, id * 100 + i);
-              session.apply(insert);
-            }
-            session.close();
-          } catch (Exception e) {
-            fail("insert thread should not throw exception: " + e);
-          }
-        }
-      });
-      threads[t].start();
-    }
-    for (int t = 0; t< 4;t++) {
-      threads[t].join();
-    }
-    localClient.shutdown();
+    // Check that non-YEDIS tables are created and retrieved properly.
+    syncClient.createTable(DEFAULT_KEYSPACE_NAME, tableName, hashKeySchema,
+                           new CreateTableOptions());
+    assertFalse(syncClient.getTablesList().getTablesList().isEmpty());
+    assertTrue(syncClient.getTablesList().getTablesList().contains(tableName));
   }
 }

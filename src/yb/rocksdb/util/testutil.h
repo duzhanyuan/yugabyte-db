@@ -21,8 +21,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_UTIL_TESTUTIL_H
-#define ROCKSDB_UTIL_TESTUTIL_H
+#ifndef YB_ROCKSDB_UTIL_TESTUTIL_H
+#define YB_ROCKSDB_UTIL_TESTUTIL_H
 
 #pragma once
 #include <algorithm>
@@ -35,7 +35,7 @@
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/merge_operator.h"
 #include "yb/rocksdb/options.h"
-#include "yb/util/slice.h"
+#include "yb/rocksdb/db/version_edit.pb.h"
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
 #include "yb/rocksdb/table/internal_iterator.h"
@@ -43,15 +43,12 @@
 #include "yb/rocksdb/util/mutexlock.h"
 #include "yb/rocksdb/util/random.h"
 
+#include "yb/util/slice.h"
+
 namespace rocksdb {
-class SequentialFile;
 class SequentialFileReader;
 
 namespace test {
-
-// Store in *dst a random string of length "len" and return a Slice that
-// references the generated data.
-extern Slice RandomString(Random* rnd, int len, std::string* dst);
 
 extern std::string RandomHumanReadableString(Random* rnd, int len);
 
@@ -60,12 +57,6 @@ extern std::string RandomHumanReadableString(Random* rnd, int len);
 enum RandomKeyType : char { RANDOM, LARGEST, SMALLEST, MIDDLE };
 extern std::string RandomKey(Random* rnd, int len,
                              RandomKeyType type = RandomKeyType::RANDOM);
-
-// Store in *dst a string of length "len" that will compress to
-// "N*compressed_fraction" bytes and return a Slice that references
-// the generated data.
-extern Slice CompressibleString(Random* rnd, double compressed_fraction,
-                                int len, std::string* dst);
 
 // A wrapper that allows injection of errors.
 class ErrorEnv : public EnvWrapper {
@@ -144,13 +135,6 @@ class SimpleSuffixReverseComparator : public Comparator {
   virtual void FindShortSuccessor(std::string* key) const override {}
 };
 
-// Returns a user key comparator that can be used for comparing two uint64_t
-// slices. Instead of comparing slices byte-wise, it compares all the 8 bytes
-// at once. Assumes same endian-ness is used though the database's lifetime.
-// Symantics of comparison would differ from Bytewise comparator in little
-// endian machines.
-extern const Comparator* Uint64Comparator();
-
 // Iterator over a vector of keys/values
 class VectorIterator : public InternalIterator {
  public:
@@ -172,7 +156,7 @@ class VectorIterator : public InternalIterator {
   virtual void SeekToLast() override { current_ = keys_.size() - 1; }
 
   virtual void Seek(const Slice& target) override {
-    current_ = std::lower_bound(keys_.begin(), keys_.end(), target.ToString()) -
+    current_ = std::lower_bound(keys_.begin(), keys_.end(), target.ToBuffer()) -
                keys_.begin();
   }
 
@@ -256,12 +240,11 @@ class StringSource: public RandomAccessFile {
         mmap_(mmap),
         total_reads_(0) {}
 
-  virtual ~StringSource() { }
+  virtual ~StringSource() {}
 
-  uint64_t Size() const { return contents_.size(); }
+  yb::Result<uint64_t> Size() const override { return contents_.size(); }
 
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-      char* scratch) const override {
+  CHECKED_STATUS Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {
     total_reads_++;
     if (offset > contents_.size()) {
       return STATUS(InvalidArgument, "invalid Read offset");
@@ -278,22 +261,25 @@ class StringSource: public RandomAccessFile {
     return Status::OK();
   }
 
-  virtual size_t GetUniqueId(char* id, size_t max_size) const override {
-    if (max_size < 20) {
-      return 0;
-    }
-
+  virtual size_t GetUniqueId(char* id) const override {
     char* rid = id;
     rid = EncodeVarint64(rid, uniq_id_);
     rid = EncodeVarint64(rid, 0);
     return static_cast<size_t>(rid-id);
   }
 
+  yb::Result<uint64_t> INode() const override { return STATUS(NotSupported, "Not supported"); }
+
+  const std::string& filename() const override { return filename_; }
+
+  size_t memory_footprint() const override { LOG(FATAL) << "Not supported"; }
+
   int total_reads() const { return total_reads_; }
 
   void set_total_reads(int tr) { total_reads_ = tr; }
 
  private:
+  std::string filename_ = "StringSource";
   std::string contents_;
   uint64_t uniq_id_;
   bool mmap_;
@@ -384,12 +370,12 @@ class FilterNumber : public CompactionFilter {
 
   std::string last_merge_operand_key() { return last_merge_operand_key_; }
 
-  bool Filter(int level, const rocksdb::Slice& key, const rocksdb::Slice& value,
-              std::string* new_value, bool* value_changed) const override {
+  FilterDecision Filter(int level, const rocksdb::Slice& key, const rocksdb::Slice& value,
+              std::string* new_value, bool* value_changed) override {
     if (value.size() == sizeof(uint64_t)) {
-      return num_ == DecodeFixed64(value.data());
+      return num_ == DecodeFixed64(value.data()) ? FilterDecision::kDiscard : FilterDecision::kKeep;
     }
-    return true;
+    return FilterDecision::kDiscard;
   }
 
   bool FilterMergeOperand(int level, const rocksdb::Slice& key,
@@ -420,8 +406,10 @@ class StringEnv : public EnvWrapper {
    public:
     explicit SeqStringSource(const std::string& data)
         : data_(data), offset_(0) {}
+
     ~SeqStringSource() {}
-    Status Read(size_t n, Slice* result, char* scratch) override {
+
+    Status Read(size_t n, Slice* result, uint8_t* scratch) override {
       std::string output;
       if (offset_ < data_.size()) {
         n = std::min(data_.size() - offset_, n);
@@ -434,6 +422,7 @@ class StringEnv : public EnvWrapper {
       }
       return Status::OK();
     }
+
     Status Skip(uint64_t n) override {
       if (offset_ >= data_.size()) {
         return STATUS(InvalidArgument,
@@ -442,6 +431,11 @@ class StringEnv : public EnvWrapper {
       // TODO(yhchiang): Currently doesn't handle the overflow case.
       offset_ += n;
       return Status::OK();
+    }
+
+    const std::string& filename() const override {
+      static const std::string kFilename = "SeqStringSource";
+      return kFilename;
     }
 
    private:
@@ -618,9 +612,10 @@ class ChanglingCompactionFilter : public CompactionFilter {
 
   void SetName(const std::string& name) { name_ = name; }
 
-  bool Filter(int level, const Slice& key, const Slice& existing_value,
-              std::string* new_value, bool* value_changed) const override {
-    return false;
+  FilterDecision Filter(
+      int level, const Slice& key, const Slice& existing_value, std::string* new_value,
+      bool* value_changed) override {
+    return FilterDecision::kKeep;
   }
 
   const char* Name() const override { return name_.c_str(); }
@@ -684,7 +679,129 @@ struct BoundaryTestValues {
   std::string max_string;
 };
 
+// A test implementation of UserFrontier, wrapper over simple int64_t value.
+class TestUserFrontier : public UserFrontier {
+ public:
+  TestUserFrontier() : value_(0) {}
+  explicit TestUserFrontier(uint64_t value) : value_(value) {}
+
+  std::unique_ptr<UserFrontier> Clone() const override {
+    return std::make_unique<TestUserFrontier>(*this);
+  }
+
+  void SetValue(uint64_t value) {
+    value_ = value;
+  }
+
+  uint64_t Value() const {
+    return value_;
+  }
+
+  std::string ToString() const override {
+    return yb::Format("{ value: $0 }", value_);
+  }
+
+  void ToPB(google::protobuf::Any* pb) const override {
+    UserBoundaryValuePB value;
+    value.set_tag(static_cast<uint32_t>(value_));
+    pb->PackFrom(value);
+  }
+
+  bool Equals(const UserFrontier& rhs) const override {
+    return value_ == down_cast<const TestUserFrontier&>(rhs).value_;
+  }
+
+  void Update(const UserFrontier& rhs, UpdateUserValueType type) override {
+    auto rhs_value = down_cast<const TestUserFrontier&>(rhs).value_;
+    switch (type) {
+      case UpdateUserValueType::kLargest:
+        value_ = std::max(value_, rhs_value);
+        return;
+      case UpdateUserValueType::kSmallest:
+        value_ = std::min(value_, rhs_value);
+        return;
+    }
+    FATAL_INVALID_ENUM_VALUE(UpdateUserValueType, type);
+  }
+
+  bool IsUpdateValid(const UserFrontier& rhs, UpdateUserValueType type) const override {
+    auto rhs_value = down_cast<const TestUserFrontier&>(rhs).value_;
+    switch (type) {
+      case UpdateUserValueType::kLargest:
+        return rhs_value >= value_;
+      case UpdateUserValueType::kSmallest:
+        return rhs_value <= value_;
+    }
+    FATAL_INVALID_ENUM_VALUE(UpdateUserValueType, type);
+  }
+
+  void FromOpIdPBDeprecated(const yb::OpIdPB& op_id) override {}
+
+  void FromPB(const google::protobuf::Any& pb) override {
+    UserBoundaryValuePB value;
+    pb.UnpackTo(&value);
+    value_ = value.tag();
+  }
+
+ private:
+  uint64_t value_ = 0;
+};
+
+class TestUserFrontiers : public rocksdb::UserFrontiersBase<TestUserFrontier> {
+ public:
+  TestUserFrontiers(uint64_t min, uint64_t max) {
+    Smallest().SetValue(min);
+    Largest().SetValue(max);
+  }
+
+  std::unique_ptr<UserFrontiers> Clone() const {
+    return std::make_unique<TestUserFrontiers>(*this);
+  }
+};
+
+// A class which remembers the name of each flushed file.
+class FlushedFileCollector : public EventListener {
+ public:
+  virtual void OnFlushCompleted(DB* db, const FlushJobInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    flushed_file_infos_.push_back(info);
+  }
+
+  std::vector<std::string> GetFlushedFiles() {
+    std::vector<std::string> flushed_files;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& info : flushed_file_infos_) {
+      flushed_files.push_back(info.file_path);
+    }
+    return flushed_files;
+  }
+
+  std::vector<std::string> GetAndClearFlushedFiles() {
+    std::vector<std::string> flushed_files;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& info : flushed_file_infos_) {
+      flushed_files.push_back(info.file_path);
+    }
+    flushed_file_infos_.clear();
+    return flushed_files;
+  }
+
+  std::vector<FlushJobInfo> GetFlushedFileInfos() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return flushed_file_infos_;
+  }
+
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    flushed_file_infos_.clear();
+  }
+
+ private:
+  std::vector<FlushJobInfo> flushed_file_infos_;
+  std::mutex mutex_;
+};
+
 }  // namespace test
 }  // namespace rocksdb
 
-#endif // ROCKSDB_UTIL_TESTUTIL_H
+#endif // YB_ROCKSDB_UTIL_TESTUTIL_H

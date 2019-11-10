@@ -41,6 +41,7 @@
 #include "yb/util/cast.h"
 #include "yb/util/status.h"
 #include "yb/util/net/net_fwd.h"
+#include "yb/util/strongly_typed_uuid.h"
 
 namespace yb {
 
@@ -49,8 +50,6 @@ struct ColumnId;
 class ColumnSchema;
 class faststring;
 class HostPort;
-class RowBlock;
-class RowBlockRow;
 class RowChangeList;
 class Schema;
 class Slice;
@@ -62,10 +61,13 @@ void StatusToPB(const Status& status, AppStatusPB* pb);
 Status StatusFromPB(const AppStatusPB& pb);
 
 // Convert the specified HostPort to protobuf.
-Status HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb);
+void HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb);
 
 // Returns the HostPort created from the specified protobuf.
-Status HostPortFromPB(const HostPortPB& host_port_pb, HostPort* host_port);
+HostPort HostPortFromPB(const HostPortPB& host_port_pb);
+
+bool HasHostPortPB(
+    const google::protobuf::RepeatedPtrField<HostPortPB>& list, const HostPortPB& hp);
 
 // Returns an Endpoint from HostPortPB.
 CHECKED_STATUS EndpointFromHostPortPB(const HostPortPB& host_portpb, Endpoint* endpoint);
@@ -76,20 +78,23 @@ CHECKED_STATUS AddHostPortPBs(const std::vector<Endpoint>& addrs,
                               google::protobuf::RepeatedPtrField<HostPortPB>* pbs);
 
 // Simply convert the list of host ports into a repeated list of corresponding PB's.
-CHECKED_STATUS HostPortsToPBs(const std::vector<HostPort>& addrs,
-                              google::protobuf::RepeatedPtrField<HostPortPB>* pbs);
+void HostPortsToPBs(const std::vector<HostPort>& addrs,
+                    google::protobuf::RepeatedPtrField<HostPortPB>* pbs);
+
+// Convert list of HostPortPBs into host ports.
+void HostPortsFromPBs(const google::protobuf::RepeatedPtrField<HostPortPB>& pbs,
+                      std::vector<HostPort>* addrs);
 
 enum SchemaPBConversionFlags {
   SCHEMA_PB_WITHOUT_IDS = 1 << 0,
-  SCHEMA_PB_WITHOUT_STORAGE_ATTRIBUTES = 1 << 1,
 };
 
 // Convert the specified schema to protobuf.
 // 'flags' is a bitfield of SchemaPBConversionFlags values.
-Status SchemaToPB(const Schema& schema, SchemaPB* pb, int flags = 0);
+void SchemaToPB(const Schema& schema, SchemaPB* pb, int flags = 0);
 
 // Convert the specified schema to protobuf without column IDs.
-Status SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb);
+void SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb);
 
 // Returns the Schema created from the specified protobuf.
 // If the schema is invalid, return a non-OK status.
@@ -119,61 +124,32 @@ CHECKED_STATUS ColumnPBsToColumnTuple(
 //
 // The 'cols' list is replaced by this method.
 // 'flags' is a bitfield of SchemaPBConversionFlags values.
-Status SchemaToColumnPBs(
+void SchemaToColumnPBs(
   const Schema& schema,
   google::protobuf::RepeatedPtrField<ColumnSchemaPB>* cols,
   int flags = 0);
 
-// Encode the given row block into the provided protobuf and data buffers.
-//
-// All data (both direct and indirect) for each selected row in the RowBlock is
-// copied into the protobuf and faststrings.
-// The original data may be destroyed safely after this returns.
-//
-// This only converts those rows whose selection vector entry is true.
-// If 'client_projection_schema' is not NULL, then only columns specified in
-// 'client_projection_schema' will be projected to 'data_buf'.
-//
-// Requires that block.nrows() > 0
-void SerializeRowBlock(const RowBlock& block, RowwiseRowBlockPB* rowblock_pb,
-                       const Schema* client_projection_schema,
-                       faststring* data_buf, faststring* indirect_data);
+YB_DEFINE_ENUM(UsePrivateIpMode, (cloud)(region)(zone)(never));
 
-// Rewrites the data pointed-to by row data slice 'row_data_slice' by replacing
-// relative indirect data pointers with absolute ones in 'indirect_data_slice'.
-// At the time of this writing, this rewriting is only done for STRING types.
-//
-// Returns a bad Status if the provided data is invalid or corrupt.
-Status RewriteRowBlockPointers(const Schema& schema, const RowwiseRowBlockPB& rowblock_pb,
-                               const Slice& indirect_data_slice, Slice* row_data_slice);
+// Returns mode for selecting between private and public IP.
+Result<UsePrivateIpMode> GetPrivateIpMode();
 
-// Extract the rows stored in this protobuf, which must have exactly the
-// given Schema. This Schema may be obtained using ColumnPBsToSchema.
-//
-// Pointers are added to 'rows' for each of the extracted rows. These
-// pointers are suitable for constructing ConstContiguousRow objects.
-// TODO: would be nice to just return a vector<ConstContiguousRow>, but
-// they're not currently copyable, so this can't be done.
-//
-// Note that the returned rows refer to memory managed by 'rows_data' and
-// 'indirect_data'. This is also the reason that 'rows_data' is a non-const pointer
-// argument: the internal data is mutated in-place to restore the validity of
-// indirect data pointers, which are relative on the wire but must be absolute
-// while in-memory.
-//
-// Returns a bad Status if the provided data is invalid or corrupt.
-Status ExtractRowsFromRowBlockPB(const Schema& schema,
-                                 const RowwiseRowBlockPB& rowblock_pb,
-                                 const Slice& indirect_data,
-                                 Slice* rows_data,
-                                 std::vector<const uint8_t*>* rows);
+// Pick host and port that should be used to connect node
+// broadcast_addresses - node public host ports
+// private_host_ports - node private host ports
+// connect_to - node placement information
+// connect_from - placement information of connect originator
+const HostPortPB& DesiredHostPort(
+    const google::protobuf::RepeatedPtrField<HostPortPB>& broadcast_addresses,
+    const google::protobuf::RepeatedPtrField<HostPortPB>& private_host_ports,
+    const CloudInfoPB& connect_to,
+    const CloudInfoPB& connect_from);
 
-// Set 'leader_hostport' to the host/port of the leader server if one
-// can be found in 'entries'.
-//
-// Returns Status::NotFound if no leader is found.
-Status FindLeaderHostPort(const google::protobuf::RepeatedPtrField<ServerEntryPB>& entries,
-                          HostPort* leader_hostport);
+// Pick host and port that should be used to connect node
+// registration - node registration information
+// connect_from - placement information of connect originator
+const HostPortPB& DesiredHostPort(
+    const ServerRegistrationPB& registration, const CloudInfoPB& connect_from);
 
 //----------------------------------- CQL value encode functions ---------------------------------
 static inline void CQLEncodeLength(const int32_t length, faststring* buffer) {
@@ -182,7 +158,8 @@ static inline void CQLEncodeLength(const int32_t length, faststring* buffer) {
   buffer->append(&byte_value, sizeof(byte_value));
 }
 
-// Encode a 32-bit length into the buffer. Caller should ensure the buffer size is at least 4 bytes.
+// Encode a 32-bit length into the buffer without extending the buffer. Caller should ensure the
+// buffer size is at least 4 bytes.
 static inline void CQLEncodeLength(const int32_t length, void* buffer) {
   NetworkByteOrder::Store32(buffer, static_cast<uint32_t>(length));
 }
@@ -253,16 +230,34 @@ static inline void CQLFinishCollection(int32_t start_pos, faststring* buffer) {
     }                                                       \
   } while (0)
 
+static inline Result<int32_t> CQLDecodeLength(Slice* data) {
+  RETURN_NOT_ENOUGH(data, sizeof(int32_t));
+  const auto len = static_cast<int32_t>(NetworkByteOrder::Load32(data->data()));
+  data->remove_prefix(sizeof(int32_t));
+  return len;
+}
+
+// Decode a 32-bit length from the buffer without consuming the buffer. Caller should ensure the
+// buffer size is at least 4 bytes.
+static inline int32_t CQLDecodeLength(const void* buffer) {
+  return static_cast<int32_t>(NetworkByteOrder::Load32(buffer));
+}
+
 // Decode a CQL number (8, 16, 32 and 64-bit integer). <num_type> is the parsed integer type.
 // <converter> converts the number from network byte-order to machine order and <data_type>
 // is the coverter's return type. The converter's return type <data_type> is unsigned while
 // <num_type> may be signed or unsigned.
 template<typename num_type, typename data_type>
 static inline CHECKED_STATUS CQLDecodeNum(
-    size_t len, data_type (*converter)(const void*), Slice* data, num_type* val) {
+    const size_t len, data_type (*converter)(const void*), Slice* data, num_type* val) {
+
   static_assert(sizeof(data_type) == sizeof(num_type), "inconsistent num type size");
-  if (len != sizeof(num_type)) return STATUS_SUBSTITUTE(NetworkError, "unexpected number byte "
-        "length: expected $0, provided $1", static_cast<int64_t>(sizeof(num_type)), len);
+  if (len != sizeof(num_type)) {
+    return STATUS_SUBSTITUTE(NetworkError,
+                             "unexpected number byte length: expected $0, provided $1",
+                             static_cast<int64_t>(sizeof(num_type)), len);
+  }
+
   RETURN_NOT_ENOUGH(data, sizeof(num_type));
   *val = static_cast<num_type>((*converter)(data->data()));
   data->remove_prefix(sizeof(num_type));
@@ -274,7 +269,7 @@ static inline CHECKED_STATUS CQLDecodeNum(
 // is the coverter's return type. The converter's return type <data_type> is an integer type.
 template<typename float_type, typename data_type>
 static inline CHECKED_STATUS CQLDecodeFloat(
-    size_t len, data_type (*converter)(const void*), Slice* data, float_type* val) {
+    const size_t len, data_type (*converter)(const void*), Slice* data, float_type* val) {
   // Make sure float and double are exactly sizeof uint32_t and uint64_t.
   static_assert(sizeof(float_type) == sizeof(data_type), "inconsistent floating point type size");
   data_type bval = 0;
@@ -296,5 +291,9 @@ static inline uint8_t Load8(const void* p) {
 
 #undef RETURN_NOT_ENOUGH
 
+YB_STRONGLY_TYPED_UUID(ClientId);
+typedef int64_t RetryableRequestId;
+
 } // namespace yb
+
 #endif  // YB_COMMON_WIRE_PROTOCOL_H

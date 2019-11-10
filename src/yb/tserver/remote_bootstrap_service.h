@@ -37,6 +37,7 @@
 
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
+#include "yb/tserver/remote_bootstrap_session.h"
 #include "yb/tserver/remote_bootstrap.service.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/locks.h"
@@ -54,7 +55,6 @@ class ReadableLogSegment;
 
 namespace tserver {
 
-class RemoteBootstrapSession;
 class TabletPeerLookupIf;
 
 class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
@@ -63,45 +63,63 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
                              TabletPeerLookupIf* tablet_peer_lookup,
                              const scoped_refptr<MetricEntity>& metric_entity);
 
-  virtual void BeginRemoteBootstrapSession(const BeginRemoteBootstrapSessionRequestPB* req,
-                                           BeginRemoteBootstrapSessionResponsePB* resp,
-                                           rpc::RpcContext context) override;
+  void BeginRemoteBootstrapSession(const BeginRemoteBootstrapSessionRequestPB* req,
+                                   BeginRemoteBootstrapSessionResponsePB* resp,
+                                   rpc::RpcContext context) override;
 
-  virtual void CheckSessionActive(const CheckRemoteBootstrapSessionActiveRequestPB* req,
-                                  CheckRemoteBootstrapSessionActiveResponsePB* resp,
-                                  rpc::RpcContext context) override;
+  void CheckSessionActive(const CheckRemoteBootstrapSessionActiveRequestPB* req,
+                          CheckRemoteBootstrapSessionActiveResponsePB* resp,
+                          rpc::RpcContext context) override;
 
-  virtual void FetchData(const FetchDataRequestPB* req,
-                         FetchDataResponsePB* resp,
-                         rpc::RpcContext context) override;
+  void FetchData(const FetchDataRequestPB* req,
+                 FetchDataResponsePB* resp,
+                 rpc::RpcContext context) override;
 
-  virtual void EndRemoteBootstrapSession(const EndRemoteBootstrapSessionRequestPB* req,
-                                         EndRemoteBootstrapSessionResponsePB* resp,
-                                         rpc::RpcContext context) override;
+  void EndRemoteBootstrapSession(const EndRemoteBootstrapSessionRequestPB* req,
+                                 EndRemoteBootstrapSessionResponsePB* resp,
+                                 rpc::RpcContext context) override;
 
-  virtual void Shutdown() override;
+
+  void RemoveSession(
+          const RemoveSessionRequestPB* req,
+          RemoveSessionResponsePB* resp,
+          rpc::RpcContext context) override;
+
+  void Shutdown() override;
+
+ protected:
+  typedef enterprise::RemoteBootstrapSession RemoteBootstrapSessionClass;
+
+  virtual CHECKED_STATUS GetDataFilePiece(
+      const DataIdPB& data_id, const scoped_refptr<RemoteBootstrapSessionClass>& session,
+      uint64_t offset, int64_t client_maxlen,
+      std::string* data, int64_t* total_data_length, RemoteBootstrapErrorPB::Code* error_code);
+
+  virtual CHECKED_STATUS ValidateSnapshotFetchRequestDataId(const DataIdPB& data_id) const;
 
  private:
-  typedef std::unordered_map<std::string, scoped_refptr<RemoteBootstrapSession> > SessionMap;
-  typedef std::unordered_map<std::string, MonoTime> MonoTimeMap;
+  struct SessionData {
+    scoped_refptr<RemoteBootstrapSessionClass> session;
+    CoarseTimePoint expiration;
 
-  // Look up session in session map.
-  CHECKED_STATUS FindSessionUnlocked(const std::string& session_id,
-                             RemoteBootstrapErrorPB::Code* app_error,
-                             scoped_refptr<RemoteBootstrapSession>* session) const;
+    void ResetExpiration();
+  };
+
+  typedef std::unordered_map<std::string, SessionData> SessionMap;
 
   // Validate the data identifier in a FetchData request.
-  CHECKED_STATUS ValidateFetchRequestDataId(const DataIdPB& data_id,
-                                    RemoteBootstrapErrorPB::Code* app_error,
-                                    const scoped_refptr<RemoteBootstrapSession>& session) const;
-
-  // Take note of session activity; Re-update the session timeout deadline.
-  void ResetSessionExpirationUnlocked(const std::string& session_id);
+  CHECKED_STATUS ValidateFetchRequestDataId(
+      const DataIdPB& data_id,
+      RemoteBootstrapErrorPB::Code* app_error,
+      const scoped_refptr<RemoteBootstrapSessionClass>& session) const;
 
   // Destroy the specified remote bootstrap session.
-  CHECKED_STATUS DoEndRemoteBootstrapSessionUnlocked(const std::string& session_id,
-                                             bool session_suceeded,
-                                             RemoteBootstrapErrorPB::Code* app_error);
+  CHECKED_STATUS DoEndRemoteBootstrapSession(
+      const std::string& session_id,
+      bool session_suceeded,
+      RemoteBootstrapErrorPB::Code* app_error)  EXCLUSIVE_LOCKS_REQUIRED(sessions_mutex_);
+
+  void RemoveSession(const std::string& session_id) EXCLUSIVE_LOCKS_REQUIRED(sessions_mutex_);
 
   // The timeout thread periodically checks whether sessions are expired and
   // removes them from the map.
@@ -111,9 +129,9 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
   TabletPeerLookupIf* tablet_peer_lookup_;
 
   // Protects sessions_ and session_expirations_ maps.
-  mutable simple_spinlock sessions_lock_;
-  SessionMap sessions_;
-  MonoTimeMap session_expirations_;
+  mutable std::mutex sessions_mutex_;
+  SessionMap sessions_ GUARDED_BY(sessions_mutex_);
+  std::atomic<int32> nsessions_ GUARDED_BY(sessions_mutex_) = {0};
 
   // Session expiration thread.
   // TODO: this is a hack, replace with some kind of timer impl. See KUDU-286.

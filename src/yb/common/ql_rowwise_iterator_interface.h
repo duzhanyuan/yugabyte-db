@@ -14,40 +14,86 @@
 #ifndef YB_COMMON_QL_ROWWISE_ITERATOR_INTERFACE_H
 #define YB_COMMON_QL_ROWWISE_ITERATOR_INTERFACE_H
 
-#include "yb/common/iterator.h"
-#include "yb/common/ql_rowblock.h"
-#include "yb/common/ql_resultset.h"
-#include "yb/common/ql_scanspec.h"
+#include <memory>
+
+#include "yb/util/result.h"
+#include "yb/util/status.h"
+#include "yb/docdb/doc_key.h"
 
 namespace yb {
+
+class HybridTime;
+class PgsqlReadRequestPB;
+class PgsqlResponsePB;
+class QLReadRequestPB;
+class QLResponsePB;
+class QLTableRow;
+class Schema;
+
 namespace common {
 
-class QLRowwiseIteratorIf : public RowwiseIterator {
+class YQLRowwiseIteratorIf {
  public:
-  virtual ~QLRowwiseIteratorIf() {}
+  typedef std::unique_ptr<common::YQLRowwiseIteratorIf> UniPtr;
+  virtual ~YQLRowwiseIteratorIf() {}
 
-  virtual CHECKED_STATUS Init(ScanSpec *spec) override = 0;
-
-  // Init QL read scan.
-  virtual CHECKED_STATUS Init(const QLScanSpec& spec) = 0;
-
-  // This may return one row at a time in the initial implementation, even though Kudu's scanning
-  // interface supports returning multiple rows at a time.
-  virtual CHECKED_STATUS NextBlock(RowBlock *dst) override = 0;
-
-  // Is the next row column to read a static column?
-  virtual bool IsNextStaticColumn() const = 0;
-
-  // Read next row using the specified projection.
-  virtual CHECKED_STATUS NextRow(const Schema& projection, QLTableRow* table_row) = 0;
+  //------------------------------------------------------------------------------------------------
+  // Pure virtual API methods.
+  //------------------------------------------------------------------------------------------------
+  // Checks whether next row exists.
+  virtual Result<bool> HasNext() const = 0;
 
   // Skip the current row.
   virtual void SkipRow() = 0;
 
-  // Checks whether we have processed enough rows for a page and sets the appropriate paging
-  // state in the response object.
-  virtual CHECKED_STATUS SetPagingStateIfNecessary(const QLReadRequestPB& request,
-                                                   QLResponsePB* response) const = 0;
+  // If restart is required returns restart hybrid time, based on iterated records.
+  // Otherwise returns invalid hybrid time.
+  virtual HybridTime RestartReadHt() = 0;
+
+  virtual std::string ToString() const = 0;
+
+  virtual const Schema& schema() const = 0;
+
+  //------------------------------------------------------------------------------------------------
+  // Virtual API methods.
+  // These methods are not applied to virtual/system table.
+  //------------------------------------------------------------------------------------------------
+
+  // Apache Cassandra Only: CQL supports static columns while all other intefaces do not.
+  // Is the next row column to read a static column?
+  virtual bool IsNextStaticColumn() const {
+    return false;
+  }
+
+  // Retrieves the next key to read after the iterator finishes for the given page.
+  virtual CHECKED_STATUS GetNextReadSubDocKey(docdb::SubDocKey* sub_doc_key) const {
+    return Status::OK();
+  }
+
+  // Returns the tuple id of the current tuple. See DocRowwiseIterator for details.
+  virtual Result<Slice> GetTupleId() const {
+    return STATUS(NotSupported, "This iterator does not provide tuple id");
+  }
+
+  // Seeks to the given tuple by its id. See DocRowwiseIterator for details.
+  virtual Result<bool> SeekTuple(const Slice& tuple_id) {
+    return STATUS(NotSupported, "This iterator cannot seek by tuple id");
+  }
+
+  //------------------------------------------------------------------------------------------------
+  // Common API methods.
+  //------------------------------------------------------------------------------------------------
+  // Read next row using the specified projection.
+  CHECKED_STATUS NextRow(const Schema& projection, QLTableRow* table_row) {
+    return DoNextRow(projection, table_row);
+  }
+
+  CHECKED_STATUS NextRow(QLTableRow* table_row) {
+    return DoNextRow(schema(), table_row);
+  }
+
+ private:
+  virtual CHECKED_STATUS DoNextRow(const Schema& projection, QLTableRow* table_row) = 0;
 };
 
 }  // namespace common

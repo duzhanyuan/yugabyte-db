@@ -19,10 +19,15 @@ import org.yb.client.TestUtils;
 
 import java.util.*;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestCollectionTypes extends BaseCQLTest {
 
   private String createTableStmt(String tableName, String keyType, String elemType)
@@ -50,45 +55,49 @@ public class TestCollectionTypes extends BaseCQLTest {
   @Test
   public void testCreateTable() throws Exception {
     // Types that can valid keys (and therefore also map keys or set elements)
-    Set<String> validKeyTypes = new HashSet<>();
-    validKeyTypes.add("tinyint");
-    validKeyTypes.add("smallint");
-    validKeyTypes.add("int");
-    validKeyTypes.add("bigint");
-    validKeyTypes.add("varchar");
-    validKeyTypes.add("timestamp");
-    validKeyTypes.add("inet");
-    validKeyTypes.add("uuid");
-    validKeyTypes.add("timeuuid");
-    validKeyTypes.add("blob");
-    validKeyTypes.add("float");
-    validKeyTypes.add("double");
+    List<String> validKeyTypes = Arrays.asList("tinyint",
+                                               "smallint",
+                                               "int",
+                                               "bigint",
+                                               "varchar",
+                                               "timestamp",
+                                               "inet",
+                                               "uuid",
+                                               "timeuuid",
+                                               "blob",
+                                               "float",
+                                               "double",
+                                               "date",
+                                               "time",
+                                               "boolean");
 
     // Types that cannot be keys but can be valid collection elements (map values or list elems)
-    Set<String> nonKeyTypes = new HashSet<>();
-    nonKeyTypes.add("boolean");
+    List<String> nonKeyTypes = Arrays.asList();
 
     //------------------------------------------------------------------------------------------
     // Testing Valid Create Table Statements
     //------------------------------------------------------------------------------------------
-    String tableNameBase = "test_coll_types_create_table_";
-    for (String tp : validKeyTypes) {
-      createCollectionTable(tableNameBase + tp, tp, tp);
-      Thread.sleep(1000);
-      dropTable(tableNameBase + tp);
-    }
 
-    for (String tp : nonKeyTypes) {
-      createCollectionTable(tableNameBase + tp, "int", tp);
-      Thread.sleep(1000);
-      dropTable(tableNameBase + tp);
+    // Create a table testing all valid key/value collection type parameters.
+    StringBuilder sb = new StringBuilder();
+    String collTemplate = "vm_%2$s map<%1$s, %2$s>, vs_%2$s set<%1$s>, vl_%2$s list<%2$s>, ";
+
+    sb.append("CREATE TABLE test_coll_types_create_valid_table (h int, r int, ");
+    for (String tp : validKeyTypes) {
+      sb.append(String.format(collTemplate, tp, tp));
     }
+    for (String tp : nonKeyTypes) {
+      // Non-key types only allowed as values, so we use 'int' for the keys.
+      sb.append(String.format(collTemplate, "int", tp));
+    }
+    sb.append("PRIMARY KEY (h, r))");
+    session.execute(sb.toString());
 
     //------------------------------------------------------------------------------------------
     // Testing Invalid Create Table Statements
     //------------------------------------------------------------------------------------------
 
-    String invTableNameBase = "test_coll_types_create_inv_table_";
+    String invTableNameBase = "test_coll_types_create_invalid_table";
     // checking that non-key types are not allowed as set elems or map keys
     for (String tp : nonKeyTypes) {
       runInvalidStmt(createTableStmt(invTableNameBase + tp, tp, "int"));

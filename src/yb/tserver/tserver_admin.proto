@@ -29,6 +29,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+syntax = "proto2";
+
 package yb.tserver;
 
 option java_package = "org.yb.tserver";
@@ -38,7 +40,7 @@ import "yb/consensus/metadata.proto";
 import "yb/tablet/metadata.proto";
 import "yb/tserver/tserver.proto";
 
-message AlterSchemaRequestPB {
+message ChangeMetadataRequestPB {
   // UUID of server this request is addressed to.
   optional bytes dest_uuid = 5;
 
@@ -46,18 +48,42 @@ message AlterSchemaRequestPB {
 
   // TODO: Replace with the table descriptor
   // (Schema, Column IDs, Column Attributes)
-  required SchemaPB schema = 2;
+  optional SchemaPB schema = 2;
 
-  required uint32 schema_version = 3;
+  repeated IndexInfoPB indexes = 7;
+
+  optional uint32 schema_version = 3;
   optional string new_table_name = 4;
 
   optional fixed64 propagated_hybrid_time = 6;
+
+  optional tablet.TableInfoPB add_table = 8;
+
+  optional uint32 wal_retention_secs = 9;
 }
 
-message AlterSchemaResponsePB {
+// This is used to export tablet metadata changes to a protobuf file to be reloaded on a new cluster
+// startup to avoid running initdb.
+message ExportedTabletMetadataChanges {
+  repeated ChangeMetadataRequestPB metadata_changes = 1;
+}
+
+message ChangeMetadataResponsePB {
   optional TabletServerErrorPB error = 1;
 
   optional fixed64 propagated_hybrid_time = 2;
+}
+
+message CopartitionTableRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+  optional bytes table_id = 2;
+  optional bytes tablet_id = 3;
+  optional string table_name = 4;
+}
+
+message CopartitionTableResponsePB {
+  optional TabletServerErrorPB error = 1;
 }
 
 // A create tablet request.
@@ -82,6 +108,9 @@ message CreateTabletRequestPB {
 
   // Initial consensus configuration for the tablet.
   required consensus.RaftConfigPB config = 7;
+
+  // For index table: information about this index.
+  optional IndexInfoPB index_info = 12;
 }
 
 message CreateTabletResponsePB {
@@ -138,6 +167,36 @@ enum TSTabletManagerStatePB {
   MANAGER_SHUTDOWN = 3;
 }
 
+// TODO: rename this to FlushOrCompactTabletsRequestPB
+message FlushTabletsRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+
+  // Tablets to flush.
+  repeated bytes tablet_ids = 2;
+
+  optional fixed64 propagated_hybrid_time = 3;
+
+  // Whether we want to compact the tablets instead of flushing them.
+  optional bool is_compaction = 4;
+}
+
+message FlushTabletsResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  optional bytes failed_tablet_id = 2;
+
+  optional fixed64 propagated_hybrid_time = 3;
+}
+
+message CountIntentsRequestPB {
+}
+
+message CountIntentsResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional int64 num_intents = 2;
+}
+
 service TabletServerAdminService {
   // Create a new, empty tablet with the specified parameters. Only used for
   // brand-new tablets, not for "moves".
@@ -147,5 +206,12 @@ service TabletServerAdminService {
   rpc DeleteTablet(DeleteTabletRequestPB) returns (DeleteTabletResponsePB);
 
   // Alter a tablet's schema.
-  rpc AlterSchema(AlterSchemaRequestPB) returns (AlterSchemaResponsePB);
+  rpc AlterSchema(ChangeMetadataRequestPB) returns (ChangeMetadataResponsePB);
+
+  // Create a co-partitioned table in an existing tablet
+  rpc CopartitionTable(CopartitionTableRequestPB) returns (CopartitionTableResponsePB);
+
+  rpc FlushTablets(FlushTabletsRequestPB) returns (FlushTabletsResponsePB);
+
+  rpc CountIntents(CountIntentsRequestPB) returns (CountIntentsResponsePB);
 }

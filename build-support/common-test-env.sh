@@ -14,6 +14,8 @@
 
 # Common bash code for test scripts/
 
+declare -i global_exit_code=0
+
 if [[ $BASH_SOURCE == $0 ]]; then
   echo "$BASH_SOURCE must be sourced, not executed" >&2
   exit 1
@@ -21,20 +23,22 @@ fi
 
 . "${BASH_SOURCE%/*}/common-build-env.sh"
 
-NON_GTEST_TESTS_RE=$( regex_from_list "
+NON_GTEST_TESTS=(
   merge-test
   non_gtest_failures-test
   c_test
   compact_on_deletion_collector_test
   db_sanity_test
   merge_test
-")
+)
 
 # There gtest suites have internal dependencies between tests, so those tests can't be run
 # separately.
-TEST_BINARIES_TO_RUN_AT_ONCE_RE=$( regex_from_list "
+TEST_BINARIES_TO_RUN_AT_ONCE=(
   tests-rocksdb/thread_local_test
-")
+)
+
+make_regexes_from_lists NON_GTEST_TESTS TEST_BINARIES_TO_RUN_AT_ONCE
 
 VALID_TEST_BINARY_DIRS_PREFIX="tests"
 VALID_TEST_BINARY_DIRS_RE="^${VALID_TEST_BINARY_DIRS_PREFIX}-[0-9a-zA-Z\-]+"
@@ -45,6 +49,9 @@ VALID_TEST_BINARY_DIRS_RE="^${VALID_TEST_BINARY_DIRS_PREFIX}-[0-9a-zA-Z\-]+"
 DEFAULT_TEST_TIMEOUT_SEC=${DEFAULT_TEST_TIMEOUT_SEC:-600}
 INCREASED_TEST_TIMEOUT_SEC=$(($DEFAULT_TEST_TIMEOUT_SEC * 2))
 
+# This timeout will be applied by the process_tree_supervisor.py script.
+PROCESS_TREE_SUPERVISOR_TEST_TIMEOUT_SEC=$(( 30 * 60 ))
+
 # We grep for these log lines and show them in the main log on test failure. This regular expression
 # is used with egrep.
 RELEVANT_LOG_LINES_RE="^[[:space:]]*(Value of|Actual|Expected):|^Expected|^Failed|^Which is:"
@@ -54,10 +61,13 @@ readonly RELEVANT_LOG_LINES_RE
 # Some functions use this to output to stdout/stderr along with a file.
 append_output_to=/dev/null
 
-readonly ADDRESS_ALREADY_IN_USE_PATTERN="Address already in use"
+readonly TEST_RESTART_PATTERN="Address already in use|\
+pthread .*: Device or resource busy|\
+FATAL: could not create shared memory segment: No space left on device"
 
 # We use this to submit test jobs for execution on Spark.
-readonly SPARK_SUBMIT_CMD_PATH=/n/tools/spark/current/bin/spark-submit
+readonly SPARK_SUBMIT_CMD_PATH_NON_ASAN_TSAN=/n/tools/spark/current/bin/spark-submit
+readonly SPARK_SUBMIT_CMD_PATH_ASAN_TSAN=/n/tools/spark/current-tsan/bin/spark-submit
 readonly INITIAL_SPARK_DRIVER_CORES=8
 
 # This is used to separate relative binary path from gtest_filter for C++ tests in what we call
@@ -73,6 +83,18 @@ readonly LIST_OF_TESTS_DIR_NAME="list_of_tests"
 
 readonly JENKINS_NFS_BUILD_REPORT_BASE_DIR="/n/jenkins/build_stats"
 
+# https://github.com/google/sanitizers/wiki/SanitizerCommonFlags
+readonly SANITIZER_COMMON_OPTIONS=""
+
+declare -i -r MIN_REPEATED_TEST_PARALLELISM=1
+declare -i -r MAX_REPEATED_TEST_PARALLELISM=100
+declare -i -r DEFAULT_REPEATED_TEST_PARALLELISM=4
+declare -i -r DEFAULT_REPEATED_TEST_PARALLELISM_TSAN=1
+
+readonly MVN_COMMON_SKIPPED_OPTIONS_IN_TEST=(
+  -Dmaven.javadoc.skip
+)
+
 # -------------------------------------------------------------------------------------------------
 # Functions
 # -------------------------------------------------------------------------------------------------
@@ -85,13 +107,15 @@ sanitize_for_path() {
 set_common_test_paths() {
   expect_num_args 0 "$@"
 
-  # Allow putting all the test logs into a separate directory by setting YB_TEST_LOG_ROOT_SUFFIX.
-  # This is useful for regression tracking when rolling commits back one by one after the main build
-  # is done (see track_down_regressions.sh), so that we don't pollute the main test result
-  # directory.
-  YB_TEST_LOG_ROOT_DIR="$BUILD_ROOT/yb-test-logs${YB_TEST_LOG_ROOT_SUFFIX:-}"
+  if [[ -z ${YB_TEST_LOG_ROOT_DIR:-} ]]; then
+    # Allow putting all the test logs into a separate directory by setting YB_TEST_LOG_ROOT_SUFFIX.
+    YB_TEST_LOG_ROOT_DIR="$BUILD_ROOT/yb-test-logs${YB_TEST_LOG_ROOT_SUFFIX:-}"
+  fi
 
   mkdir_safe "$YB_TEST_LOG_ROOT_DIR"
+
+  # This is needed for tests to find the lsof program.
+  add_path_entry /usr/sbin
 }
 
 validate_relative_test_binary_path() {
@@ -236,6 +260,12 @@ collect_gtest_tests() {
     gtest_list_tests_cmd+=( "--gtest_filter=$YB_GTEST_FILTER" )
   fi
 
+  # We need to list the tests without any user-specified sanitizer options, because that might
+  # produce unintended output.
+  local old_sanitizer_extra_options=${YB_SANITIZER_EXTRA_OPTIONS:-}
+  local YB_SANITIZER_EXTRA_OPTIONS=""
+  set_sanitizer_runtime_options
+
   set +e
   pushd "$gtest_list_tests_tmp_dir" >/dev/null
   local gtest_list_tests_result  # this has to be on a separate line to capture the exit code
@@ -245,6 +275,9 @@ collect_gtest_tests() {
   gtest_list_tests_exit_code=$?
   popd >/dev/null
   set -e
+
+  YB_SANITIZER_EXTRA_OPTIONS=$old_sanitizer_extra_options
+  set_sanitizer_runtime_options
 
   set_expected_core_dir "$gtest_list_tests_tmp_dir"
   test_log_path="$gtest_list_stderr_path"
@@ -274,7 +307,7 @@ Shared library .* loaded at address 0x[0-9a-f]+$" || true ) \
     >"$gtest_list_stderr_path.filtered"
 
   # -s tests if the given file is non-empty
-  if [ -s "$gtest_list_stderr_path.filtered" ]; then
+  if [[ -s "$gtest_list_stderr_path.filtered" ]]; then
     (
       echo
       echo "'$abs_test_binary_path' produced non-empty stderr output when run with" \
@@ -334,6 +367,11 @@ using_nfs() {
   return 1
 }
 
+create_test_tmpdir() {
+  export TEST_TMPDIR="/tmp/yb_test.tmp.$RANDOM.$RANDOM.$RANDOM.pid$$"
+  mkdir_safe "$TEST_TMPDIR"
+}
+
 # Set a number of variables in preparation to running a test.
 # Inputs:
 #   test_descriptor
@@ -368,8 +406,6 @@ using_nfs() {
 #   test_cmd_line
 #     An array representing the test command line to run, including the JUnit-compatible test result
 #     XML file location and --gtest_filter=..., if applicable.
-#   raw_test_log_path
-#     The path to output the raw test log to (before any filtering by stacktrace_addr2line.pl).
 #   test_log_path
 #     The final log path (after any applicable filtering and appending additional debug info).
 #   xml_output_file
@@ -381,7 +417,7 @@ using_nfs() {
 #
 # This function also removes the old XML output file at the path "$xml_output_file".
 
-prepare_for_running_test() {
+prepare_for_running_cxx_test() {
   expect_num_args 0 "$@"
   expect_vars_to_be_set \
     YB_TEST_LOG_ROOT_DIR \
@@ -414,18 +450,8 @@ prepare_for_running_test() {
   local test_binary_sanitized=$( sanitize_for_path "$rel_test_binary" )
   local test_name_sanitized=$( sanitize_for_path "$test_name" )
 
-  # If there are ephermeral drives, pick a random one for this test and create a symlink from
-  #
-  # $BUILD_ROOT/yb-test-logs/$test_binary_sanitized
-  # ^^^^^^^^^^^^^^^^^^^^^^^^
-  # ($YB_TEST_LOG_ROOT_DIR)
-  #
-  # to /mnt/<drive>/<some_unique_path>/test-workspace/<testname>.
-  # Otherwise, simply create the directory under $BUILD_ROOT/yb-test-logs.
-  test_dir="$YB_TEST_LOG_ROOT_DIR/$test_binary_sanitized"
-  if [[ ! -d $test_dir ]]; then
-    create_dir_on_ephemeral_drive "$test_dir" "test-workspace/$test_binary_sanitized"
-  fi
+  test_dir=$YB_TEST_LOG_ROOT_DIR/$test_binary_sanitized
+  mkdir_safe "$test_dir"
 
   rel_test_log_path_prefix="$test_binary_sanitized"
   if "$run_at_once"; then
@@ -459,16 +485,8 @@ prepare_for_running_test() {
     test_cmd_line+=( "--gtest_filter=$test_name" )
   fi
 
-  export TEST_TMPDIR="$test_log_path_prefix.tmp"
-  if is_src_root_on_nfs; then
-    export TEST_TMPDIR="/tmp/$test_log_path_prefix.tmp.$RANDOM.$RANDOM.$RANDOM.$$"
-  else
-    export TEST_TMPDIR="$test_log_path_prefix.tmp"
-  fi
-
-  mkdir_safe "$TEST_TMPDIR"
+  create_test_tmpdir
   test_log_path="$test_log_path_prefix.log"
-  raw_test_log_path="${test_log_path_prefix}__raw.log"
 
   # gtest won't overwrite old junit test files, resulting in a build failure
   # even when retries are successful.
@@ -505,8 +523,14 @@ set_debugger_input_for_core_stack_trace() {
   if is_mac; then
     debugger_cmd=( lldb "$executable_path" -c "$core_path" )
     debugger_input="thread backtrace ${thread_for_backtrace:-all}"  # backtrace
+    # TODO: dump the current thread AND all threads, like we already do with gdb.
   else
-    debugger_cmd=( gdb -q -n -ex bt -batch "$executable_path" "$core_path" )
+    debugger_cmd=(
+      gdb -q -n
+      -ex 'bt'
+      -ex 'thread apply all bt'
+      -batch "$executable_path" "$core_path"
+    )
     debugger_input=""
   fi
 }
@@ -538,8 +562,11 @@ analyze_existing_core_file() {
   set +e
   (
     set -x
-    echo "$debugger_input" | "${debugger_cmd[@]}" 2>&1 | \
-      egrep -v "^\[New LWP [0-9]+\]$" | tee -a "$append_output_to"
+    echo "$debugger_input" |
+      "${debugger_cmd[@]}" 2>&1 |
+      egrep -v "^\[New LWP [0-9]+\]$" |
+      "$YB_SRC_ROOT"/build-support/dedup_thread_stacks.py |
+      tee -a "$append_output_to"
   ) >&2
   set -e
   echo >&2
@@ -637,11 +664,73 @@ process_core_file() {
   fi
 }
 
+# Used for both C++ and Java tests.
+stop_process_tree_supervisor() {
+  process_supervisor_success=true
+  if [[ ${process_tree_supervisor_pid:-0} -eq 0 ]]; then
+    return
+  fi
+
+  if ! kill -SIGUSR1 "$process_tree_supervisor_pid"; then
+    log "Warning: could not stop the process tree supervisor (pid $process_tree_supervisor_pid)." \
+        "This could be because it has already terminated."
+  fi
+
+  set +e
+  wait "$process_tree_supervisor_pid"
+  declare -i supervisor_exit_code=$?
+  set -e
+  if [[ $supervisor_exit_code -eq $SIGUSR1_EXIT_CODE ]]; then
+    # This could happen when we killed the supervisor script before it had a chance to set the
+    # signal handler for SIGUSR1.
+    supervisor_exit_code=0
+  fi
+
+  declare -i return_code=0
+  if [[ $supervisor_exit_code -ne 0 ]]; then
+    log "Process tree supervisor exited with code $supervisor_exit_code"
+    process_supervisor_success=false
+  fi
+
+  if [[ -f $process_supervisor_log_path ]]; then
+    if is_jenkins || [[ $process_supervisor_success != "true" ]] || \
+       grep -q YB_STRAY_PROCESS "$process_supervisor_log_path"; then
+      log "Process supervisor log dump ($process_supervisor_log_path):"
+      cat "$process_supervisor_log_path" >&2
+    else
+      log "Omitting process supervisor log, nothing interesting there"
+    fi
+
+    # TODO: Re-enable the logic below for treating stray processes as test failures, when the
+    # following tests are fixed:
+    # - org.yb.pgsql.TestPgRegressFeature.testPgRegressFeature
+    # - org.yb.pgsql.TestPgRegressTypesNumeric.testPgRegressTypes
+    # See https://github.com/YugaByte/yugabyte-db/issues/946 for details.
+    if false && grep -q YB_STRAY_PROCESS "$process_supervisor_log_path"; then
+      log "Stray processes reported in $process_supervisor_log_path, considering the test failed."
+      log "The JUnit-compatible XML file will be updated to reflect this error."
+      process_supervisor_success=false
+
+      if [[ -f ${process_tree_supervisor_append_log_to_on_error:-} ]]; then
+        log "Appending process supervisor log to $process_tree_supervisor_append_log_to_on_error"
+        (
+          echo "Process supervisor log:";
+          cat "$process_supervisor_log_path"
+        ) >>"$process_tree_supervisor_append_log_to_on_error"
+      fi
+    fi
+    rm -f "$process_supervisor_log_path"
+  fi
+
+  # To make future calls to this function a no-op.
+  process_tree_supervisor_pid=0
+}
+
 # Checks if the there is no XML file at path "$xml_output_file". This may happen if a gtest test
 # suite fails before it has a chance to generate an XML output file. In that case, this function
 # generates a substitute XML output file using parse_test_failure.py, but only if the log file
 # exists at its expected location.
-handle_xml_output() {
+handle_cxx_test_xml_output() {
   expect_vars_to_be_set \
     rel_test_binary \
     test_log_path \
@@ -683,8 +772,18 @@ handle_xml_output() {
     fi
   fi
 
+  process_tree_supervisor_append_log_to_on_error=$test_log_path
+
+  stop_process_tree_supervisor
+
+  if ! "$process_supervisor_success"; then
+    log "Process tree supervisor reported that the test failed"
+    test_failed=true
+  fi
   if "$test_failed"; then
-    echo "Updating $xml_output_file with a link to test log" >&2
+    log "Test failed, updating $xml_output_file"
+  else
+    log "Test succeeded, updating $xml_output_file"
   fi
   "$YB_SRC_ROOT"/build-support/update_test_result_xml.py \
     --result-xml "$xml_output_file" \
@@ -693,52 +792,6 @@ handle_xml_output() {
 
   # Useful for distributed builds in an NFS environment.
   chmod g+w "$xml_output_file"
-}
-
-postprocess_test_log() {
-  expect_num_args 0 "$@"
-  expect_vars_to_be_set \
-    STACK_TRACE_FILTER \
-    abs_test_binary_path \
-    raw_test_log_path \
-    test_log_path \
-    test_log_path_prefix
-
-  if [[ ! -f $raw_test_log_path ]]; then
-    # We must have failed even before we could run the test.
-    return
-  fi
-
-  local stack_trace_filter_err_path="${test_log_path_prefix}__stack_trace_filter_err.txt"
-
-  if [[ $STACK_TRACE_FILTER == "cat" ]]; then
-    # Don't pass the binary name as an argument to the cat command.
-    set +e
-    "$STACK_TRACE_FILTER" <"$raw_test_log_path" 2>"$stack_trace_filter_err_path" >"$test_log_path"
-  else
-    set +ex
-    "$STACK_TRACE_FILTER" "$abs_test_binary_path" <"$raw_test_log_path" \
-      >"$test_log_path" 2>"$stack_trace_filter_err_path"
-  fi
-  local stack_trace_filter_exit_code=$?
-  set -e
-
-  if [[ $stack_trace_filter_exit_code -ne 0 ]]; then
-    # Stack trace filtering failed, create an output file with the error message.
-    (
-      echo "Failed to run the stack trace filtering program '$STACK_TRACE_FILTER'"
-      echo
-      echo "Standard error from '$STACK_TRACE_FILTER'":
-      cat "$stack_trace_filter_err_path"
-      echo
-
-      echo "Raw output:"
-      echo
-      cat "$raw_test_log_path"
-    ) >"$test_log_path"
-    test_failed=true
-  fi
-  rm -f "$raw_test_log_path" "$stack_trace_filter_err_path"
 }
 
 # Sets test log URL prefix if we're running in Jenkins.
@@ -757,7 +810,9 @@ determine_test_timeout() {
   if [[ -n ${YB_TEST_TIMEOUT:-} ]]; then
     timeout_sec=$YB_TEST_TIMEOUT
   else
-    if [[ $rel_test_binary == "bin/compact_on_deletion_collector_test" ]]; then
+    if [[ $rel_test_binary == "tests-pgwrapper/pg_wrapper-test" || \
+          $rel_test_binary == "tests-pgwrapper/pg_libpq-test" || \
+          $rel_test_binary == "tests-pgwrapper/create_initial_sys_catalog_snapshot" ]]; then
       # This test is particularly slow on TSAN, and it has to be run all at once (we cannot use
       # --gtest_filter) because of dependencies between tests.
       timeout_sec=$INCREASED_TEST_TIMEOUT_SEC
@@ -767,7 +822,25 @@ determine_test_timeout() {
   fi
 }
 
-run_one_test() {
+try_set_ulimited_ulimit() {
+  # Setting the ulimit may fail with an error message, and that's what we want. We will still
+  # run the test.  In case we do manage to set the core file size limit, the caller can restore the
+  # previous limit after exiting a subshell.
+  if ! ulimit -c unlimited; then
+    # Print some diagnostics if we fail to set core file size limit.
+    log "Command 'ulimit -c unlimited' failed. Current 'ulimit -c' output: $( ulimit -c )"
+  fi
+}
+
+# YB_CTEST_VERBOSE makes test output go to stderr, and then we separately make it show up on
+# the console by giving ctest the --verbose option. This is intended for development. When we
+# run tests on Jenkins or when running all tests using "ctest -j8" from the build root, one
+# should leave YB_CTEST_VERBOSE unset.
+is_ctest_verbose() {
+  [[ ${YB_CTEST_VERBOSE:-0} == "1" ]]
+}
+
+run_one_cxx_test() {
   expect_num_args 0 "$@"
   expect_vars_to_be_set \
     BUILD_ROOT \
@@ -786,34 +859,27 @@ run_one_test() {
   local test_wrapper_cmd_line=(
     "$BUILD_ROOT"/bin/run-with-timeout $(( $timeout_sec + 1 )) "${test_cmd_line[@]}"
   )
+  if [[ $TEST_TMPDIR == "/" || $TEST_TMPDIR == "/tmp" ]]; then
+    # Let's be paranoid because we'll be deleting everything inside this directory.
+    fatal "Invalid TEST_TMPDIR: '$TEST_TMPDIR': must be a unique temporary directory."
+  fi
   pushd "$TEST_TMPDIR" >/dev/null
+
+  export YB_FATAL_DETAILS_PATH_PREFIX=$test_log_path_prefix.fatal_failure_details
+
+  about_to_start_running_test
 
   local attempts_left
   for attempts_left in {1..0}; do
+    # Clean up anything that might have been left from the previous attempt.
+    rm -rf "$TEST_TMPDIR"/*
+
     set +e
     (
-      # Setting the ulimit may fail with an error message, and that's what we want. We will still
-      # run the test.  In case we do manage to set the core file size limit, we will restore the
-      # previous limit after we exit the subshell.
-      ulimit -c unlimited
-      if [[ $? -ne 0 ]]; then
-        # Print some diagnostics if we fail to set core file size limit.
-        log "Command 'ulimit -c unlimited' failed. Current 'ulimit -c' output: $( ulimit -c )"
-      fi
+      try_set_ulimited_ulimit
 
-      # YB_CTEST_VERBOSE makes test output go to stderr, and then we separately make it show up on
-      # the console by giving ctest the --verbose option. This is intended for development. When we
-      # run tests on Jenkins or when running all tests using "ctest -j8" from the build root, one
-      # should leave YB_CTEST_VERBOSE unset.
-      if [[ -n ${YB_CTEST_VERBOSE:-} ]]; then
-        # In the verbose mode we have to perform stack trace filtering / symbolization right away.
-        local stack_trace_filter_cmd=( "$STACK_TRACE_FILTER" )
-        if [[ $STACK_TRACE_FILTER != "cat" ]]; then
-          stack_trace_filter_cmd+=( "$abs_test_binary_path" )
-        fi
-        ( set -x; "${test_wrapper_cmd_line[@]}" 2>&1 ) | \
-          "${stack_trace_filter_cmd[@]}" | \
-          tee "$test_log_path"
+      if is_ctest_verbose; then
+        ( set -x; "${test_wrapper_cmd_line[@]}" 2>&1 ) | tee "$test_log_path"
         # Propagate the exit code of the test process, not any of the filters. This will only exit
         # this subshell, not the entire script calling this function.
         exit ${PIPESTATUS[0]}
@@ -835,10 +901,10 @@ run_one_test() {
     # See if the test failed due to "Address already in use" and log a message if we still have more
     # attempts left.
     if [[ $attempts_left -gt 0 ]] && \
-       egrep -q "$ADDRESS_ALREADY_IN_USE_PATTERN" "$test_log_path"; then
-      log "Found 'Address already in use' in test log, re-running the test:"
-      egrep "$ADDRESS_ALREADY_IN_USE_PATTERN" "$test_log_path" >&2
-    elif [[ $test_exit_code -ne 0 ]]; then
+       egrep -q "$TEST_RESTART_PATTERN" "$test_log_path"; then
+      log "Found one of the intermittent error patterns in the log, restarting the test (once):"
+      egrep "$TEST_RESTART_PATTERN" "$test_log_path" >&2
+    else
       # Avoid retrying any other kinds of failures.
       break
     fi
@@ -851,7 +917,7 @@ run_one_test() {
   fi
 }
 
-handle_test_failure() {
+handle_cxx_test_failure() {
   expect_num_args 0 "$@"
   expect_vars_to_be_set \
     TEST_TMPDIR \
@@ -880,11 +946,13 @@ handle_test_failure() {
         # https://jenkins.dev.yugabyte.com/job/yugabyte-with-custom-test-script/47/artifact/build/debug/yb-test-logs/bin__raft_consensus-itest/RaftConsensusITest_TestChurnyElections.log
         echo "Log URL: $test_log_url_prefix/$rel_test_log_path_prefix.log"
       fi
-      if [[ -f $test_log_path ]]; then
-        if egrep -q "$RELEVANT_LOG_LINES_RE" "$test_log_path"; then
-          echo "Relevant log lines:"
-          egrep -C 2 "$RELEVANT_LOG_LINES_RE" "$test_log_path"
-        fi
+
+      # Show some context from the test log, but only do so if we are not already showing the entire
+      # test log when invoking tests directly in yb_build.sh.
+      if ! is_ctest_verbose && [[ -f $test_log_path ]] &&
+         egrep -q "$RELEVANT_LOG_LINES_RE" "$test_log_path"; then
+        echo "Relevant log lines:"
+        egrep -C 3 "$RELEVANT_LOG_LINES_RE" "$test_log_path"
       fi
     ) >&2
     set_expected_core_dir "$TEST_TMPDIR"
@@ -902,22 +970,53 @@ delete_successful_output_if_needed() {
     # Delete test output after a successful test run to minimize network traffic and disk usage on
     # Jenkins.
     rm -rf "$test_log_path" "$TEST_TMPDIR"
+    return
   fi
   if is_src_root_on_nfs; then
+    log "Removing temporary test data directory: $TEST_TMPDIR"
     rm -rf "$TEST_TMPDIR"
   fi
 }
 
-run_test_and_process_results() {
-  run_one_test
-  postprocess_test_log
-  handle_test_failure
-  handle_xml_output
+run_postproces_test_result_script() {
+  local args=(
+    --yb-src-root "$YB_SRC_ROOT"
+    --build-root "$BUILD_ROOT"
+    --extra-error-log-path "${YB_TEST_EXTRA_ERROR_LOG_PATH:-}"
+  )
+  if [[ -n ${YB_FATAL_DETAILS_PATH_PREFIX:-} ]]; then
+    args+=(
+      --fatal-details-path-prefix "$YB_FATAL_DETAILS_PATH_PREFIX"
+    )
+  fi
+  "$VIRTUAL_ENV/bin/python" "$YB_SRC_ROOT/python/yb/postprocess_test_result.py" \
+    "${args[@]}" "$@"
+}
+
+run_cxx_test_and_process_results() {
+  run_one_cxx_test
+  handle_cxx_test_failure
+  handle_cxx_test_xml_output
+
+  run_postproces_test_result_script \
+    --test-log-path "$test_log_path" \
+    --junit-xml-path "$xml_output_file" \
+    --language cxx \
+    --cxx-rel-test-binary "$rel_test_binary" \
+    --test-failed "$test_failed"
+
   delete_successful_output_if_needed
 }
 
-set_asan_tsan_options() {
+set_sanitizer_runtime_options() {
   expect_vars_to_be_set BUILD_ROOT
+
+  # Don't allow setting these options directly from outside. We will allow controlling them through
+  # our own "extra options" environment variables.
+  export ASAN_OPTIONS=""
+  export TSAN_OPTIONS=""
+  export LSAN_OPTIONS=""
+  export UBSAN_OPTIONS=""
 
   local -r build_root_basename=${BUILD_ROOT##*/}
 
@@ -964,11 +1063,10 @@ set_asan_tsan_options() {
   if [[ $build_root_basename =~ ^asan- ]]; then
     # Enable leak detection even under LLVM 3.4, where it was disabled by default.
     # This flag only takes effect when running an ASAN build.
-    ASAN_OPTIONS="${ASAN_OPTIONS:-} detect_leaks=1"
-    export ASAN_OPTIONS
+    export ASAN_OPTIONS="detect_leaks=1 disable_coredump=0"
 
     # Set up suppressions for LeakSanitizer
-    LSAN_OPTIONS="${LSAN_OPTIONS:-} suppressions=$YB_SRC_ROOT/build-support/lsan-suppressions.txt"
+    LSAN_OPTIONS="suppressions=$YB_SRC_ROOT/build-support/lsan-suppressions.txt"
 
     # If we print out object addresses somewhere else, we can match them to LSAN-reported
     # addresses of leaked objects.
@@ -976,7 +1074,10 @@ set_asan_tsan_options() {
     export LSAN_OPTIONS
 
     # Enable stack traces for UBSAN failures
-    UBSAN_OPTIONS="${UBSAN_OPTIONS:-} print_stacktrace=1"
+    UBSAN_OPTIONS="print_stacktrace=1"
+    local ubsan_suppressions_path=$YB_SRC_ROOT/build-support/ubsan-suppressions.txt
+    ensure_file_exists "$ubsan_suppressions_path"
+    UBSAN_OPTIONS+=" suppressions=$ubsan_suppressions_path"
     export UBSAN_OPTIONS
   fi
 
@@ -989,12 +1090,21 @@ set_asan_tsan_options() {
     #    needs compiler-rt commits c4c3dfd, 9a8efe3, and possibly others.
     # 2. Many unit tests report lock-order-inversion warnings; they should be
     #    fixed before reenabling the detector.
-    TSAN_OPTIONS="${TSAN_OPTIONS:-} detect_deadlocks=0"
-    TSAN_OPTIONS="$TSAN_OPTIONS suppressions=$YB_SRC_ROOT/build-support/tsan-suppressions.txt"
-    TSAN_OPTIONS="$TSAN_OPTIONS history_size=7"
-    TSAN_OPTIONS="$TSAN_OPTIONS external_symbolizer_path=$ASAN_SYMBOLIZER_PATH"
+    TSAN_OPTIONS="detect_deadlocks=0"
+    TSAN_OPTIONS+=" suppressions=$YB_SRC_ROOT/build-support/tsan-suppressions.txt"
+    TSAN_OPTIONS+=" history_size=7"
+    TSAN_OPTIONS+=" external_symbolizer_path=$ASAN_SYMBOLIZER_PATH"
+    if [[ ${YB_SANITIZERS_ENABLE_COREDUMP:-0} == "1" ]]; then
+      TSAN_OPTIONS+=" disable_coredump=false"
+    fi
     export TSAN_OPTIONS
   fi
+
+  local extra_opts=${YB_SANITIZER_EXTRA_OPTIONS:-}
+  export ASAN_OPTIONS="$SANITIZER_COMMON_OPTIONS ${ASAN_OPTIONS:-} $extra_opts"
+  export LSAN_OPTIONS="$SANITIZER_COMMON_OPTIONS ${LSAN_OPTIONS:-} $extra_opts"
+  export TSAN_OPTIONS="$SANITIZER_COMMON_OPTIONS ${TSAN_OPTIONS:-} $extra_opts"
+  export UBSAN_OPTIONS="$SANITIZER_COMMON_OPTIONS ${UBSAN_OPTIONS:-} $extra_opts"
 }
 
 did_test_succeed() {
@@ -1006,48 +1116,53 @@ did_test_succeed() {
   fi
 
   if [[ ! -f "$log_path" ]]; then
-    log "Log path '$log_path' not found."
+    log "Test failure reason: Log path '$log_path' not found."
     return 1
   fi
 
   if grep -q 'Running 0 tests from 0 test cases' "$log_path" && \
      ! egrep -q 'YOU HAVE [[:digit:]]+ DISABLED TEST' "$log_path"; then
-    log 'No tests were run, and no disabled tests found, invalid test filter?'
+    log 'Test failure reason: No tests were run, and no disabled tests found, invalid test filter?'
     return 1
   fi
 
   if grep -q 'LeakSanitizer: detected memory leaks' "$log_path"; then
-    log 'Detected memory leaks'
+    log 'Test failure reason: Detected memory leaks'
     return 1
   fi
 
   if grep -q 'AddressSanitizer: heap-use-after-free' "$log_path"; then
-    log 'Detected use of freed memory'
+    log 'Test failure reason: Detected use of freed memory'
     return 1
   fi
 
   if grep -q 'AddressSanitizer: undefined-behavior' "$log_path"; then
-    log 'Detected undefined behavior'
+    log 'Test failure reason: Detected ASAN undefined behavior'
+    return 1
+  fi
+
+  if grep -q 'UndefinedBehaviorSanitizer: undefined-behavior' "$log_path"; then
+    log 'Test failure reason: Detected UBSAN undefined behavior'
     return 1
   fi
 
   if grep -q 'ThreadSanitizer' "$log_path"; then
-    log 'ThreadSanitizer failures'
+    log 'Test failure reason: ThreadSanitizer failures'
     return 1
   fi
 
   if egrep -q 'Leak check.*detected leaks' "$log_path"; then
-    log 'Leak check failures'
+    log 'Test failure reason: Leak check failures'
     return 1
   fi
 
   if egrep -q 'Segmentation fault: ' "$log_path"; then
-    log 'Segmentation fault'
+    log 'Test failure reason: Segmentation fault'
     return 1
   fi
 
   if egrep -q '^\[  FAILED  \]' "$log_path"; then
-    log 'GTest failures'
+    log 'Test failure reason: GTest failures'
     return 1
   fi
 
@@ -1086,13 +1201,18 @@ did_test_succeed() {
       SIGIO \
       SIGPWR; do
     if grep -q " $signal_str " "$log_path"; then
-      log "Caught signal: $signal_str"
+      log "Test failure reason: Caught signal: $signal_str"
       return 1
     fi
   done
 
   if grep -q 'Check failed: ' "$log_path"; then
-    log 'Check failed'
+    log 'Test failure reason: Check failed'
+    return 1
+  fi
+
+  if egrep -q '^\[INFO\] BUILD FAILURE$' "$log_path"; then
+    log "Test failure reason: Java build or tests failed"
     return 1
   fi
 
@@ -1122,22 +1242,33 @@ show_disk_usage() {
   echo
 }
 
+find_spark_submit_cmd() {
+  if [[ $build_type == "tsan" || $build_type == "asan" ]]; then
+    spark_submit_cmd_path=$SPARK_SUBMIT_CMD_PATH_ASAN_TSAN
+  else
+    spark_submit_cmd_path=$SPARK_SUBMIT_CMD_PATH_NON_ASAN_TSAN
+  fi
+}
+
 spark_available() {
-  if is_running_on_gcp && [[ -f $SPARK_SUBMIT_CMD_PATH ]]; then
+  find_spark_submit_cmd
+  if [[ -f $spark_submit_cmd_path ]]; then
     return 0  # true
   fi
   return 1  # false
 }
 
 run_tests_on_spark() {
+  if ! spark_available; then
+    fatal "Spark is not available, can't run tests on Spark"
+  fi
   log "Running tests on Spark"
   local return_code
   local run_tests_args=(
     --build-root "$BUILD_ROOT"
-    --build-type "$build_type"
     --save_report_to_build_dir
   )
-  if is_jenkins && [[ -d "$JENKINS_NFS_BUILD_REPORT_BASE_DIR" ]]; then
+  if is_jenkins && [[ -d $JENKINS_NFS_BUILD_REPORT_BASE_DIR ]]; then
     run_tests_args+=( "--reports-dir" "$JENKINS_NFS_BUILD_REPORT_BASE_DIR" --write_report )
   fi
 
@@ -1147,7 +1278,7 @@ run_tests_on_spark() {
     # Run Spark and filter out some boring output (or we'll end up with 6000 lines, two per test).
     # We still keep "Finished" lines ending with "(x/y)" where x is divisible by 10. Example:
     # Finished task 2791.0 in stage 0.0 (TID 2791) in 10436 ms on <ip> (executor 3) (2900/2908)
-    time "$SPARK_SUBMIT_CMD_PATH" \
+    time "$spark_submit_cmd_path" \
       --driver-cores "$INITIAL_SPARK_DRIVER_CORES" \
       "$YB_SRC_ROOT/build-support/run_tests_on_spark.py" \
       "${run_tests_args[@]}" "$@" 2>&1 | \
@@ -1198,6 +1329,7 @@ fix_cxx_test_name() {
       ;;
       1)
         log "Auto-correcting $cxx_test_name -> ${possible_corrections[0]}"
+        test_binary_name=$cxx_test_name
         cxx_test_name=${possible_corrections[0]}
       ;;
       *)
@@ -1216,16 +1348,533 @@ fix_cxx_test_name() {
   fi
 }
 
+# Fixes cxx_test_name based on gtest_filter
+fix_gtest_cxx_test_name() {
+  if [[ $cxx_test_name != GTEST_* || $make_program != *ninja ]]; then
+    return
+  fi
+  local gtest_name=${cxx_test_name#*_}
+  local targets=$("$make_program" -t targets all)
+  while read line; do
+    # Sample lines from "ninja -t targets all"
+    # CMakeFiles/latest_symlink: CUSTOM_COMMAND
+    # src/yb/rocksdb/CMakeFiles/edit_cache.util: CUSTOM_COMMAND
+    # src/yb/rocksdb/edit_cache: phony
+    # src/yb/rocksdb/rocksdb_transaction_test: phony
+    # cmake_object_order_depends_target_transaction_test: phony
+    # tests-rocksdb/transaction_test: CXX_EXECUTABLE_LINKER__transaction_test
+    if [[ ${line#*:} == " phony" ]]; then
+      local target_name=${line%%:*}
+      local stripped_target_name="${target_name//[_-]/}"
+      if [[ $stripped_target_name == $gtest_name ]]; then
+        log "Found target $target_name for $gtest_name"
+        cxx_test_name=$target_name
+        return
+      fi
+    fi
+  done <<< "$targets"
+
+  log "Unable to find test matching gtest_filter $YB_GTEST_FILTER"
+}
+
+# This is called immediately before we start running the test. The Spark-based test runner watches
+# for this "flag file" to appear to catch a case where run-test.sh gets totally stuck on macOS
+# before even getting to the test.
+about_to_start_running_test() {
+  if [[ -n ${YB_TEST_STARTED_RUNNING_FLAG_FILE:-} ]]; then
+    touch "$YB_TEST_STARTED_RUNNING_FLAG_FILE"
+    log "Created file $YB_TEST_STARTED_RUNNING_FLAG_FILE to indicate that the test is starting"
+  fi
+}
+
+# Arguments: <maven_module_name> <test_class_and_maybe_method>
+# The second argument could have slashes instead of dots, and could have an optional .java
+# extension.
+# Examples:
+# - yb-client org.yb.client.TestYBClient
+# - yb-client org.yb.client.TestYBClient#testAllMasterChangeConfig
+#
+# <maven_module_name> could also be the module directory relative to $YB_SRC_ROOT, e.g.
+# java/yb-cql or ent/java/<enterprise_module_name>.
+run_java_test() {
+  expect_num_args 2 "$@"
+  local module_name_or_rel_module_dir=$1
+  local test_class_and_maybe_method=${2%.java}
+  test_class_and_maybe_method=${test_class_and_maybe_method%.scala}
+  if [[ $module_name_or_rel_module_dir == */* ]]; then
+    # E.g. java/yb-cql or ent/java/<enterprise_module_name>.
+    local module_dir=$YB_SRC_ROOT/$module_name_or_rel_module_dir
+    module_name=${module_name_or_rel_module_dir##*/}
+  else
+    # E.g. yb-cql.
+    local module_name=$module_name_or_rel_module_dir
+    local module_dir=$YB_SRC_ROOT/java/$module_name
+  fi
+  ensure_directory_exists "$module_dir"
+  local java_project_dir=${module_dir%/*}
+  if [[ $java_project_dir != */java ]]; then
+    fatal "Expected the Java module directory '$module_dir' to have the form of" \
+          ".../java/<module_name>. Trying to run test: $test_class_and_maybe_method."
+  fi
+
+  local test_method_name=""
+  if [[ $test_class_and_maybe_method == *\#* ]]; then
+    test_method_name=${test_class_and_maybe_method##*#}
+  fi
+  local test_class=${test_class_and_maybe_method%#*}
+
+  if [[ -z ${BUILD_ROOT:-} ]]; then
+    fatal "Running Java tests requires that BUILD_ROOT be set"
+  fi
+  set_mvn_parameters
+  copy_artifacts_to_non_shared_mvn_repo
+
+  set_sanitizer_runtime_options
+  mkdir -p "$YB_TEST_LOG_ROOT_DIR/java"
+
+  # This can't include $YB_TEST_INVOCATION_ID -- previously, when we did that, it looked like some
+  # Maven processes were killed, although it is not clear why, because they should have already
+  # completed by the time we start looking for $YB_TEST_INVOCATION_ID in test names and killing
+  # processes.
+  local timestamp=$( get_timestamp_for_filenames )
+  local surefire_rel_tmp_dir=surefire${timestamp}_${RANDOM}_${RANDOM}_${RANDOM}_$$
+
+  # This should change the directory to either "java" or "ent/java".
+  cd "$module_dir"/..
+
+  # We specify tempDir to use a separate temporary directory for each test.
+  # http://maven.apache.org/surefire/maven-surefire-plugin/test-mojo.html
+  mvn_opts=(
+    -Dtest="$test_class_and_maybe_method"
+    --projects "$module_name"
+    -DtempDir="$surefire_rel_tmp_dir"
+    "${MVN_COMMON_SKIPPED_OPTIONS_IN_TEST[@]}"
+  )
+  append_common_mvn_opts
+
+  local report_suffix
+  if [[ -n $test_method_name ]]; then
+    report_suffix=${test_class}__${test_method_name}
+  else
+    report_suffix=$test_class
+  fi
+  report_suffix=${report_suffix//[/_}
+  report_suffix=${report_suffix//]/_}
+
+  local should_clean_test_dir=false
+  local surefire_reports_dir
+  if [[ -n ${YB_SUREFIRE_REPORTS_DIR:-} ]]; then
+    surefire_reports_dir=$YB_SUREFIRE_REPORTS_DIR
+  else
+    surefire_reports_dir=$module_dir/target/surefire-reports_${report_suffix}
+    if should_run_java_test_methods_separately && [[ -n $test_method_name ]]; then
+      # This report directory only has data for one test method (see how we come up with
+      # report_suffix above if test method name is defined ), so it is OK to clean it before running
+      # the test.
+      should_clean_test_dir=true
+    fi
+  fi
+  declare -r surefire_reports_dir
+  declare -r should_clean_test_dir
+
+  unset report_suffix
+
+  mvn_opts+=(
+    "-Dyb.surefire.reports.directory=$surefire_reports_dir"
+    surefire:test
+  )
+
+  if is_jenkins; then
+    # When running on Jenkins we would like to see more debug output.
+    mvn_opts+=( -X )
+  fi
+
+  if ! which mvn >/dev/null; then
+    fatal "Maven not found on PATH. PATH: $PATH"
+  fi
+
+  local junit_xml_path=$surefire_reports_dir/TEST-$test_class.xml
+  local log_files_path_prefix=$surefire_reports_dir/$test_class
+  local test_log_path=$log_files_path_prefix-output.txt
+  log "Using surefire reports directory: $surefire_reports_dir"
+  log "Test log path: $test_log_path"
+
+  local mvn_output_path=""
+  about_to_start_running_test
+  if [[ ${YB_REDIRECT_MVN_OUTPUT_TO_FILE:-0} == 1 ]]; then
+    mvn_output_path=$surefire_reports_dir/${test_class}__mvn_output.log
+  fi
+
+  local attempts_left
+  for attempts_left in {1..0}; do
+    if "$should_clean_test_dir" && [[ -d $surefire_reports_dir ]]; then
+      log "Cleaning the existing contents of: $surefire_reports_dir"
+      ( set -x; rm -f "$surefire_reports_dir"/* )
+    fi
+    if [[ ${YB_REDIRECT_MVN_OUTPUT_TO_FILE:-0} == 1 ]]; then
+      mkdir -p "$surefire_reports_dir"
+      set +e
+      time ( try_set_ulimited_ulimit; set -x; mvn "${mvn_opts[@]}" ) &>"$mvn_output_path"
+    else
+      set +e
+      time ( try_set_ulimited_ulimit; set -x; mvn "${mvn_opts[@]}" )
+    fi
+    local mvn_exit_code=$?
+    set -e
+    log "Maven exited with code $mvn_exit_code"
+    if [[ $mvn_exit_code -eq 0 || $attempts_left -eq 0 ]]; then
+      break
+    fi
+    if [[ ! -f $test_log_path ]]; then
+      log "Warning: test log path not found: $test_log_path, not re-trying the test."
+      break
+    elif egrep -q "$TEST_RESTART_PATTERN" "$test_log_path"; then
+      log "Found an intermittent error in $test_log_path, retrying the test"
+      egrep "$TEST_RESTART_PATTERN" "$test_log_path" >&2
+    else
+      break
+    fi
+  done
+
+  local xml_valid=true
+  if [[ -f $junit_xml_path ]]; then
+    # No reason to include mini cluster logs in the JUnit XML. In fact, these logs can interfere
+    # with XML parsing by Jenkins.
+    local filtered_junit_xml_path=$junit_xml_path.filtered
+    egrep -v "\
+^(m|ts|initdb|postgres)[0-9]*[|]pid[0-9]+[|]|\
+^[[:space:]]+at|\
+^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} |\
+^redis[.]clients[.]jedis[.]exceptions[.]JedisConnectionException: |\
+^Caused by: |\
+^[[:space:]][.]{3} +[0-9]+ more|\
+^java[.]lang[.][a-zA-Z.]+Exception: " "$junit_xml_path" >"$filtered_junit_xml_path"
+    # See if we have got a valid XML file after filtering.
+    if xmllint "$filtered_junit_xml_path" >/dev/null; then
+      mv -f "$filtered_junit_xml_path" "$junit_xml_path"
+      log "Filtered JUnit XML file '$junit_xml_path' is valid"
+    else
+      log "Failed to filter JUnit XML file '$junit_xml_path': invalid after filtering"
+      if xmllint "$junit_xml_path"; then
+        log "JUnit XML file '$junit_xml_path' is valid with no filtering done"
+      else
+        log "JUnit XML file '$junit_xml_path' is already invalid even with no filtering!"
+        xml_valid=false
+      fi
+      rm -f "$filtered_junit_xml_path"
+    fi
+  fi
+
+  process_tree_supervisor_append_log_to_on_error=$test_log_path
+  stop_process_tree_supervisor
+
+  if ! "$process_supervisor_success"; then
+    log "Process tree supervisor script reported an error, marking the test as failed in" \
+        "$junit_xml_path"
+    "$YB_SRC_ROOT"/build-support/update_test_result_xml.py \
+      --result-xml "$junit_xml_path" \
+      --mark-as-failed true \
+      --extra-message "Process supervisor script reported errors (e.g. unterminated processes)."
+  fi
+
+  if is_jenkins ||
+     [[ ${YB_REMOVE_SUCCESSFUL_JAVA_TEST_OUTPUT:-} == "1" && $mvn_exit_code -eq 0 ]]; then
+    # If the test is successful, all expected files exist, and no failures are found in the JUnit
+    # test XML, delete the test log files to save disk space in the Jenkins archive.
+    #
+    # We redirect both stdout and stderr for egrep commands to /dev/null because the files we are
+    # looking for might not exist. There could be a better way to do this that would not hide
+    # real errors.
+    if [[ -f $test_log_path && -f $junit_xml_path ]] && \
+       ! egrep "YB Java test failed" \
+         "$test_log_path" "$log_files_path_prefix".*.{stdout,stderr}.txt &>/dev/null && \
+       ! egrep "(errors|failures)=\"?[1-9][0-9]*\"?" "$junit_xml_path" &>/dev/null; then
+      log "Removing $test_log_path and related per-test-method logs: test succeeded."
+      (
+        set -x
+        rm -f "$test_log_path" \
+              "$log_files_path_prefix".*.{stdout,stderr}.txt \
+              "$mvn_output_path"
+      )
+    else
+      log "Not removing $test_log_path and related per-test-method logs: some tests failed," \
+          "or could not find test output or JUnit XML output."
+      log_file_existence "$test_log_path"
+      log_file_existence "$junit_xml_path"
+    fi
+  fi
+
+  if should_gzip_test_logs; then
+    gzip_if_exists "$test_log_path" "$mvn_output_path"
+    local per_test_method_log_path
+    for per_test_method_log_path in "$log_files_path_prefix".*.{stdout,stderr}.txt; do
+      gzip_if_exists "$per_test_method_log_path"
+    done
+  fi
+
+  declare -i java_test_exit_code=$mvn_exit_code
+  if [[ $java_test_exit_code -eq 0 ]] && ! "$process_supervisor_success"; then
+    java_test_exit_code=1
+  fi
+
+  run_postproces_test_result_script \
+    --test-log-path "$test_log_path" \
+    --junit-xml-path "$junit_xml_path" \
+    --language java \
+    --class-name "$test_class" \
+    --test-name "$test_method_name" \
+    --java-module-dir "$module_dir"
+
+  return "$java_test_exit_code"
+}
+
+collect_java_tests() {
+  set_common_test_paths
+  log "Collecting the list of all Java test methods and parameterized test methods"
+  local old_surefire_reports_dir=${YB_SUREFIRE_REPORTS_DIR:-}
+  unset YB_SUREFIRE_REPORTS_DIR
+  local mvn_opts=(
+    -DcollectTests
+    "${MVN_COMMON_SKIPPED_OPTIONS_IN_TEST[@]}"
+  )
+  append_common_mvn_opts
+  java_test_list_path=$BUILD_ROOT/java_test_list.txt
+  local collecting_java_tests_log_prefix=$BUILD_ROOT/collecting_java_tests
+  local stdout_log="$collecting_java_tests_log_prefix.out"
+  local stderr_log="$collecting_java_tests_log_prefix.err"
+  cp /dev/null "$java_test_list_path"
+  cp /dev/null "$stdout_log"
+  cp /dev/null "$stderr_log"
+
+  local java_project_dir
+  for java_project_dir in "${yb_java_project_dirs[@]}"; do
+    pushd "$java_project_dir"
+    local log_msg="Collecting Java tests in directory $PWD"
+    echo "$log_msg" >>"$stdout_log"
+    echo "$log_msg" >>"$stderr_log"
+    set +e
+    (
+      export YB_RUN_JAVA_TEST_METHODS_SEPARATELY=1
+      set -x
+      # The string "YUGABYTE_JAVA_TEST: " is specified in the Java code as COLLECTED_TESTS_PREFIX.
+      #
+      time mvn "${mvn_opts[@]}" surefire:test \
+        2>>"$stderr_log" | \
+        tee -a "$stdout_log" | \
+        egrep '^YUGABYTE_JAVA_TEST: ' | \
+        sed 's/^YUGABYTE_JAVA_TEST: //g' >>"$java_test_list_path"
+    )
+    if [[ $? -ne 0 ]]; then
+      local log_file_path
+      for log_file_path in "$stdout_log" "$stderr_log"; do
+        if [[ -f $log_file_path ]]; then
+          heading "Contents of $log_file_path (dumping here because of an error)"
+          cat "$log_file_path"
+        else
+          heading "$log_file_path does not exist"
+        fi
+      done
+      fatal "Failed collecting Java tests. See '$stdout_log' and '$stderr_log' contents above."
+    fi
+    set -e
+    popd
+  done
+  log "Collected the list of Java tests to '$java_test_list_path'"
+}
+
+run_all_java_test_methods_separately() {
+  (
+    export YB_RUN_JAVA_TEST_METHODS_SEPARATELY=1
+    export YB_REDIRECT_MVN_OUTPUT_TO_FILE=1
+    declare -i num_successes=0
+    declare -i num_failures=0
+    declare -i total_tests=0
+    collect_java_tests
+    declare -i start_time_sec=$(date +%s)
+    for java_test_name in $( cat "$java_test_list_path" | sort ); do
+      if resolve_and_run_java_test "$java_test_name"; then
+        log "Java test succeeded: $java_test_name"
+        let num_successes+=1
+      else
+        log "Java test failed: $java_test_name"
+        global_exit_code=1
+        let num_failures+=1
+      fi
+      let total_tests+=1
+      declare -i success_pct=$(( $num_successes * 100 / $total_tests ))
+      declare -i current_time_sec=$(date +%s)
+      declare -i elapsed_time_sec=$(( $current_time_sec - $start_time_sec ))
+      declare -i avg_test_time_sec=$(( $elapsed_time_sec / $total_tests ))
+      heading "Current Java test stats: " \
+              "$num_successes successful," \
+              "$num_failures failed," \
+              "$total_tests total," \
+              "success rate: $success_pct%," \
+              "elapsed time: $elapsed_time_sec sec," \
+              "avg test time: $avg_test_time_sec sec"
+    done
+  )
+}
+
+run_python_doctest() {
+  python_root=$YB_SRC_ROOT/python
+  local PYTHONPATH
+  export PYTHONPATH=$python_root
+
+  local IFS=$'\n'
+  local file_list=$( cd "$YB_SRC_ROOT" && git ls-files '*.py' )
+
+  local python_file
+  for python_file in $file_list; do
+    local basename=${python_file##*/}
+    if [[ $python_file == managed/* ||
+          $python_file == cloud/* ||
+          $python_file == src/postgres/src/test/locale/sort-test.py ||
+          $python_file == bin/test_bsopt.py ]]; then
+      continue
+    fi
+    if [[ $basename == .ycm_extra_conf.py ||
+          $basename == split_long_command_line.py ||
+          $python_file =~ managed/.* ]]; then
+      continue
+    fi
+    ( set -x; python -m doctest "$python_file" )
+  done
+}
+
+run_python_tests() {
+  activate_virtualenv
+  run_python_doctest
+  check_python_script_syntax
+}
+
+should_run_java_test_methods_separately() {
+  [[ ${YB_RUN_JAVA_TEST_METHODS_SEPARATELY:-0} == "1" ]]
+}
+
+# Finds the directory (Maven module) the given Java test belongs to and runs it.
+#
+# Argument: the test to run in the following form:
+# com.yugabyte.jedis.TestReadFromFollowers#testSameZoneOps[0]
+resolve_and_run_java_test() {
+  expect_num_args 1 "$@"
+  local java_test_name=$1
+  set_common_test_paths
+  log "Running Java test $java_test_name"
+  local module_dir
+  local language
+  local java_test_method_name=""
+  if [[ $java_test_name == *\#* ]]; then
+    java_test_method_name=${java_test_name##*#}
+  fi
+  local java_test_class=${java_test_name%#*}
+  local rel_java_src_path=${java_test_class//./\/}
+  if ! is_jenkins; then
+    log "Java test class: $java_test_class"
+    log "Java test method name and optionally a parameter set index: $java_test_method_name"
+  fi
+
+  local module_name=""
+  local rel_module_dir=""
+  local java_project_dir
+
+  for java_project_dir in "${yb_java_project_dirs[@]}"; do
+    for module_dir in "$java_project_dir"/*; do
+      if [[ "$module_dir" == */target ]]; then
+        continue
+      fi
+      if [[ -d $module_dir ]]; then
+        for language in java scala; do
+          candidate_source_path=$module_dir/src/test/$language/$rel_java_src_path.$language
+          if [[ -f $candidate_source_path ]]; then
+            local current_module_name=${module_dir##*/}
+            if [[ -n $module_name ]]; then
+              fatal "Could not determine module for Java/Scala test '$java_test_name': both" \
+                    "'$module_name' and '$current_moudle_name' are valid candidates."
+            fi
+            module_name=$current_module_name
+            rel_module_dir=${module_dir##$YB_SRC_ROOT/}
+          fi
+        done
+      fi
+    done
+  done
+
+  local IFS=$'\n'
+  if [[ -z $module_name ]]; then
+    # Could not find the test source assuming we are given the complete package. Let's assume we
+    # only have the class name.
+    module_name=""
+    local rel_source_path=""
+    local java_project_dir
+    for java_project_dir in "${yb_java_project_dirs[@]}"; do
+      for module_dir in "$java_project_dir"/*; do
+        if [[ "$module_dir" == */target ]]; then
+          continue
+        fi
+        if [[ -d $module_dir ]]; then
+          local module_test_src_root="$module_dir/src/test"
+          if [[ -d $module_test_src_root ]]; then
+            local candidate_files=(
+              $(
+                cd "$module_test_src_root" &&
+                find . \( -name "$java_test_class.java" -or -name "$java_test_class.scala" \)
+              )
+            )
+            if [[ ${#candidate_files[@]} -gt 0 ]]; then
+              local current_module_name=${module_dir##*/}
+              if [[ -n $module_name ]]; then
+                fatal "Could not determine module for Java/Scala test '$java_test_name': both" \
+                      "'$module_name' and '$current_module_name' are valid candidates."
+              fi
+              module_name=$current_module_name
+              rel_module_dir=${module_dir##$YB_SRC_ROOT/}
+
+              if [[ ${#candidate_files[@]} -gt 1 ]]; then
+                fatal "Ambiguous source files for Java/Scala test '$java_test_name': " \
+                      "${candidate_files[*]}"
+              fi
+
+              rel_source_path=${candidate_files[0]}
+            fi
+          fi
+        fi
+      done
+    done
+
+    if [[ -z $module_name ]]; then
+      fatal "Could not find module name for Java/Scala test '$java_test_name'"
+    fi
+
+    local java_class_with_package=${rel_source_path%.java}
+    java_class_with_package=${java_class_with_package%.scala}
+    java_class_with_package=${java_class_with_package#./java/}
+    java_class_with_package=${java_class_with_package#./scala/}
+    java_class_with_package=${java_class_with_package//\//.}
+    if [[ $java_class_with_package != *.$java_test_class ]]; then
+      fatal "Internal error: could not find Java package name for test class $java_test_name. " \
+            "Found source file: $rel_source_path, and extracted Java class with package from it:" \
+            "'$java_class_with_package'. Expected that Java class name with package" \
+            "('$java_class_with_package') would end dot and Java test class name" \
+            "('.$java_test_class') but that is not the case."
+    fi
+    java_test_name=$java_class_with_package
+    if [[ -n $java_test_method_name ]]; then
+      java_test_name+="#$java_test_method_name"
+    fi
+  fi
+
+  if [[ ${num_test_repetitions:-1} -eq 1 ]]; then
+    # This will return an error code appropriate to the test result.
+    run_java_test "$rel_module_dir" "$java_test_name"
+  else
+    # TODO: support enterprise case by passing rel_module_dir here.
+    run_repeat_unit_test "$module_name" "$java_test_name" --java
+  fi
+}
+
 # -------------------------------------------------------------------------------------------------
 # Initialization
 # -------------------------------------------------------------------------------------------------
-
-if is_mac; then
-  # Stack trace address to line number conversion is disabled on Mac OS X as of Apr 2016.
-  # See https://yugabyte.atlassian.net/browse/ENG-37
-  STACK_TRACE_FILTER=cat
-else
-  STACK_TRACE_FILTER=$YB_SRC_ROOT/build-support/stacktrace_addr2line.pl
-fi
 
 readonly jenkins_job_and_build=${JOB_NAME:-unknown_job}__${BUILD_NUMBER:-unknown_build}

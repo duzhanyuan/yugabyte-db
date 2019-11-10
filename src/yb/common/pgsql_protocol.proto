@@ -1,0 +1,339 @@
+// Copyright (c) YugaByte, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+// in compliance with the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+// or implied.  See the License for the specific language governing permissions and limitations
+// under the License.
+//
+syntax = "proto2";
+
+package yb;
+
+option java_package = "org.yb";
+
+import "yb/common/common.proto";
+import "yb/common/ql_protocol.proto";
+
+//--------------------------------------------------------------------------------------------------
+// Expressions.
+//--------------------------------------------------------------------------------------------------
+// Builtin call expression. There are 3 different calls.
+// - Builtin operators such as '>', '<', '=', ...
+//   These operators can be executed anywhere.
+// - Builtin functions such as Now().
+//   These functions can be executed anywhere.
+// - Server builtin functions.
+//   Only tablet servers can execute these functions.
+//
+// TODO(neil) Regular builtin operators. This message can be executed anywhere.
+// - This is more efficient than builtin call as it avoids most overheads of calling builtin lib.
+// - Merge the current condition operator execution with this.
+// - To optimize certain operation (such as +), replace it builtin function with builtin op.
+message PgsqlBCallPB {
+  optional int32 opcode = 1;
+  repeated PgsqlExpressionPB operands = 2;
+}
+
+// A logical condition that evaluates to true/false. Used in the WHERE clause.
+message PgsqlConditionPB {
+  optional QLOperator op = 1;
+  repeated PgsqlExpressionPB operands = 2;
+}
+
+// An expression in a WHERE condition.
+// - Bind values would be given by client and grouped into a repeated field that can be accessed
+//   by their indexes.
+// - Alias values would be computed by server and grouped into repeated field that can be accessed
+//   by their indexes.
+// - Code generator write indexes as ref. Executor deref indexes to get actual values.
+message PgsqlExpressionPB {
+  oneof expr {
+    QLValuePB value = 1;
+    int32 column_id = 2;
+    int32 bind_id = 3;                         // Bind variable index.
+    int32 alias_id = 4;                        // Alias index.
+    PgsqlBCallPB bfcall = 5;                   // Regular builtin calls.
+    PgsqlBCallPB tscall = 6;                   // Tablet server builtin calls.
+    PgsqlBCallPB bocall = 7;                   // Builtin operator calls.
+    PgsqlConditionPB condition = 8;            // Logical condition that evaluates to true/false.
+  }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Column messages.
+//--------------------------------------------------------------------------------------------------
+// ColumnRefs is a list of columns to be read by DocDB before a PGSQL request can be executed.
+message PgsqlColumnRefsPB {
+  repeated int32 ids = 1;
+}
+
+// ColumnValue is a value to be assigned to a table column by DocDB while executing a PGSQL request.
+// Currently, this is used for SET clause.
+//   SET column-of-given-id = expr
+message PgsqlColumnValuePB {
+  optional int32 column_id = 1;
+  optional PgsqlExpressionPB expr = 2;
+}
+
+// PgsqlRSColDesc is the descriptor of a selected column in a ResultSet (RS), which can be any
+// expression and not just table columns.
+message PgsqlRSColDescPB {
+  optional string name = 1;
+  optional QLTypePB ql_type = 2;
+}
+
+// Descriptor of a row in a resultset (RS).
+message PgsqlRSRowDescPB {
+  repeated PgsqlRSColDescPB rscol_descs = 1;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Data Writting Instructions - INSERT, UPDATE, and DELETE.
+//--------------------------------------------------------------------------------------------------
+
+// Instruction.
+message PgsqlWriteRequestPB {
+  // Statement types
+  enum PgsqlStmtType {
+    PGSQL_INSERT = 1;
+    PGSQL_UPDATE = 2;
+    PGSQL_DELETE = 3;
+  }
+
+  // Client info
+  optional QLClient client = 1;       // required
+
+  // Statement info
+  optional uint64 stmt_id = 2;     // client request id.
+  optional PgsqlStmtType stmt_type = 3;    // required
+
+  // Table id.
+  optional bytes table_id = 4; // required
+
+  // Table schema version.
+  optional uint32 schema_version = 5; // required
+
+  //------------------------------------------------------------------------------------------------
+  // Row Identifiers provides information for the row that the server INSERTs, DELETEs, or UPDATEs.
+  // - hash_code, if provided, helps locating the row. It is used by the proxy to find tablet server
+  //   and by DocDB to find a set of matching rows.
+  // - partition_column_values are for partition columns.
+  // - range_column_values are for range columns.
+  // - column_values are for non-primary columns. They are used to further identify the row to be
+  //   inserted, deleted, or updated.
+  //
+  // NOTE: Primary columns are defined when creating tables. These columns are different from
+  //       those columns that are used as part of an INDEX.
+  optional uint32 hash_code = 6;
+  repeated PgsqlExpressionPB partition_column_values = 7;
+  repeated PgsqlExpressionPB range_column_values = 8;
+  optional PgsqlExpressionPB ybctid_column_value = 9;
+  // Not used with UPDATEs. Use column_new_values to UPDATE a value.
+  repeated PgsqlColumnValuePB column_values = 10;
+
+  //------------------------------------------------------------------------------------------------
+  // Column New Values.
+  // - Columns to be overwritten (UPDATE SET clause). This field can contain primary-key columns.
+  repeated PgsqlColumnValuePB column_new_values = 11;
+
+  //------------------------------------------------------------------------------------------------
+  // Tuple descriptor for RETURNING clause.
+  //
+  // For now, we sent rsrow descriptor from proxy to tablet server for every request. RSRow is just
+  // a selected row. We call it rsrow to distinguish a selected row from a row of a table in the
+  // database in our coding.
+  optional PgsqlRSRowDescPB rsrow_desc = 12;
+  repeated PgsqlExpressionPB targets = 13; // required for a RETURNING clause.
+
+  //------------------------------------------------------------------------------------------------
+  // Where clause condition
+  optional PgsqlExpressionPB where_expr = 14;
+
+  // Listing of all columns that this write operation is referencing.
+  // TServers will need to read these columns when processing the write request.
+  optional PgsqlColumnRefsPB column_refs = 15;
+
+  // The version of the ysql system catalog this query was prepared against.
+  optional uint64 ysql_catalog_version = 16;
+
+  // True only if this changes a system catalog table (or index).
+  optional bool is_ysql_catalog_change = 17 [default = false];
+}
+
+//--------------------------------------------------------------------------------------------------
+// Data Reading Instructions - SELECT
+//--------------------------------------------------------------------------------------------------
+
+// Paging state for continuing a read request.
+//
+// For a SELECT statement that returns many rows, the client may specify how many rows to return at
+// most in each fetch. This paging state maintains the state for returning the next set of rows of
+// the statement. This paging state is opaque to the client.
+//
+// When there should be more rows to return from the same tablet in the next fetch, "next_row_key"
+// is populated in DocDB (PgsqlReadOperation) with the DocKey of the next row to read. We also
+// embed a hybrid-time which is the clean snapshot time for read consistency. We also populate the
+// "next_partition_key" for the next row, which is the hash code of the hash portion of the DocKey.
+// This next partition key is needed by YBClient (Batcher) to locate the tablet to send the request
+// to and it doesn't have access to the DocDB function to decode and extract from the DocKey.
+//
+// When we are done returning rows from the current tablet and the next fetch should continue in
+// the next tablet (possible only for full-table query across tablets), "next_partition_key" is
+// populated by the current tablet with its exclusive partition-end key, which is the start key of
+// next tablet's partition. "next_row_key" is empty in this case which means we will start from the
+// very beginning of the next tablet. (TODO: we need to return the clean snapshot time in this case
+// also).
+//
+message PgsqlPagingStatePB {
+  // Table UUID to verify the same table still exists when continuing in the next fetch.
+  optional bytes table_id = 1;
+
+  // Partition key to find the tablet server of the next row to read.
+  optional bytes next_partition_key = 2;
+
+  // The row key (SubDocKey = [DocKey + HybridTimestamp]) of the next row to read.
+  optional bytes next_row_key = 3;
+
+  // Running total number of rows read across fetches so far. Needed to ensure we read up to the
+  // number of rows in the SELECT's LIMIT clause across fetches.
+  optional uint64 total_num_rows_read = 4;
+
+  // For selects with IN condition on the hash columns there are multiple partitions that need to be
+  // queried, one for each combination of allowed values for the hash columns.
+  // This holds the index of the next partition and is used to resume the read from the right place.
+  optional uint64 next_partition_index = 5;
+}
+
+// TODO(neil) The protocol for select needs to be changed accordingly when we introduce and cache
+// execution plan in tablet server.
+message PgsqlReadRequestPB {
+  // Client info
+  optional QLClient client = 1; // required
+
+  // Statement info. There's only SELECT, so we don't need different request type.
+  optional uint64 stmt_id = 2; // required
+
+  // Table id.
+  optional bytes table_id = 19; // required
+
+  // Table schema version
+  optional uint32 schema_version = 3; // required
+
+  //------------------------------------------------------------------------------------------------
+  // Primary key.
+  // - Hash code is used to locate efficiently a group of data values of the same hash code.
+  //   First, it is used to find tablet server.
+  //   Then, it is used again by DocDB to narrow the search within a tablet.
+  // - Partition columns are used to compute the hash code.
+  // - Range columns combining with partition columns are used for indexing.
+  optional uint32 hash_code = 4;
+  repeated PgsqlExpressionPB partition_column_values = 5;
+  repeated PgsqlExpressionPB range_column_values = 18;
+  optional PgsqlExpressionPB ybctid_column_value = 20;
+
+  // For select using local secondary index: this request selects the ybbasectids to fetch the rows
+  // in place of the primary key above.
+  optional PgsqlReadRequestPB index_request = 21;
+
+  //------------------------------------------------------------------------------------------------
+  // Tuple descriptor.
+  //
+  // For now, we sent rsrow descriptor from proxy to tablet server for every request. RSRow is just
+  // a selected row. We call it rsrow to distinguish a selected row from a row of a table in the
+  // database in our coding.
+  optional PgsqlRSRowDescPB rsrow_desc = 6;
+  repeated PgsqlExpressionPB targets = 7; // required.
+
+  //------------------------------------------------------------------------------------------------
+  // Where clause condition
+  optional PgsqlExpressionPB where_expr = 8;
+
+  // Conditions for range columns.
+  optional PgsqlExpressionPB condition_expr = 22;
+
+  //------------------------------------------------------------------------------------------------
+  // Listing of all columns that this operation is referencing. TServers will need to read these
+  // columns when processing this read request.
+  optional PgsqlColumnRefsPB column_refs = 9;
+
+  //------------------------------------------------------------------------------------------------
+  // Query options.
+  optional bool is_forward_scan = 10 [default = true];
+
+  // Reading distinct columns?
+  optional bool distinct = 11 [default = false];
+
+  // Flag for reading aggregate values.
+  optional bool is_aggregate = 12 [default = false];
+
+  // Limit number of rows to return. For SELECT, this limit is the smaller of the page size (max
+  // (max number of rows to return per fetch) & the LIMIT clause if present in the SELECT statement.
+  optional uint64 limit = 13;
+
+  //------------------------------------------------------------------------------------------------
+  // Paging state retrieved from the last response.
+  optional PgsqlPagingStatePB paging_state = 14;
+
+  // Return paging state when "limit" number of rows are returned? In case when "limit" is the
+  // page size, this is set for PgsqlResponsePB to return the paging state for the next fetch.
+  optional bool return_paging_state = 15 [default = false];
+
+  // the upper limit for partition (hash) key when paging.
+  optional uint32 max_hash_code = 17;
+
+  // The version of the ysql system catalog this query was prepared against.
+  optional uint64 ysql_catalog_version = 16;
+
+  // Row mark as used by postgres for row locking. As of 10/12/19 only ROW_MARK_SHARE and
+  // ROW_MARK_KEYSHARE are supported.
+  // TODO https://github.com/yugabyte/yugabyte-db/issues/2495:
+  // As of 10/12/19 whenever a read request has an element in this list, the whole read batch is
+  // assumed to need the same row locks. This is not a problem because we are not batching
+  // read requests, but we will need to change this behavior if we start batching requests.
+  repeated RowMarkType row_mark_type = 23;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Responses.
+//--------------------------------------------------------------------------------------------------
+
+// Response from tablet server for both read and write.
+message PgsqlResponsePB {
+  // Response status
+  enum RequestStatus {
+    PGSQL_STATUS_OK = 0;
+    PGSQL_STATUS_SCHEMA_VERSION_MISMATCH = 1;
+    PGSQL_STATUS_RUNTIME_ERROR = 2;
+    PGSQL_STATUS_USAGE_ERROR = 3;
+    PGSQL_STATUS_RESTART_REQUIRED_ERROR = 4;
+    PGSQL_STATUS_DUPLICATE_KEY_ERROR = 5;
+  }
+
+  // TODO: AppStatusPB can consolidate status + error_message + pg_error_code
+  // Internal Status information
+  optional RequestStatus status = 1 [ default = PGSQL_STATUS_OK ]; // required
+
+  // True if this operation was not actually applied, for instance update to the same value.
+  optional bool skipped = 6;
+
+  // User readable error message associated with Internal & External Status
+  optional string error_message = 2;
+
+  // Sidecar of rows data returned
+  optional int32 rows_data_sidecar = 4;
+
+  // Paging state for continuing the read in the next QLReadRequestPB fetch.
+  optional PgsqlPagingStatePB paging_state = 5;
+
+  // Number of rows affected by the operation. Currently only used for update and delete.
+  optional int32 rows_affected_count = 7;
+
+  // External Status : PostgreSQL error code encoded as in errcodes.h or yb_pg_errcodes.h.
+  // See https://www.postgresql.org/docs/11/errcodes-appendix.html
+  optional uint64 pg_error_code = 8;
+}

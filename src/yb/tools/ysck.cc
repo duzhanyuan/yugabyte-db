@@ -48,9 +48,6 @@
 namespace yb {
 namespace tools {
 
-using std::cerr;
-using std::cout;
-using std::endl;
 using std::ostream;
 using std::shared_ptr;
 using std::string;
@@ -62,44 +59,14 @@ DEFINE_int32(checksum_timeout_sec, 120,
              "before timing out.");
 DEFINE_int32(checksum_scan_concurrency, 4,
              "Number of concurrent checksum scans to execute per tablet server.");
-DEFINE_bool(checksum_snapshot, true, "Should the checksum scanner use a snapshot scan");
-DEFINE_uint64(checksum_snapshot_hybrid_time, ChecksumOptions::kCurrentHybridTime,
-              "hybrid_time to use for snapshot checksum scans, defaults to 0, which "
-              "uses the current hybrid_time of a tablet server involved in the scan");
-
-// Print an informational message to cerr.
-static ostream& Info() {
-  cerr << "INFO: ";
-  return cerr;
-}
-
-// Print a warning message to cerr.
-static ostream& Warn() {
-  cerr << "WARNING: ";
-  return cerr;
-}
-
-// Print an error message to cerr.
-static ostream& Error() {
-  cerr << "ERROR: ";
-  return cerr;
-}
 
 ChecksumOptions::ChecksumOptions()
     : timeout(MonoDelta::FromSeconds(FLAGS_checksum_timeout_sec)),
-      scan_concurrency(FLAGS_checksum_scan_concurrency),
-      use_snapshot(FLAGS_checksum_snapshot),
-      snapshot_hybrid_time(FLAGS_checksum_snapshot_hybrid_time) {
-}
+      scan_concurrency(FLAGS_checksum_scan_concurrency) {}
 
-ChecksumOptions::ChecksumOptions(MonoDelta timeout, int scan_concurrency,
-                                 bool use_snapshot, uint64_t snapshot_hybrid_time)
+ChecksumOptions::ChecksumOptions(MonoDelta timeout, int scan_concurrency)
     : timeout(std::move(timeout)),
-      scan_concurrency(scan_concurrency),
-      use_snapshot(use_snapshot),
-      snapshot_hybrid_time(snapshot_hybrid_time) {}
-
-const uint64_t ChecksumOptions::kCurrentHybridTime = 0;
+      scan_concurrency(scan_concurrency) {}
 
 YsckCluster::~YsckCluster() {
 }
@@ -132,7 +99,7 @@ Status Ysck::CheckMasterRunning() {
   VLOG(1) << "Connecting to the Master";
   Status s = cluster_->master()->Connect();
   if (s.ok()) {
-    Info() << "Connected to the Master" << endl;
+    LOG(INFO) << "Connected to the Master";
   }
   return s;
 }
@@ -159,11 +126,11 @@ Status Ysck::CheckTabletServersRunning() {
     }
   }
   if (bad_servers == 0) {
-    Info() << Substitute("Connected to all $0 Tablet Servers", servers_count) << endl;
+    LOG(INFO) << Substitute("Connected to all $0 Tablet Servers", servers_count);
     return Status::OK();
   } else {
-    Warn() << Substitute("Connected to $0 Tablet Servers, $1 weren't reachable",
-                         servers_count - bad_servers, bad_servers) << endl;
+    LOG(WARNING) << Substitute("Connected to $0 Tablet Servers, $1 weren't reachable",
+                               servers_count - bad_servers, bad_servers);
     return STATUS(NetworkError, "Not all Tablet Servers are reachable");
   }
 }
@@ -174,8 +141,8 @@ Status Ysck::ConnectToTabletServer(const shared_ptr<YsckTabletServer>& ts) {
   if (s.ok()) {
     VLOG(1) << "Connected to Tablet Server: " << ts->uuid();
   } else {
-    Warn() << Substitute("Unable to connect to Tablet Server $0 because $1",
-                         ts->uuid(), s.ToString()) << endl;
+    LOG(WARNING) << Substitute("Unable to connect to Tablet Server $0 because $1",
+                               ts->uuid(), s.ToString());
   }
   return s;
 }
@@ -186,7 +153,7 @@ Status Ysck::CheckTablesConsistency() {
   VLOG(1) << Substitute("List of $0 tables retrieved", tables_count);
 
   if (tables_count == 0) {
-    Info() << "The cluster doesn't have any tables" << endl;
+    LOG(INFO) << "The cluster doesn't have any tables";
     return Status::OK();
   }
 
@@ -198,11 +165,11 @@ Status Ysck::CheckTablesConsistency() {
     }
   }
   if (bad_tables_count == 0) {
-    Info() << Substitute("The metadata for $0 tables is HEALTHY", tables_count) << endl;
+    LOG(INFO) << Substitute("The metadata for $0 tables is HEALTHY", tables_count);
     return Status::OK();
   } else {
-    Warn() << Substitute("$0 out of $1 tables are not in a healthy state",
-                         bad_tables_count, tables_count) << endl;
+    LOG(WARNING) << Substitute("$0 out of $1 tables are not in a healthy state",
+                               bad_tables_count, tables_count);
     return STATUS(Corruption, Substitute("$0 tables are bad", bad_tables_count));
   }
 }
@@ -212,7 +179,8 @@ Status Ysck::CheckTablesConsistency() {
 class ChecksumResultReporter : public RefCountedThreadSafe<ChecksumResultReporter> {
  public:
   typedef std::pair<Status, uint64_t> ResultPair;
-  typedef std::unordered_map<std::string, ResultPair> ReplicaResultMap;
+  typedef std::vector<ResultPair> TableResults;
+  typedef std::unordered_map<std::string, TableResults> ReplicaResultMap;
   typedef std::unordered_map<std::string, ReplicaResultMap> TabletResultMap;
 
   // Initialize reporter with the number of replicas being queried.
@@ -226,9 +194,14 @@ class ChecksumResultReporter : public RefCountedThreadSafe<ChecksumResultReporte
                     const Status& status,
                     uint64_t checksum) {
     std::lock_guard<simple_spinlock> guard(lock_);
-    unordered_map<string, ResultPair>& replica_results =
-        LookupOrInsert(&checksums_, tablet_id, unordered_map<string, ResultPair>());
-    InsertOrDie(&replica_results, replica_uuid, ResultPair(status, checksum));
+    unordered_map<string, TableResults>& replica_results =
+        LookupOrInsert(&checksums_, tablet_id, unordered_map<string, TableResults>());
+    if (replica_results.find(replica_uuid) == replica_results.end()) {
+      TableResults table_results(1, ResultPair(status, checksum));
+      replica_results[replica_uuid] = table_results;
+    } else {
+      replica_results[replica_uuid].push_back(ResultPair(status, checksum));
+    }
     responses_.CountDown();
   }
 
@@ -272,16 +245,16 @@ void TabletServerChecksumCallback(
     const scoped_refptr<ChecksumResultReporter>& reporter,
     const shared_ptr<YsckTabletServer>& tablet_server,
     const TabletQueue& queue,
-    const std::string& tablet_id,
+    const TabletId& tablet_id,
     const ChecksumOptions& options,
     const Status& status,
     uint64_t checksum) {
   reporter->ReportResult(tablet_id, tablet_server->uuid(), status, checksum);
 
-  std::pair<Schema, std::string> table_tablet;
+  std::pair<Schema, TabletId> table_tablet;
   if (queue->BlockingGet(&table_tablet)) {
     const Schema& table_schema = table_tablet.first;
-    const std::string& tablet_id = table_tablet.second;
+    const TabletId& tablet_id = table_tablet.second;
     ReportResultCallback callback = Bind(&TabletServerChecksumCallback,
                                          reporter,
                                          tablet_server,
@@ -301,7 +274,7 @@ Status Ysck::ChecksumData(const vector<string>& tables,
   // Copy options so that local modifications can be made and passed on.
   ChecksumOptions options = opts;
 
-  typedef unordered_map<shared_ptr<YsckTablet>, shared_ptr<YsckTable>> TabletTableMap;
+  typedef unordered_map<shared_ptr<YsckTablet>, std::vector<shared_ptr<YsckTable>>> TabletTableMap;
   TabletTableMap tablet_table_map;
 
   int num_tablet_replicas = 0;
@@ -311,6 +284,11 @@ Status Ysck::ChecksumData(const vector<string>& tables,
       // Skip the system namespace with virtual tables, since they are not assigned to tservers.
       continue;
     }
+
+    // TODO: remove once we have is_system() implemented correctly for PostgreSQL tables.
+    if (table->table_type() == PGSQL_TABLE_TYPE)
+      continue;
+
     there_are_non_system_tables = true;
     VLOG(1) << "Table: " << table->name().ToString();
     if (!tables_filter.empty() && !ContainsKey(tables_filter, table->name().table_name())) continue;
@@ -319,7 +297,11 @@ Status Ysck::ChecksumData(const vector<string>& tables,
     for (const shared_ptr<YsckTablet>& tablet : table->tablets()) {
       VLOG(1) << "Tablet: " << tablet->id();
       if (!tablets_filter.empty() && !ContainsKey(tablets_filter, tablet->id())) continue;
-      InsertOrDie(&tablet_table_map, tablet, table);
+      if (tablet_table_map.find(tablet) == tablet_table_map.end()) {
+        tablet_table_map[tablet] = std::vector<shared_ptr<YsckTable>>(1, table);
+      } else {
+        tablet_table_map[tablet].push_back(table);
+      }
       num_tablet_replicas += tablet->replicas().size();
     }
   }
@@ -347,22 +329,16 @@ Status Ysck::ChecksumData(const vector<string>& tables,
   // Create a queue of checksum callbacks grouped by the tablet server.
   for (const TabletTableMap::value_type& entry : tablet_table_map) {
     const shared_ptr<YsckTablet>& tablet = entry.first;
-    const shared_ptr<YsckTable>& table = entry.second;
-    for (const shared_ptr<YsckTabletReplica>& replica : tablet->replicas()) {
-      const shared_ptr<YsckTabletServer>& ts =
-          FindOrDie(cluster_->tablet_servers(), replica->ts_uuid());
+    for (const shared_ptr<YsckTable>& table : entry.second) {
+      for (const shared_ptr<YsckTabletReplica>& replica : tablet->replicas()) {
+        const shared_ptr<YsckTabletServer>& ts =
+            FindOrDie(cluster_->tablet_servers(), replica->ts_uuid());
 
-      const TabletQueue& queue =
-          LookupOrInsertNewSharedPtr(&tablet_server_queues, ts, num_tablet_replicas);
-      CHECK_EQ(QUEUE_SUCCESS, queue->Put(make_pair(table->schema(), tablet->id())));
+        const TabletQueue& queue =
+            LookupOrInsertNewSharedPtr(&tablet_server_queues, ts, num_tablet_replicas);
+        CHECK_EQ(QUEUE_SUCCESS, queue->Put(make_pair(table->schema(), tablet->id())));
+      }
     }
-  }
-
-  if (options.use_snapshot && options.snapshot_hybrid_time == ChecksumOptions::kCurrentHybridTime) {
-    // Set the snapshot hybrid_time to the current hybrid_time of an arbitrary tablet server.
-    RETURN_NOT_OK(
-        tablet_server_queues.begin()->first->CurrentHybridTime(&options.snapshot_hybrid_time));
-    Info() << "Using snapshot hybrid_time: " << options.snapshot_hybrid_time << endl;
   }
 
   // Kick off checksum scans in parallel. For each tablet server, we start
@@ -403,9 +379,9 @@ Status Ysck::ChecksumData(const vector<string>& tables,
       if (ContainsKey(checksums, tablet->id())) {
         if (!printed_table_name) {
           printed_table_name = true;
-          cout << "-----------------------" << endl;
-          cout << table->name().ToString() << endl;
-          cout << "-----------------------" << endl;
+          LOG(INFO) << "-----------------------";
+          LOG(INFO) << table->name().ToString();
+          LOG(INFO) << "-----------------------";
         }
         bool seen_first_replica = false;
         uint64_t first_checksum = 0;
@@ -415,28 +391,29 @@ Status Ysck::ChecksumData(const vector<string>& tables,
           const string& replica_uuid = r.first;
 
           shared_ptr<YsckTabletServer> ts = FindOrDie(cluster_->tablet_servers(), replica_uuid);
-          const ChecksumResultReporter::ResultPair& result = r.second;
-          const Status& status = result.first;
-          uint64_t checksum = result.second;
-          string status_str = (status.ok()) ? Substitute("Checksum: $0", checksum)
-                                            : Substitute("Error: $0", status.ToString());
-          cout << Substitute("T $0 P $1 ($2): $3", tablet->id(), ts->uuid(), ts->address(),
-                                                   status_str) << endl;
-          if (!status.ok()) {
-            num_errors++;
-          } else if (!seen_first_replica) {
-            seen_first_replica = true;
-            first_checksum = checksum;
-          } else if (checksum != first_checksum) {
-            num_mismatches++;
-            Error() << ">> Mismatch found in table " << table->name().ToString()
-                    << " tablet " << tablet->id() << endl;
+          for (const ChecksumResultReporter::ResultPair& result : r.second) {
+            const Status &status = result.first;
+            uint64_t checksum = result.second;
+            string status_str = (status.ok()) ? Substitute("Checksum: $0", checksum)
+                : Substitute("Error: $0", status.ToString());
+            LOG(INFO) << Substitute("T $0 P $1 ($2): $3",
+                                    tablet->id(), ts->uuid(), ts->address(), status_str);
+            if (!status.ok()) {
+              num_errors++;
+            } else if (!seen_first_replica) {
+              seen_first_replica = true;
+              first_checksum = checksum;
+            } else if (checksum != first_checksum) {
+              num_mismatches++;
+              LOG(ERROR) << ">> Mismatch found in table " << table->name().ToString()
+                         << " tablet " << tablet->id();
+            }
           }
           num_results++;
         }
       }
     }
-    if (printed_table_name) cout << endl;
+    if (printed_table_name) LOG(INFO) << "";
   }
   if (num_results != num_tablet_replicas) {
     CHECK(timed_out) << Substitute("Unexpected error: only got $0 out of $1 replica results",
@@ -461,7 +438,7 @@ bool Ysck::VerifyTable(const shared_ptr<YsckTable>& table) {
   vector<shared_ptr<YsckTablet> > tablets = table->tablets();
   int tablets_count = tablets.size();
   if (tablets_count == 0) {
-    Warn() << Substitute("Table $0 has 0 tablets", table->name().ToString()) << endl;
+    LOG(WARNING) << Substitute("Table $0 has 0 tablets", table->name().ToString());
     return false;
   }
   int table_num_replicas = table->num_replicas();
@@ -475,10 +452,10 @@ bool Ysck::VerifyTable(const shared_ptr<YsckTable>& table) {
     }
   }
   if (bad_tablets_count == 0) {
-    Info() << Substitute("Table $0 is HEALTHY", table->name().ToString()) << endl;
+    LOG(INFO) << Substitute("Table $0 is HEALTHY", table->name().ToString());
   } else {
-    Warn() << Substitute(
-        "Table $0 has $1 bad tablets", table->name().ToString(), bad_tablets_count) << endl;
+    LOG(WARNING) << Substitute("Table $0 has $1 bad tablets",
+                               table->name().ToString(), bad_tablets_count);
     good_table = false;
   }
   return good_table;
@@ -488,8 +465,8 @@ bool Ysck::VerifyTablet(const shared_ptr<YsckTablet>& tablet, int table_num_repl
   vector<shared_ptr<YsckTabletReplica> > replicas = tablet->replicas();
   bool good_tablet = true;
   if (replicas.size() != table_num_replicas) {
-    Warn() << Substitute("Tablet $0 has $1 instead of $2 replicas",
-                         tablet->id(), replicas.size(), table_num_replicas) << endl;
+    LOG(WARNING) << Substitute("Tablet $0 has $1 instead of $2 replicas",
+                               tablet->id(), replicas.size(), table_num_replicas);
     // We only fail the "goodness" check if the tablet is under-replicated.
     if (replicas.size() < table_num_replicas) {
       good_tablet = false;
@@ -507,7 +484,7 @@ bool Ysck::VerifyTablet(const shared_ptr<YsckTablet>& tablet, int table_num_repl
     }
   }
   if (leaders_count == 0) {
-    Warn() << Substitute("Tablet $0 doesn't have a leader", tablet->id()) << endl;
+    LOG(WARNING) << Format("Tablet $0 doesn't have a leader, replicas: $1", tablet->id(), replicas);
     good_tablet = false;
   }
   VLOG(1) << Substitute("Tablet $0 has $1 leader and $2 followers",

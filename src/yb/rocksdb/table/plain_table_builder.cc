@@ -110,6 +110,7 @@ PlainTableBuilder::PlainTableBuilder(
   properties_.num_data_blocks = 1;
   // Fill it later if store_index_in_file_ == true
   properties_.data_index_size = 0;
+  properties_.num_data_index_blocks = 0;
   properties_.filter_index_size = 0;
   properties_.num_filter_blocks = 0;
   properties_.filter_size = 0;
@@ -231,6 +232,7 @@ Status PlainTableBuilder::Finish() {
     finish_result = index_builder_->Finish();
 
     properties_.data_index_size = finish_result.size();
+    properties_.num_data_index_blocks = 1;
     s = WriteBlock(finish_result, file_, &offset_, &index_block_handle);
 
     if (!s.ok()) {
@@ -285,7 +287,7 @@ Status PlainTableBuilder::Finish() {
   footer.set_metaindex_handle(metaindex_block_handle);
   footer.set_index_handle(BlockHandle::NullBlockHandle());
   std::string footer_encoding;
-  footer.EncodeTo(&footer_encoding);
+  footer.AppendEncodedTo(&footer_encoding);
   s = file_->Append(footer_encoding);
   if (s.ok()) {
     offset_ += footer_encoding.size();

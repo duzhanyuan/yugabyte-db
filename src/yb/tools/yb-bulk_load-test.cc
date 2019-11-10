@@ -18,8 +18,12 @@
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/table_handle.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/jsonb.h"
 #include "yb/common/partition.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/docdb/docdb_test_util.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
@@ -29,7 +33,7 @@
 #include "yb/master/master_defaults.h"
 #include "yb/master/mini_master.h"
 #include "yb/rpc/messenger.h"
-#include "yb/ql/util/statement_result.h"
+#include "yb/yql/cql/ql/util/statement_result.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tools/bulk_load_utils.h"
 #include "yb/tools/yb-generate_partitions.h"
@@ -42,6 +46,10 @@
 
 DECLARE_uint64(initial_seqno);
 DECLARE_uint64(bulk_load_num_files_per_tablet);
+DECLARE_bool(enable_load_balancing);
+DECLARE_int32(replication_factor);
+
+using namespace std::literals;
 
 namespace yb {
 namespace tools {
@@ -53,6 +61,7 @@ using client::YBSchemaBuilder;
 using client::YBTableCreator;
 using client::YBTableName;
 using client::YBTable;
+using common::Jsonb;
 
 static const char* const kPartitionToolName = "yb-generate_partitions_main";
 static const char* const kBulkLoadToolName = "yb-bulk_load";
@@ -60,9 +69,8 @@ static const char* const kNamespace = "bulk_load_test_namespace";
 static const char* const kTableName = "my_table";
 // Lower number of runs for tsan due to low perf.
 static constexpr int32_t kNumIterations = NonTsanVsTsan(10000, 30);
-static constexpr int32_t kNumTablets = NonTsanVsTsan(32, 3);
-// Use 3 tservers to test a more realistic scenario.
-static constexpr int32_t kNumTabletServers = NonTsanVsTsan(3, 1);
+static constexpr int32_t kNumTablets = NonTsanVsTsan(3, 3);
+static constexpr int32_t kNumTabletServers = 1;
 static constexpr int32_t kV2Value = 12345;
 static constexpr size_t kV2Index = 5;
 static constexpr uint64_t kNumFilesPerTablet = 5;
@@ -80,12 +88,13 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
 
     // Use a high enough initial sequence number.
     FLAGS_initial_seqno = 1 << 20;
+
     cluster_.reset(new MiniCluster(env_.get(), opts));
     ASSERT_OK(cluster_->Start());
 
-    ASSERT_OK(YBClientBuilder()
-              .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
-              .Build(&client_));
+    client_ = ASSERT_RESULT(YBClientBuilder()
+        .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
+        .Build());
 
     YBSchemaBuilder b;
     b.AddColumn("hash_key")->Type(INT64)->NotNull()->HashPrimaryKey();
@@ -96,13 +105,13 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     b.AddColumn("v2")->Type(INT32)->NotNull();
     b.AddColumn("v3")->Type(FLOAT)->NotNull();
     b.AddColumn("v4")->Type(DOUBLE)->NotNull();
+    b.AddColumn("v5")->Type(JSONB)->Nullable();
     CHECK_OK(b.Build(&schema_));
 
-    YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
-    rpc::MessengerBuilder bld("Client");
-    ASSERT_OK(bld.Build().MoveTo(&client_messenger_));
-    proxy_.reset(new master::MasterServiceProxy(client_messenger_,
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
+    client_messenger_ = ASSERT_RESULT(rpc::MessengerBuilder("Client").Build());
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
+    proxy_.reset(new master::MasterServiceProxy(&proxy_cache,
                                                 cluster_->leader_mini_master()->bound_rpc_addr()));
 
     // Create the namespace.
@@ -114,7 +123,6 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_OK(table_creator->table_name(*table_name_.get())
           .table_type(client::YBTableType::YQL_TABLE_TYPE)
           .schema(&schema_)
-          .num_replicas(1)
           .num_tablets(kNumTablets)
           .wait(true)
           .Create());
@@ -132,6 +140,8 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   void DoTearDown() override {
+    client_messenger_->Shutdown();
+    client_.reset();
     cluster_->Shutdown();
   }
 
@@ -163,8 +173,8 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     string tablet_id;
     string partition_key;
     CsvTokenizer tokenizer = Tokenize(row);
-    RETURN_NOT_OK(partition_generator_->LookupTabletIdWithTokenizer(tokenizer, &tablet_id,
-                                                                    &partition_key));
+    RETURN_NOT_OK(partition_generator_->LookupTabletIdWithTokenizer(
+        tokenizer, {}, &tablet_id, &partition_key));
     uint16_t hash_code = PartitionSchema::DecodeMultiColumnHashValue(partition_key);
     req->set_hash_code(hash_code);
     req->set_max_hash_code(hash_code);
@@ -222,22 +232,30 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_EQ(std::stoi(*it++), ql_row.column(5).int32_value());
     ASSERT_FLOAT_EQ(std::stof(*it++), ql_row.column(6).float_value());
     ASSERT_DOUBLE_EQ(std::stold(*it++), ql_row.column(7).double_value());
+    string token_str = *it++;
+    if (IsNull(token_str)) {
+      ASSERT_TRUE(ql_row.column(8).IsNull());
+    } else {
+      Jsonb jsonb_from_token;
+      CHECK_OK(jsonb_from_token.FromString(token_str));
+      ASSERT_EQ(jsonb_from_token.SerializedJsonb(), ql_row.column(8).jsonb_value());
+    }
   }
 
  protected:
 
   class LoadGenerator {
    public:
-    LoadGenerator(const string& tablet_id, tserver::TabletServerServiceProxy* tserver_proxy)
+    LoadGenerator(const string& tablet_id, const client::TableHandle* table,
+                  tserver::TabletServerServiceProxy* tserver_proxy)
       : tablet_id_(tablet_id),
-        running_(true),
-        random_(0),
+        table_(table),
         tserver_proxy_(tserver_proxy) {
     }
 
     void RunLoad() {
       while (running_.load()) {
-        WriteRow(tablet_id_);
+        ASSERT_NO_FATALS(WriteRow(tablet_id_));
       }
     }
 
@@ -249,36 +267,41 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
       tserver::WriteRequestPB req;
       tserver::WriteResponsePB resp;
       rpc::RpcController controller;
-      controller.set_timeout(MonoDelta::FromSeconds(3));
+      controller.set_timeout(15s);
 
       req.set_tablet_id(tablet_id);
       QLWriteRequestPB* ql_write = req.add_ql_write_batch();
-      QLExpressionPB* hash_column = ql_write->add_hashed_column_values();
-      hash_column->mutable_value()->set_int64_value(random_.Next64());
+      QLAddInt64HashValue(ql_write, random_.Next64());
+      QLAddTimestampHashValue(ql_write, random_.Next32());
+      QLAddStringHashValue(ql_write, std::to_string(random_.Next32()));
+      QLSetHashCode(ql_write);
 
-      hash_column = ql_write->add_hashed_column_values();
-      hash_column->mutable_value()->set_timestamp_value(random_.Next32());
+      QLAddTimestampRangeValue(ql_write, random_.Next64());
 
-      hash_column = ql_write->add_hashed_column_values();
-      hash_column->mutable_value()->set_string_value(std::to_string(random_.Next32()));
+      table_->AddStringColumnValue(ql_write, "v1", "");
+      table_->AddInt32ColumnValue(ql_write, "v2", 0);
+      table_->AddFloatColumnValue(ql_write, "v3", 0);
+      table_->AddDoubleColumnValue(ql_write, "v4", 0);
+      table_->AddJsonbColumnValue(ql_write, "v5", "{ \"a\" : \"foo\" , \"b\" : \"bar\" }");
 
-      QLExpressionPB* range_column = ql_write->add_range_column_values();
-      range_column->mutable_value()->set_timestamp_value(random_.Next64());
-
-      ASSERT_OK(tserver_proxy_->Write(req, &resp, &controller));
-      ASSERT_FALSE(resp.has_error());
+      auto status = tserver_proxy_->Write(req, &resp, &controller);
+      ASSERT_TRUE(status.ok() || status.IsTimedOut()) << "Bad status: " << status;
+      ASSERT_FALSE(resp.has_error()) << "Resp: " << resp.ShortDebugString();
     }
 
    private:
     string tablet_id_;
-    std::atomic<bool> running_;
-    Random random_;
+    const client::TableHandle* table_;
     tserver::TabletServerServiceProxy* tserver_proxy_;
+
+    std::atomic<bool> running_{true};
+    Random random_{0};
   };
 
   string GenerateRow(int index) {
     // Build the row and lookup table_id
     string timestamp_string;
+    string json;
     if (index % 2 == 0) {
       // Use string format.
       int year = 1970 + random_.Next32() % 2000;
@@ -289,13 +312,15 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
       int second = random_.Next32() % 60;
       timestamp_string = strings::Substitute("$0-$1-$2 $3:$4:$5", year, month, day, hour, minute,
                                              second);
+      json = "\"{\\\"a\\\":\\\"foo\\\",\\\"b\\\":\\\"bar\\\"}\"";
     } else {
       timestamp_string = std::to_string(static_cast<int64_t>(random_.Next32()));
+      json = "\\\\n"; // represents null value.
     }
 
     string row = strings::Substitute(
-        "$0,$1,$2,2017-06-17 14:47:00,\"abc,xyz\",$3,3.14,4.1",
-        static_cast<int64_t>(random_.Next32()), timestamp_string, random_.Next32(), kV2Value);
+        "$0,$1,$2,2017-06-17 14:47:00,\"abc,xyz\",$3,3.14,4.1,$4",
+        static_cast<int64_t>(random_.Next32()), timestamp_string, random_.Next32(), kV2Value, json);
     VLOG(1) << "Generated row: " << row;
     return row;
   }
@@ -306,6 +331,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     req.add_tablet_ids(tablet_id);
     master::GetTabletLocationsResponsePB resp;
     rpc::RpcController controller;
+    controller.set_timeout(60s);
     ASSERT_OK(proxy_->GetTabletLocations(req, &resp, &controller));
     ASSERT_FALSE(resp.has_error());
     ASSERT_EQ(1, resp.tablet_locations_size());
@@ -328,35 +354,44 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
                    std::unique_ptr<QLRowBlock>* rowblock) {
     tserver::ReadResponsePB resp;
     rpc::RpcController controller;
-    controller.set_timeout(MonoDelta::FromSeconds(3));
+    controller.set_timeout(15s);
     ASSERT_OK(tserver_proxy->Read(req, &resp, &controller));
     ASSERT_FALSE(resp.has_error());
     ASSERT_EQ(1, resp.ql_batch_size());
     QLResponsePB ql_resp = resp.ql_batch(0);
-    ASSERT_EQ(QLResponsePB_QLStatus_YQL_STATUS_OK, ql_resp.status());
+    ASSERT_EQ(QLResponsePB_QLStatus_YQL_STATUS_OK, ql_resp.status())
+        << "Response: " << ql_resp.ShortDebugString();
     ASSERT_TRUE(ql_resp.has_rows_data_sidecar());
 
     // Retrieve row.
-    Slice rows_data;
     ASSERT_TRUE(controller.finished());
-    ASSERT_OK(controller.GetSidecar(ql_resp.rows_data_sidecar(), &rows_data));
+    Slice rows_data = ASSERT_RESULT(controller.GetSidecar(ql_resp.rows_data_sidecar()));
     std::shared_ptr<std::vector<ColumnSchema>>
       columns = std::make_shared<std::vector<ColumnSchema>>(schema_.columns());
     yb::ql::RowsResult rowsResult(*table_name_, columns, rows_data.ToBuffer());
     *rowblock = rowsResult.GetRowBlock();
   }
 
-  std::shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
   YBSchema schema_;
   std::unique_ptr<YBTableName> table_name_;
   std::shared_ptr<YBTable> table_;
   std::unique_ptr<master::MasterServiceProxy> proxy_;
-  std::shared_ptr<rpc::Messenger> client_messenger_;
+  std::unique_ptr<rpc::Messenger> client_messenger_;
   std::unique_ptr<YBPartitionGenerator> partition_generator_;
   std::vector<std::string> master_addresses_;
   std::string master_addresses_comma_separated_;
   Random random_;
 };
+
+class YBBulkLoadTestWithoutRebalancing : public YBBulkLoadTest {
+ public:
+  void SetUp() override {
+    FLAGS_enable_load_balancing = false;
+    YBBulkLoadTest::SetUp();
+  }
+};
+
 
 TEST_F(YBBulkLoadTest, VerifyPartitions) {
   for (int i = 0; i < kNumIterations; i++) {
@@ -366,6 +401,82 @@ TEST_F(YBBulkLoadTest, VerifyPartitions) {
     VLOG(1) << "Got tablet id: " << tablet_id << ", partition key: " << partition_key;
 
     VerifyTabletIdPartitionKey(tablet_id, partition_key);
+  }
+}
+
+TEST_F(YBBulkLoadTest, VerifyPartitionsWithIgnoredColumns) {
+  const std::set<int> skipped_cols = tools::SkippedColumns("0,9");
+  for (int i = 0; i < kNumIterations; i++) {
+    string tablet_id;
+    string partition_key;
+    string row = GenerateRow(i);
+    ASSERT_OK(partition_generator_->LookupTabletId(row, &tablet_id, &partition_key));
+    VLOG(1) << "Got tablet id: " << tablet_id << ", partition key: " << partition_key;
+
+    VerifyTabletIdPartitionKey(tablet_id, partition_key);
+
+    string tablet_id2;
+    string partition_key2;
+    string row_with_extras = "foo," + row + ",bar";
+    ASSERT_OK(partition_generator_->LookupTabletId(
+        row_with_extras, skipped_cols, &tablet_id2, &partition_key2));
+    ASSERT_EQ(tablet_id, tablet_id2);
+    ASSERT_EQ(partition_key, partition_key2);
+  }
+}
+
+TEST_F(YBBulkLoadTest, TestTokenizer) {
+  {
+    // JSON needs to be enclosed in quotes, so that the internal commas are not treated as different
+    // columns. Need to escape the quotes within to ensure that they are not eaten up.
+    string str ="1,2017-06-17 14:47:00,\"abc,;xyz\","
+                 "\"{\\\"a\\\":\\\"foo\\\",\\\"b\\\":\\\"bar\\\"}\"";
+    CsvTokenizer tokenizer = Tokenize(str);
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "{\"a\":\"foo\",\"b\":\"bar\"}");
+    ASSERT_EQ(it, tokenizer.end());
+  }
+
+  {
+    // Separating fields with ';'. No need to enclose JSON in quotes. Internal quotes still need
+    // to be escapted to prevent being consumed.
+    string str ="1;2017-06-17 14:47:00;\"abc,;xyz\";"
+                "{\\\"a\\\":\\\"foo\\\",\\\"b\\\":\\\"bar\\\"}";
+    CsvTokenizer tokenizer = Tokenize(str, ';', '\"');
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "{\"a\":\"foo\",\"b\":\"bar\"}");
+    ASSERT_EQ(it, tokenizer.end());
+  }
+
+  {
+    string str ="1,2017-06-17 14:47:00,'abc,;xyz',"
+                 "'{\"a\":\"foo\",\"b\":\"bar\"}'";
+    // No need to escape quotes because the quote character is \'
+    CsvTokenizer tokenizer = Tokenize(str, ',', '\'');
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "{\"a\":\"foo\",\"b\":\"bar\"}");
+    ASSERT_EQ(it, tokenizer.end());
+  }
+  {
+    string str ="1,2017-06-17 14:47:00,'abc,;xyz',"
+                "\\\\n";
+    // No need to escape quotes because the quote character is \'
+    CsvTokenizer tokenizer = Tokenize(str, ',', '\'');
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "\\n");
+    ASSERT_EQ(it, tokenizer.end());
   }
 }
 
@@ -387,7 +498,7 @@ TEST_F(YBBulkLoadTest, InvalidLines) {
   ASSERT_NOK(partition_generator_->LookupTabletId("123,123.2", &tablet_id, &partition_key));
 }
 
-TEST_F(YBBulkLoadTest, TestCLITool) {
+TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
   string exe_path = GetToolPath(kPartitionToolName);
   vector<string> argv = {kPartitionToolName, "-master_addresses", master_addresses_comma_separated_,
       "-table_name", kTableName, "-namespace_name", kNamespace};
@@ -417,6 +528,9 @@ TEST_F(YBBulkLoadTest, TestCLITool) {
     boost::split(tokens, buf, boost::is_any_of("\t"));
     ASSERT_EQ(2, tokens.size());
     const string& tablet_id = tokens[0];
+    ASSERT_EQ(generated_rows[i], tokens[1]);
+    ASSERT_EQ(tokens[1][tokens[1].length() -1], '\n');
+    boost::trim_right(tokens[1]); // remove the trailing '\n'
     const string& line = tokens[1];
     auto it = tabletid_to_line.find(tablet_id);
     if (it != tabletid_to_line.end()) {
@@ -428,7 +542,6 @@ TEST_F(YBBulkLoadTest, TestCLITool) {
     // Verify tablet id and original line.
     master::TabletLocationsPB tablet_location;
     VerifyTabletId(tablet_id, &tablet_location);
-    ASSERT_EQ(generated_rows[i], line);
   }
 
   CloseStreamsAndWaitForProcess(out, in, partition_process.get());
@@ -484,6 +597,8 @@ TEST_F(YBBulkLoadTest, TestCLITool) {
   ASSERT_OK(proxy_->GetTableLocations(req, &resp, &controller));
   ASSERT_FALSE(resp.has_error());
   ASSERT_EQ(kNumTablets, resp.tablet_locations_size());
+  client::TableHandle table;
+  ASSERT_OK(table.Open(*table_name_, client_.get()));
 
   for (const master::TabletLocationsPB& tablet_location : resp.tablet_locations()) {
     const string& tablet_id = tablet_location.tablet_id();
@@ -501,20 +616,20 @@ TEST_F(YBBulkLoadTest, TestCLITool) {
     }
     ASSERT_GE(kNumFilesPerTablet, num_files);
 
-    Endpoint leader_tserver;
+    HostPort leader_tserver;
     for (const master::TabletLocationsPB::ReplicaPB& replica : tablet_location.replicas()) {
       if (replica.role() == consensus::RaftPeerPB_Role::RaftPeerPB_Role_LEADER) {
-        HostPort host_port;
-        ASSERT_OK(EndpointFromHostPortPB(replica.ts_info().rpc_addresses(0), &leader_tserver));
+        leader_tserver = HostPortFromPB(replica.ts_info().private_rpc_addresses(0));
         break;
       }
     }
 
-    auto tserver_proxy = std::make_unique<tserver::TabletServerServiceProxy>(client_messenger_,
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
+    auto tserver_proxy = std::make_unique<tserver::TabletServerServiceProxy>(&proxy_cache,
                                                                              leader_tserver);
 
     // Start the load generator to ensure we can import files with running load.
-    LoadGenerator load_generator(tablet_id, tserver_proxy.get());
+    LoadGenerator load_generator(tablet_id, &table, tserver_proxy.get());
     std::thread load_thread(&LoadGenerator::RunLoad, &load_generator);
     // Wait for load generator to generate some traffic.
     SleepFor(MonoDelta::FromSeconds(5));

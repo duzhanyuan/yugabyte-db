@@ -25,7 +25,8 @@
 // thus APIs and class definitions might subject to change at this point.
 // Will remove this comment once the APIs have been finalized.
 
-#pragma once
+#ifndef YB_ROCKSDB_THREAD_STATUS_H
+#define YB_ROCKSDB_THREAD_STATUS_H
 
 #include <stdint.h>
 #include <cstddef>
@@ -34,23 +35,21 @@
 #include <utility>
 #include <vector>
 
+#include "yb/util/enums.h"
+#include "yb/util/math_util.h"
+
 #ifndef ROCKSDB_USING_THREAD_STATUS
-#define ROCKSDB_USING_THREAD_STATUS \
-    !defined(ROCKSDB_LITE) && \
+#if !defined(ROCKSDB_LITE) && \
     !defined(NROCKSDB_THREAD_STATUS) && \
     !defined(OS_MACOSX) && \
     !defined(IOS_CROSS_COMPILE)
+#define ROCKSDB_USING_THREAD_STATUS 1
+#else
+#define ROCKSDB_USING_THREAD_STATUS 0
+#endif
 #endif
 
 namespace rocksdb {
-
-// TODO(yhchiang): remove this function once c++14 is available
-//                 as std::max will be able to cover this.
-// Current MS compiler does not support constexpr
-template <int A, int B>
-struct constexpr_max {
-  static const int result = (A > B) ? A : B;
-};
 
 // A structure that describes the current status of a thread.
 // The status of active threads can be fetched using
@@ -108,8 +107,9 @@ struct ThreadStatus {
 
   // The maximum number of properties of an operation.
   // This number should be set to the biggest NUM_XXX_PROPERTIES.
-  static const int kNumOperationProperties =
-      constexpr_max<NUM_COMPACTION_PROPERTIES, NUM_FLUSH_PROPERTIES>::result;
+  static constexpr auto kNumOperationProperties =
+      yb::constexpr_max(yb::to_underlying(NUM_COMPACTION_PROPERTIES),
+                        yb::to_underlying(NUM_FLUSH_PROPERTIES));
 
   // The type used to refer to a thread state.
   // A state describes lower-level action of a thread
@@ -207,3 +207,5 @@ struct ThreadStatus {
 
 
 }  // namespace rocksdb
+
+#endif // YB_ROCKSDB_THREAD_STATUS_H

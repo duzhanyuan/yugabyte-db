@@ -34,7 +34,7 @@
 #include "yb/rocksdb/snapshot.h"
 #include "yb/rocksdb/status.h"
 #include "yb/rocksdb/utilities/transaction_db.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/utilities/transactions/transaction_db_impl.h"
 #include "yb/rocksdb/utilities/transactions/transaction_util.h"
@@ -232,7 +232,7 @@ Status TransactionImpl::LockBatch(WriteBatch* batch,
 
   // Iterating on this handler will add all keys in this batch into keys
   Handler handler;
-  batch->Iterate(&handler);
+  RETURN_NOT_OK(batch->Iterate(&handler));
 
   Status s;
 

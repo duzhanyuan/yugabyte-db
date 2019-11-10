@@ -96,13 +96,22 @@ class LogicalRocksDBDebugSnapshot {
   string docdb_debug_dump_str;
 };
 
-class DocDBRocksDBFixtureTest : public DocDBRocksDBUtil {
+class DocDBRocksDBFixture : public DocDBRocksDBUtil {
  public:
   void AssertDocDbDebugDumpStrEq(const string &expected);
-  void CompactHistoryBefore(HybridTime history_cutoff);
+  void FullyCompactHistoryBefore(HybridTime history_cutoff);
+
+  // num_files_to_compact - number of files that should participate in the minor compaction
+  // start_index - the index of the file to start with (0 = the oldest file, -1 = compact
+  //               num_files_to_compact newest files).
+  void MinorCompaction(HybridTime history_cutoff, int num_files_to_compact, int start_index = -1);
+
+  int NumSSTableFiles();
+  StringVector SSTableFileNames();
+
   CHECKED_STATUS InitRocksDBDir() override;
   CHECKED_STATUS InitRocksDBOptions() override;
-  std::string tablet_id() override;
+  TabletId tablet_id() override;
   CHECKED_STATUS FormatDocWriteBatch(const DocWriteBatch& dwb, std::string* dwb_str);
 };
 
@@ -113,7 +122,7 @@ class DocDBLoadGenerator {
  public:
   static constexpr uint64_t kDefaultRandomSeed = 23874297385L;
 
-  DocDBLoadGenerator(DocDBRocksDBFixtureTest* fixture,
+  DocDBLoadGenerator(DocDBRocksDBFixture* fixture,
                      int num_doc_keys,
                      int num_unique_subkeys,
                      UseHash use_hash,
@@ -181,8 +190,9 @@ class DocDBLoadGenerator {
 
  private:
   rocksdb::DB* rocksdb() { return fixture_->rocksdb(); }
+  DocDB doc_db() { return fixture_->doc_db(); }
 
-  DocDBRocksDBFixtureTest* fixture_;
+  DocDBRocksDBFixture* fixture_;
   RandomNumberGenerator random_;  // Using default seed.
   std::vector<DocKey> doc_keys_;
 
@@ -228,6 +238,10 @@ class DocDBLoadGenerator {
 
   TransactionOperationContextOpt GetReadOperationTransactionContext();
 };
+
+// Used for pre-processing multi-line DocDB debug dump strings in tests.  Removes common indentation
+// and C++-style comments and applies backslash line continuation.
+string TrimDocDbDebugDumpStr(const string& debug_dump);
 
 #define ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(expected) \
   do { \

@@ -24,8 +24,7 @@ namespace master {
 class YQLTablesVTable : public YQLVirtualTable {
  public:
   explicit YQLTablesVTable(const Master* const master);
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  Result<std::shared_ptr<QLRowBlock>> RetrieveData(const QLReadRequestPB& request) const override;
  protected:
   Schema CreateSchema() const;
  private:
@@ -49,6 +48,7 @@ class YQLTablesVTable : public YQLVirtualTable {
   static constexpr const char* const kMinIndexInterval = "min_index_interval";
   static constexpr const char* const kReadRepairChance = "read_repair_chance";
   static constexpr const char* const kSpeculativeRetry = "speculative_retry";
+  static constexpr const char* const kTransactions = "transactions";
 };
 
 }  // namespace master

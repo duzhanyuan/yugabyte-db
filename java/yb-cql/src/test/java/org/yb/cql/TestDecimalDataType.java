@@ -16,16 +16,21 @@ import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertNull;
+import static org.yb.AssertionWrappers.assertTrue;
 
 import java.math.BigDecimal;
 import java.util.Iterator;
 import java.util.Random;
 import java.util.TreeSet;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestDecimalDataType extends BaseCQLTest {
   private String getRandomVarInt(boolean withSign, int length) {
     String digits = "0123456789";
@@ -61,9 +66,9 @@ public class TestDecimalDataType extends BaseCQLTest {
     final Random random = new Random();
     int r = random.nextInt(10);
     if (r < 3) {
-      return decimal + "E" + getRandomVarInt(true, 6);
+      return decimal + "E" + getRandomVarInt(true, 3);
     } else if (r < 5) {
-      return decimal + "e" + getRandomVarInt(true, 6);
+      return decimal + "e" + getRandomVarInt(true, 3);
     }
     return decimal;
   }
@@ -645,4 +650,84 @@ public class TestDecimalDataType extends BaseCQLTest {
 
     LOG.info("TEST CQL CONVERSIONS LIMITS - End");
   }
+
+  @Test
+  public void testDecimalDataTypeSum() throws Exception {
+    BigDecimal hash = new BigDecimal("-0.2");
+    TreeSet<BigDecimal> decimals = new TreeSet<BigDecimal>();
+    decimals.add(new BigDecimal("-100.02"));
+    decimals.add(new BigDecimal("-43.030016"));
+    decimals.add(new BigDecimal("-6.00001"));
+    decimals.add(new BigDecimal("-6.000001"));
+    decimals.add(new BigDecimal("-6"));
+    decimals.add(new BigDecimal("-5.99999956"));
+    decimals.add(new BigDecimal("-5.8999999"));
+    decimals.add(new BigDecimal("-1.2"));
+    decimals.add(new BigDecimal("-1.15"));
+    decimals.add(new BigDecimal("-.05"));
+    decimals.add(new BigDecimal("-1.01E+2"));
+    decimals.add(new BigDecimal("0"));
+    decimals.add(new BigDecimal("0.05"));
+    decimals.add(new BigDecimal("1.05"));
+    decimals.add(new BigDecimal("1.15"));
+    decimals.add(new BigDecimal("1.2"));
+    decimals.add(new BigDecimal("1.01E+5"));
+    testDecimalDataTypeSum(hash, decimals);
+  }
+
+  @Test
+  public void testDecimalDataTypeSumRandom() throws Exception {
+    final Random random = new Random();
+    BigDecimal hashDecimal = new BigDecimal(getRandomDecimal());
+    TreeSet<BigDecimal> decimals = new TreeSet<BigDecimal>();
+    for (int i = 0; i < 100; i++) {
+      BigDecimal decimal;
+      do {
+        decimal = new BigDecimal(getRandomDecimal());
+      } while (!decimals.add(decimal));
+    }
+
+    testDecimalDataTypeSum(hashDecimal, decimals);
+  }
+
+  private void testDecimalDataTypeSum(BigDecimal hashDecimal, TreeSet<BigDecimal> decimals)
+          throws Exception {
+    LOG.info("TEST CQL DECIMAL TYPE IN HASH - Start");
+
+    // Create table
+    String tableName = "test_decimal";
+    String createStmt = String.format("CREATE TABLE %s " +
+            "(h1 decimal, h2 int, r1 decimal, r2 int, v1 decimal, v2 int, " +
+            "primary key((h1, h2), r1, r2));", tableName);
+    session.execute(createStmt);
+    BigDecimal sumDecimal = new BigDecimal("0");
+
+
+    for (BigDecimal decimal : decimals) {
+      // Insert one row. Deliberately insert with same hash key but different range column values.
+      final String insertStmt =
+          String.format("INSERT INTO %s (h1, h2, r1, r2, v1, v2) VALUES (%s, 1, %s, %d, %s, 2);",
+              tableName, hashDecimal.toString(), decimal.toString(), decimal.intValue(),
+              decimal.toString());
+      LOG.info("insertStmt: " + insertStmt);
+      session.execute(insertStmt);
+      sumDecimal = sumDecimal.add(decimal);
+    }
+
+    // Select sum of rows by the hash key. Should be 1 result row.
+    final String selectSumStmt = String.format("SELECT sum(v1) FROM %s " +
+            "WHERE h1 = %s AND h2 = 1;", tableName, hashDecimal.toString());
+    LOG.info("selectSumStmt: " + selectSumStmt);
+    ResultSet rsSum = session.execute(selectSumStmt);
+    assertEquals(1, rsSum.getAvailableWithoutFetching());
+
+    Row rowSum = rsSum.one();
+
+    assertEquals(0, rowSum.getDecimal(0).compareTo(sumDecimal));
+
+    final String dropStmt = "DROP TABLE test_decimal;";
+    session.execute(dropStmt);
+    LOG.info("TEST CQL DECIMAL TYPE SUM - End");
+  }
+
 }

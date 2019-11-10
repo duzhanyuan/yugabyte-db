@@ -30,13 +30,21 @@
 // under the License.
 //
 // Some portions Copyright 2013 The Chromium Authors. All rights reserved.
+
 #include "yb/gutil/strings/util.h"
+#include "yb/util/string_util.h"
+#include "yb/util/test_util.h"
 
 #include <gtest/gtest.h>
 
+using std::string;
+
 namespace yb {
 
-TEST(StringUtilTest, MatchPatternTest) {
+class StringUtilTest : public YBTest {
+};
+
+TEST_F(StringUtilTest, MatchPatternTest) {
   EXPECT_TRUE(MatchPattern("www.google.com", "*.com"));
   EXPECT_TRUE(MatchPattern("www.google.com", "*"));
   EXPECT_FALSE(MatchPattern("www.google.com", "www*.g*.org"));
@@ -66,7 +74,123 @@ TEST(StringUtilTest, MatchPatternTest) {
   // wildcard (when this doesn't occur, MatchPattern reaches it's maximum
   // recursion depth).
   EXPECT_TRUE(MatchPattern("Hello" ,
-                           "He********************************o")) ;
+                           "He********************************o"));
+}
+
+TEST_F(StringUtilTest, TestIsBigInteger) {
+  ASSERT_TRUE(IsBigInteger("0"));
+  ASSERT_TRUE(IsBigInteger("1234"));
+  ASSERT_TRUE(IsBigInteger("-1234"));
+  ASSERT_TRUE(IsBigInteger("+1234"));
+  ASSERT_TRUE(IsBigInteger("0000"));
+  ASSERT_TRUE(IsBigInteger("00001234"));
+  ASSERT_TRUE(IsBigInteger("-00001234"));
+  ASSERT_TRUE(IsBigInteger("+00001234"));
+  ASSERT_TRUE(IsBigInteger("111222333444555666777888999888777666555444333222111"));
+  ASSERT_FALSE(IsBigInteger(""));
+  ASSERT_FALSE(IsBigInteger("."));
+  ASSERT_FALSE(IsBigInteger("0."));
+  ASSERT_FALSE(IsBigInteger(".0"));
+  ASSERT_FALSE(IsBigInteger("0.0"));
+  ASSERT_FALSE(IsBigInteger("0,0"));
+  ASSERT_FALSE(IsBigInteger(" 0"));
+  ASSERT_FALSE(IsBigInteger("0 "));
+}
+
+TEST_F(StringUtilTest, TestIsDecimal) {
+  // Integer cases
+  ASSERT_TRUE(IsDecimal("0"));
+  ASSERT_TRUE(IsDecimal("1234"));
+  ASSERT_TRUE(IsDecimal("-1234"));
+  ASSERT_TRUE(IsDecimal("+1234"));
+  ASSERT_TRUE(IsDecimal("0000"));
+  ASSERT_TRUE(IsDecimal("00001234"));
+  ASSERT_TRUE(IsDecimal("-00001234"));
+  ASSERT_TRUE(IsDecimal("+00001234"));
+  ASSERT_TRUE(IsDecimal("111222333444555666777888999888777666555444333222111"));
+  // Decimal separator - regular
+  ASSERT_TRUE(IsDecimal("0.0"));
+  ASSERT_TRUE(IsDecimal("1234.1234"));
+  ASSERT_TRUE(IsDecimal("-1234.1234"));
+  ASSERT_TRUE(IsDecimal("+1234.1234"));
+  ASSERT_TRUE(IsDecimal("0000.0000"));
+  ASSERT_TRUE(IsDecimal("00001234.12340000"));
+  ASSERT_TRUE(IsDecimal("-00001234.12340000"));
+  ASSERT_TRUE(IsDecimal("+00001234.12340000"));
+  ASSERT_TRUE(IsDecimal(string("111222333444555666777888999888777666555444333222111")
+                            + ".111222333444555666777888999888777666555444333222111"));
+  // Decimal separator - irregular
+  ASSERT_TRUE(IsDecimal("0."));
+  ASSERT_TRUE(IsDecimal(".0"));
+  ASSERT_TRUE(IsDecimal("0.0"));
+  // Exponent
+  ASSERT_TRUE(IsDecimal("0e0"));
+  ASSERT_TRUE(IsDecimal("1e2"));
+  ASSERT_TRUE(IsDecimal("123E456"));
+  ASSERT_TRUE(IsDecimal("-123e-456"));
+  ASSERT_TRUE(IsDecimal("+123e+456"));
+  ASSERT_TRUE(IsDecimal("000123e000456"));
+  ASSERT_TRUE(IsDecimal(string("111222333444555666777888999888777666555444333222111")
+                            + "e111222333444555666777888999888777666555444333222111"));
+  // Both exponent and decimal separator
+  ASSERT_TRUE(IsDecimal("1.2e345"));
+  ASSERT_TRUE(IsDecimal(".123e1"));
+  ASSERT_TRUE(IsDecimal("-.123e1"));
+  ASSERT_TRUE(IsDecimal("+.123e1"));
+  ASSERT_TRUE(IsDecimal("123.e1"));
+  ASSERT_TRUE(IsDecimal("-123.e1"));
+  ASSERT_TRUE(IsDecimal("+123.e1"));
+  ASSERT_TRUE(IsDecimal(string("111222333444555666777888999888777666555444333222111")
+                            + ".111222333444555666777888999888777666555444333222111"
+                            + "e111222333444555666777888999888777666555444333222111"));
+  // Non-decimals
+  ASSERT_FALSE(IsDecimal(" 0"));
+  ASSERT_FALSE(IsDecimal("0 "));
+  ASSERT_FALSE(IsDecimal(""));
+  ASSERT_FALSE(IsDecimal("."));
+  ASSERT_FALSE(IsDecimal("0,0"));
+  ASSERT_FALSE(IsDecimal("0e"));
+  ASSERT_FALSE(IsDecimal("0e0.0"));
+  ASSERT_FALSE(IsDecimal("0e.0"));
+  ASSERT_FALSE(IsDecimal("0e0."));
+}
+
+TEST_F(StringUtilTest, TestIsBoolean) {
+  ASSERT_TRUE(IsBoolean("true"));
+  ASSERT_TRUE(IsBoolean("TRUE"));
+  ASSERT_TRUE(IsBoolean("fAlSe"));
+  ASSERT_TRUE(IsBoolean("falsE"));
+  ASSERT_FALSE(IsBoolean(""));
+  ASSERT_FALSE(IsBoolean("0"));
+  ASSERT_FALSE(IsBoolean("1"));
+  ASSERT_FALSE(IsBoolean(" true"));
+  ASSERT_FALSE(IsBoolean("false "));
+}
+
+TEST_F(StringUtilTest, TestAppendWithSeparator) {
+  string s;
+  AppendWithSeparator("foo", &s);
+  ASSERT_EQ(s, "foo");
+  AppendWithSeparator("bar", &s);
+  ASSERT_EQ(s, "foo, bar");
+  AppendWithSeparator("foo", &s, " -- ");
+  ASSERT_EQ(s, "foo, bar -- foo");
+
+  s = "";
+  AppendWithSeparator(string("foo"), &s);
+  ASSERT_EQ(s, "foo");
+  AppendWithSeparator(string("bar"), &s);
+  ASSERT_EQ(s, "foo, bar");
+  AppendWithSeparator(string("foo"), &s, " -- ");
+  ASSERT_EQ(s, "foo, bar -- foo");
+}
+
+TEST_F(StringUtilTest, TestCollectionToString) {
+  std::vector<std::string> v{"foo", "123", "bar", ""};
+  ASSERT_EQ("[foo, 123, bar, ]", VectorToString(v));
+  ASSERT_EQ("[foo, 123, bar, ]", RangeToString(v.begin(), v.end()));
+  ASSERT_EQ("[]", RangeToString(v.begin(), v.begin()));
+  ASSERT_EQ("[foo]", RangeToString(v.begin(), v.begin() + 1));
 }
 
 } // namespace yb

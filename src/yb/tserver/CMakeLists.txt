@@ -135,23 +135,38 @@ ADD_YB_LIBRARY(tserver_service_proto
   NONLINK_DEPS ${TSERVER_YRPC_TGTS})
 
 #########################################
+# tserver_util
+#########################################
+
+set(TSERVER_UTIL_SRCS
+  tserver_flags.cc
+  tserver_shared_mem.cc
+  tserver_error.cc)
+set(TSERVER_UTIL_LIBS
+  yb_util)
+ADD_YB_LIBRARY(tserver_util
+  SRCS ${TSERVER_UTIL_SRCS}
+  DEPS ${TSERVER_UTIL_LIBS})
+add_dependencies(tserver_util gen_proto)
+
+#########################################
 # tserver
 #########################################
 
 set(TSERVER_SRCS
   heartbeater.cc
+  metrics_snapshotter.cc
   mini_tablet_server.cc
   remote_bootstrap_client.cc
   remote_bootstrap_service.cc
   remote_bootstrap_session.cc
-  scanner_metrics.cc
-  scanners.cc
+  service_util.cc
   tablet_server.cc
   tablet_server_options.cc
   tablet_service.cc
   ts_tablet_manager.cc
   tserver-path-handlers.cc
-  ${TSERVER_SRCS_EXTENTIONS})
+  ${TSERVER_SRCS_EXTENSIONS})
 
 add_library(tserver ${TSERVER_SRCS})
 target_link_libraries(tserver
@@ -171,7 +186,9 @@ target_link_libraries(tserver
   server_common
   server_process
   tablet
-  yb_client)
+  yb_client
+  yb_pggate_flags
+  ${TSERVER_LIB_EXTENSIONS})
 
 #########################################
 # yb-tserver
@@ -179,9 +196,10 @@ target_link_libraries(tserver
 
 add_executable(yb-tserver tablet_server_main.cc)
 target_link_libraries(yb-tserver
-  yb-cql
   tserver
+  yb-cql
   yb-redis
+  yb_pgwrapper
   master
   ${YB_BASE_LIBS})
 
@@ -189,33 +207,36 @@ target_link_libraries(yb-tserver
 # tserver_test_util
 #########################################
 
-set(TSERVER_TEST_UTIL_SRCS
-  tablet_server_test_util.cc
-)
-
-add_library(tserver_test_util ${TSERVER_TEST_UTIL_SRCS})
-target_link_libraries(tserver_test_util
-  tserver)
+add_library(tserver_test_util tablet_server-test-base.cc tablet_server_test_util.cc)
+target_link_libraries(tserver_test_util tablet_test_util tserver yb_test_util)
 
 #########################################
 # tserver tests
 #########################################
 
 set(YB_TEST_LINK_LIBS
+  rpc_test_util
   tserver
   tserver_test_util
   yb_client # yb::client::YBTableName
+  tablet_test_util
   ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(remote_bootstrap_rocksdb_client-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_session-test)
 ADD_YB_TEST(remote_bootstrap_service-test)
 ADD_YB_TEST(tablet_server-test)
 ADD_YB_TEST(tablet_server-stress-test RUN_SERIAL true)
-ADD_YB_TEST(scanners-test)
 ADD_YB_TEST(ts_tablet_manager-test)
+ADD_YB_TEST(tserver_shared_mem-test)
 
 if(YB_ENT_CURRENT_SOURCE_DIR)
   # Set the test source file folder.
   set(CMAKE_CURRENT_LIST_DIR ${YB_ENT_CURRENT_SOURCE_DIR})
-  ADD_YB_TEST(${TSERVER_EXTENTIONS_TEST1})
+
+  foreach(test ${TSERVER_EXTENSIONS_TESTS})
+    ADD_YB_TEST(${test})
+  endforeach()
 endif()
+
+# Tablet server starts PostgreSQL as a child process
+adD_dependencies(tserver postgres)

@@ -14,32 +14,32 @@
 package org.yb.cql;
 
 import com.datastax.driver.core.*;
-import com.datastax.driver.core.exceptions.ProtocolError;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
 import com.datastax.driver.core.querybuilder.QueryBuilder;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.driver.core.policies.PartitionAwarePolicy;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.ColumnSchema;
-import org.yb.Common;
-import org.yb.Schema;
-import org.yb.Type;
+import org.yb.*;
 import org.yb.client.*;
 import org.yb.consensus.Metadata;
 import org.yb.minicluster.Metrics;
 import org.yb.minicluster.MiniYBCluster;
 import org.yb.minicluster.MiniYBDaemon;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 
 import static junit.framework.TestCase.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertNotNull;
+import static org.yb.AssertionWrappers.assertTrue;
 
+@RunWith(value=YBTestRunner.class)
 public class TestConsistencyLevels extends BaseCQLTest {
   protected static final Logger LOG = LoggerFactory.getLogger(TestConsistencyLevels.class);
 
@@ -62,7 +62,7 @@ public class TestConsistencyLevels extends BaseCQLTest {
 
   @Override
   public void useKeyspace() throws Exception {
-    // Use the DEFAULT_KEYSPACE for this test.
+    // Use the DEFAULT_TEST_KEYSPACE for this test.
   }
 
   @Override
@@ -70,6 +70,16 @@ public class TestConsistencyLevels extends BaseCQLTest {
     // We need to destroy the mini cluster since we don't want metrics from one test to interfere
     // with another.
     destroyMiniCluster();
+  }
+
+  protected void createMiniClusterWithSameRegion() throws Exception {
+    // Create a cluster with tservers in the same region.
+    List<List<String>> tserverArgs = new ArrayList<>();
+    for (int i = 0; i < NUM_TABLET_SERVERS; i++) {
+      tserverArgs.add(Arrays.asList(String.format("--placement_region=%s%d", REGION_PREFIX, 1)));
+    }
+    createMiniCluster(1, tserverArgs);
+
   }
 
   protected void createMiniClusterWithPlacementRegion() throws Exception {
@@ -97,7 +107,7 @@ public class TestConsistencyLevels extends BaseCQLTest {
     CreateTableOptions options = new CreateTableOptions();
     options.setNumTablets(1);
     options.setTableType(Common.TableType.YQL_TABLE_TYPE);
-    ybTable = client.createTable(TABLE_NAME, new Schema(
+    ybTable = client.createTable(DEFAULT_TEST_KEYSPACE, TABLE_NAME, new Schema(
       Arrays.asList(hash_column.build(), range_column.build(), regular_column.build())), options);
 
     // Verify number of replicas.
@@ -109,8 +119,8 @@ public class TestConsistencyLevels extends BaseCQLTest {
     for (int idx = 0; idx < NUM_ROWS; idx++) {
       // INSERT: Valid statement with column list.
       String insert_stmt = String.format(
-        "INSERT INTO %s.%s(h, r, k) VALUES(%d, %d, %d);", DEFAULT_KEYSPACE, TABLE_NAME, idx, idx,
-        idx);
+        "INSERT INTO %s.%s(h, r, k) VALUES(%d, %d, %d);", DEFAULT_TEST_KEYSPACE, TABLE_NAME,
+        idx, idx, idx);
       session.execute(insert_stmt);
     }
   }
@@ -142,7 +152,7 @@ public class TestConsistencyLevels extends BaseCQLTest {
 
   private boolean verifyNumRows(ConsistencyLevel consistencyLevel) {
     Statement statement = QueryBuilder.select()
-      .from(DEFAULT_KEYSPACE, TABLE_NAME)
+      .from(DEFAULT_TEST_KEYSPACE, TABLE_NAME)
       .setConsistencyLevel(consistencyLevel);
     return NUM_ROWS == session.execute(statement).all().size();
   }
@@ -217,8 +227,7 @@ public class TestConsistencyLevels extends BaseCQLTest {
           DCAwareRoundRobinPolicy.builder()
           .withLocalDc(REGION_PREFIX + i)
           .withUsedHostsPerRemoteDc(Integer.MAX_VALUE)
-          .build(),
-          PARTITION_POLICY_REFRESH_FREQUENCY_SECONDS)).build();
+          .build())).build();
       Session session = cluster.connect();
 
       // Find the tserver, cqlproxy for this region.
@@ -240,14 +249,13 @@ public class TestConsistencyLevels extends BaseCQLTest {
       Metrics tserverMetrics = new Metrics(tserver_webaddress.getHostText(),
         tserver_webaddress.getPort(), "server");
       long tserverNumOpsBefore = tserverMetrics.getHistogram(TSERVER_READ_METRIC).totalCount;
-
       Metrics cqlproxyMetrics = new Metrics(cqlproxy_webaddress.getHostText(),
         cqlproxy_webaddress.getPort(), "server");
       long cqlproxyNumOpsBefore = cqlproxyMetrics.getHistogram(CQLPROXY_SELECT_METRIC).totalCount;
 
       // Perform a number of reads.
       Statement statement = QueryBuilder.select()
-        .from(DEFAULT_KEYSPACE, TABLE_NAME)
+        .from(DEFAULT_TEST_KEYSPACE, TABLE_NAME)
         .setConsistencyLevel(ConsistencyLevel.ONE);
       for (int j = 0; j < NUM_OPS; j++) {
         session.execute(statement);
@@ -266,5 +274,57 @@ public class TestConsistencyLevels extends BaseCQLTest {
       assertTrue(NUM_OPS <=
         cqlproxyMetrics.getHistogram(CQLPROXY_SELECT_METRIC).totalCount - cqlproxyNumOpsBefore);
     }
+  }
+
+  @Test
+  public void testRoundRobinBetweenReplicas() throws Exception {
+    // Destroy existing cluster and recreate it.
+    destroyMiniCluster();
+
+    // Set a high refresh interval, so that this does not mess with our metrics.
+    MiniYBCluster.CQL_NODE_LIST_REFRESH_SECS = Integer.MAX_VALUE;
+    createMiniClusterWithSameRegion();
+    setUpCqlClient();
+    setUpTable();
+
+    String stmt = "select * from " + DEFAULT_TEST_KEYSPACE + "." + TABLE_NAME + ";";
+    PreparedStatement prepare_stmt = session.prepare(stmt).
+                                     setConsistencyLevel(ConsistencyLevel.ONE);
+    for (int j = 0; j < NUM_OPS; j++) {
+      session.execute(prepare_stmt.bind());
+    }
+
+    Map<HostAndPort, MiniYBDaemon> tservers = miniCluster.getTabletServers();
+    long totalOps = 0;
+    long maxOps = 0, minOps = NUM_OPS + 1;
+    HostAndPort cqlproxy_webaddress = null;
+    for (Map.Entry<HostAndPort, MiniYBDaemon> entry: tservers.entrySet()) {
+      cqlproxy_webaddress = HostAndPort.fromParts(entry.getKey().getHostText(), entry
+              .getValue().getCqlWebPort());
+      Metrics cqlproxyMetrics = new Metrics(cqlproxy_webaddress.getHostText(),
+              cqlproxy_webaddress.getPort(), "server");
+      long cqlproxyNumOps = cqlproxyMetrics.getHistogram(CQLPROXY_SELECT_METRIC).totalCount;
+      assertTrue(cqlproxyNumOps > NUM_OPS/(STANDARD_DEVIATION_FACTOR*NUM_TABLET_SERVERS));
+      LOG.info("CQL Proxy Num Ops: " + cqlproxyNumOps);
+    }
+
+    for (LocatedTablet.Replica replica : tablet.getReplicas()) {
+      String host = replica.getRpcHost();
+      int webPort = tservers.get(HostAndPort.fromParts(host, replica.getRpcPort())).getWebPort();
+
+      Metrics metrics = new Metrics(host, webPort, "server");
+      long numOps = metrics.getHistogram(TSERVER_READ_METRIC).totalCount;
+      LOG.info("Num ops for tserver: " + replica.toString() + " : " + numOps);
+      totalOps += numOps;
+      if (numOps > maxOps) {
+        maxOps = numOps;
+      }
+      if (numOps < minOps) {
+        minOps = numOps;
+      }
+      assertTrue(numOps > NUM_OPS/(STANDARD_DEVIATION_FACTOR*NUM_TABLET_SERVERS));
+    }
+    assertTrue(totalOps <= NUM_OPS);
+    assertTrue((maxOps - minOps) < NUM_OPS/(STANDARD_DEVIATION_FACTOR*NUM_TABLET_SERVERS));
   }
 }

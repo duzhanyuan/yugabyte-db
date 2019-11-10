@@ -240,6 +240,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <set>
 #include <string>
 #include <sstream>
 #include <unordered_map>
@@ -248,6 +249,7 @@
 #include <gtest/gtest_prod.h>
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
+#include <boost/thread/shared_mutex.hpp>
 
 #include "yb/gutil/bind.h"
 #include "yb/gutil/callback.h"
@@ -255,12 +257,15 @@
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/singleton.h"
+
 #include "yb/util/atomic.h"
 #include "yb/util/jsonwriter.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status.h"
 #include "yb/util/striped64.h"
+#include "yb/util/strongly_typed_bool.h"
+#include "yb/util/shared_lock.h"
 
 // Define a new entity type.
 //
@@ -278,6 +283,9 @@
                                       label, \
                                       unit, \
                                       desc))
+
+#define METRIC_DEFINE_simple_counter(entity, name, label, unit) \
+    METRIC_DEFINE_counter(entity, name, label, unit, label)
 
 #define METRIC_DEFINE_gauge(type, entity, name, label, unit, desc, ...) \
   ::yb::GaugePrototype<type> BOOST_PP_CAT(METRIC_, name)(         \
@@ -300,6 +308,8 @@
     METRIC_DEFINE_gauge(int64, entity, name, label, unit, desc, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_uint64(entity, name, label, unit, desc, ...) \
     METRIC_DEFINE_gauge(uint64_t, entity, name, label, unit, desc, ## __VA_ARGS__)
+#define METRIC_DEFINE_simple_gauge_uint64(entity, name, label, unit, ...) \
+    METRIC_DEFINE_gauge(uint64_t, entity, name, label, unit, label, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_double(entity, name, label, unit, desc, ...) \
     METRIC_DEFINE_gauge(double, entity, name, label, unit, desc, ## __VA_ARGS__)
 
@@ -371,6 +381,7 @@ class HistogramSnapshotPB;
 
 class MetricEntity;
 class PrometheusWriter;
+class NMSWriter;
 } // namespace yb
 
 // Forward-declare the generic 'server' entity type.
@@ -401,7 +412,6 @@ struct MetricUnit {
     kThreads,
     kTransactions,
     kUnits,
-    kScanners,
     kMaintenanceOperations,
     kBlocks,
     kLogBlockContainers,
@@ -480,8 +490,12 @@ class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
   scoped_refptr<Histogram> FindOrCreateHistogram(const HistogramPrototype* proto);
 
   template<typename T>
-  scoped_refptr<AtomicGauge<T> > FindOrCreateGauge(const GaugePrototype<T>* proto,
-                                                   const T& initial_value);
+  scoped_refptr<AtomicGauge<T>> FindOrCreateGauge(const GaugePrototype<T>* proto,
+                                                  const T& initial_value);
+
+  template<typename T>
+  scoped_refptr<AtomicGauge<T>> FindOrCreateGauge(std::unique_ptr<GaugePrototype<T>> proto,
+                                                  const T& initial_value);
 
   template<typename T>
   scoped_refptr<FunctionGauge<T> > FindOrCreateFunctionGauge(const GaugePrototype<T>* proto,
@@ -536,6 +550,10 @@ class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
     external_prometheus_metrics_cbs_.push_back(external_metrics_cb);
   }
 
+  const MetricEntityPrototype& prototype() const { return *prototype_; }
+
+  void Remove(const MetricPrototype* proto);
+
  private:
   friend class MetricRegistry;
   friend class RefCountedThreadSafe<MetricEntity>;
@@ -579,6 +597,8 @@ class PrometheusWriter {
       timestamp_(std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::system_clock::now().time_since_epoch()).count()) {}
 
+  virtual ~PrometheusWriter() {}
+
   template<typename T>
   CHECKED_STATUS WriteSingleEntry(
       const MetricEntity::AttributeMap& attr, const std::string& name, const T& value) {
@@ -610,9 +630,11 @@ class PrometheusWriter {
   }
 
  private:
-  template<typename T>
-  CHECKED_STATUS FlushSingleEntry(
-      const MetricEntity::AttributeMap& attr, const std::string& name, const T& value) {
+  // FlushSingleEntry() was a function template with type of "value" as template
+  // var T. To allow NMSWriter to override FlushSingleEntry(), the type of "value"
+  // has been instantiated to int64_t.
+  virtual CHECKED_STATUS FlushSingleEntry(const MetricEntity::AttributeMap& attr,
+      const std::string& name, const int64_t& value) {
     *output_ << name;
     size_t total_elements = attr.size();
     if (total_elements > 0) {
@@ -641,6 +663,43 @@ class PrometheusWriter {
   int64_t timestamp_;
 };
 
+// Native Metrics Storage Writer - writes prometheus metrics into system table.
+class NMSWriter : public PrometheusWriter {
+ public:
+  typedef std::unordered_map<std::string, int64_t> MetricsMap;
+  typedef std::unordered_map<std::string, MetricsMap> EntityMetricsMap;
+
+  explicit NMSWriter(EntityMetricsMap* table_metrics, MetricsMap* server_metrics)
+    : PrometheusWriter(nullptr), table_metrics_(table_metrics),
+    server_metrics_(server_metrics) {}
+
+ private:
+  CHECKED_STATUS FlushSingleEntry(
+      const MetricEntity::AttributeMap& attr, const std::string& name,
+      const int64_t& value) override {
+
+    auto it = attr.find("metric_type");
+    if (it == attr.end()) {
+      // ignore.
+    } else if (it->second == "server") {
+      (*server_metrics_)[name] = (int64_t)value;
+    } else if (it->second == "tablet") {
+      auto it2 = attr.find("table_id");
+      if (it2 == attr.end()) {
+        // ignore.
+      } else {
+        (*table_metrics_)[it2->second][name] = (int64_t)value;
+      }
+    }
+    return Status::OK();
+  }
+
+  // Output
+  // Map from table_id to map of metric_name to value
+  EntityMetricsMap* table_metrics_;
+  // Map from metric_name to value
+  MetricsMap* server_metrics_;
+};
 
 
 // Base class to allow for putting all metrics into a single container.
@@ -658,8 +717,10 @@ class Metric : public RefCountedThreadSafe<Metric> {
 
  protected:
   explicit Metric(const MetricPrototype* prototype);
+  explicit Metric(std::unique_ptr<MetricPrototype> prototype);
   virtual ~Metric();
 
+  std::unique_ptr<MetricPrototype> prototype_holder_;
   const MetricPrototype* const prototype_;
 
  private:
@@ -714,9 +775,32 @@ class MetricRegistry {
     return entities_.size();
   }
 
+  void tablets_shutdown_insert(std::string id) {
+    std::lock_guard<boost::shared_mutex> l(tablets_shutdown_lock_);
+    tablets_shutdown_.insert(id);
+  }
+
+  void tablets_shutdown_erase(std::string id) {
+    std::lock_guard<boost::shared_mutex> l(tablets_shutdown_lock_);
+    (void)tablets_shutdown_.erase(id);
+  }
+
+  bool tablets_shutdown_find(std::string id) const {
+    SharedLock<boost::shared_mutex> l(tablets_shutdown_lock_);
+    return tablets_shutdown_.find(id) != tablets_shutdown_.end();
+  }
+
  private:
   typedef std::unordered_map<std::string, scoped_refptr<MetricEntity> > EntityMap;
   EntityMap entities_;
+
+  mutable boost::shared_mutex tablets_shutdown_lock_;
+
+  // Set of tablets that have been shutdown. Protected by tablets_shutdown_lock_.
+  std::set<std::string> tablets_shutdown_;
+
+  // Returns whether a tablet has been shutdown.
+  bool TabletHasBeenShutdown(const scoped_refptr<MetricEntity> entity) const;
 
   mutable simple_spinlock lock_;
   DISALLOW_COPY_AND_ASSIGN(MetricRegistry);
@@ -809,10 +893,10 @@ class MetricPrototype {
   void WriteFields(JsonWriter* writer,
                    const MetricJsonOptions& opts) const;
 
+  virtual ~MetricPrototype() {}
+
  protected:
   explicit MetricPrototype(CtorArgs args);
-  virtual ~MetricPrototype() {
-  }
 
   const CtorArgs args_;
 
@@ -858,8 +942,13 @@ class GaugePrototype : public MetricPrototype {
 class Gauge : public Metric {
  public:
   explicit Gauge(const MetricPrototype* prototype)
-    : Metric(prototype) {
+      : Metric(prototype) {
   }
+
+  explicit Gauge(std::unique_ptr<MetricPrototype> prototype)
+      : Metric(std::move(prototype)) {
+  }
+
   virtual ~Gauge() {}
   virtual CHECKED_STATUS WriteAsJson(JsonWriter* w,
                              const MetricJsonOptions& opts) const override;
@@ -892,9 +981,12 @@ template <typename T>
 class AtomicGauge : public Gauge {
  public:
   AtomicGauge(const GaugePrototype<T>* proto, T initial_value)
-    : Gauge(proto),
-      value_(initial_value) {
+      : Gauge(proto), value_(initial_value) {
   }
+
+  AtomicGauge(std::unique_ptr<GaugePrototype<T>> proto, T initial_value)
+      : Gauge(std::move(proto)), value_(initial_value) {}
+
   T value() const {
     return static_cast<T>(value_.Load(kMemOrderRelease));
   }
@@ -927,6 +1019,20 @@ class AtomicGauge : public Gauge {
  private:
   DISALLOW_COPY_AND_ASSIGN(AtomicGauge);
 };
+
+template <class T>
+void IncrementGauge(const scoped_refptr<AtomicGauge<T>>& gauge) {
+  if (gauge) {
+    gauge->Increment();
+  }
+}
+
+template <class T>
+void DecrementGauge(const scoped_refptr<AtomicGauge<T>>& gauge) {
+  if (gauge) {
+    gauge->Decrement();
+  }
+}
 
 // Utility class to automatically detach FunctionGauges when a class destructs.
 //
@@ -1096,6 +1202,12 @@ class Counter : public Metric {
   DISALLOW_COPY_AND_ASSIGN(Counter);
 };
 
+inline void IncrementCounter(const scoped_refptr<Counter>& counter) {
+  if (counter) {
+    counter->Increment();
+  }
+}
+
 class HistogramPrototype : public MetricPrototype {
  public:
   HistogramPrototype(const MetricPrototype::CtorArgs& args,
@@ -1136,6 +1248,11 @@ class Histogram : public Metric {
   CHECKED_STATUS GetHistogramSnapshotPB(HistogramSnapshotPB* snapshot,
                                 const MetricJsonOptions& opts) const;
 
+
+  // Returns a pointer to the underlying histogram. The implementation of HdrHistogram
+  //   // is thread safe.
+  const HdrHistogram* histogram() const { return histogram_.get(); }
+
   uint64_t CountInBucketForValueForTests(uint64_t value) const;
   uint64_t MinValueForTests() const;
   uint64_t MaxValueForTests() const;
@@ -1150,17 +1267,37 @@ class Histogram : public Metric {
   DISALLOW_COPY_AND_ASSIGN(Histogram);
 };
 
+inline void IncrementHistogram(const scoped_refptr<Histogram>& histogram, int64_t value) {
+  if (histogram) {
+    histogram->Increment(value);
+  }
+}
+
+YB_STRONGLY_TYPED_BOOL(Auto);
+
 // Measures a duration while in scope. Adds this duration to specified histogram on destruction.
 class ScopedLatencyMetric {
  public:
-  // NOTE: the given histogram must live as long as this object.
   // If 'latency_hist' is NULL, this turns into a no-op.
-  explicit ScopedLatencyMetric(Histogram* latency_hist);
+  // automatic - automatically update histogram when object is destroyed.
+  explicit ScopedLatencyMetric(const scoped_refptr<Histogram>& latency_hist,
+                               Auto automatic = Auto::kTrue);
+
+  ScopedLatencyMetric(ScopedLatencyMetric&& rhs);
+  void operator=(ScopedLatencyMetric&& rhs);
+
+  ScopedLatencyMetric(const ScopedLatencyMetric&) = delete;
+  void operator=(const ScopedLatencyMetric&) = delete;
+
   ~ScopedLatencyMetric();
 
+  void Restart();
+  void Finish();
+
  private:
-  Histogram* latency_hist_;
+  scoped_refptr<Histogram> latency_hist_;
   MonoTime time_started_;
+  Auto auto_;
 };
 
 ////////////////////////////////////////////////////////////
@@ -1207,6 +1344,20 @@ inline scoped_refptr<AtomicGauge<T> > MetricEntity::FindOrCreateGauge(
 }
 
 template<typename T>
+inline scoped_refptr<AtomicGauge<T> > MetricEntity::FindOrCreateGauge(
+    std::unique_ptr<GaugePrototype<T>> proto,
+    const T& initial_value) {
+  CheckInstantiation(proto.get());
+  std::lock_guard<simple_spinlock> l(lock_);
+  auto m = down_cast<AtomicGauge<T>*>(FindPtrOrNull(metric_map_, proto.get()).get());
+  if (!m) {
+    m = new AtomicGauge<T>(std::move(proto), initial_value);
+    InsertOrDie(&metric_map_, m->prototype(), m);
+  }
+  return m;
+}
+
+template<typename T>
 inline scoped_refptr<FunctionGauge<T> > MetricEntity::FindOrCreateFunctionGauge(
     const GaugePrototype<T>* proto,
     const Callback<T()>& function) {
@@ -1220,6 +1371,37 @@ inline scoped_refptr<FunctionGauge<T> > MetricEntity::FindOrCreateFunctionGauge(
   }
   return m;
 }
+
+struct OwningMetricCtorArgs {
+  OwningMetricCtorArgs(
+      std::string entity_type_,
+      std::string name_,
+      std::string label_,
+      MetricUnit::Type unit_,
+      std::string description_,
+      uint32_t flags_ = 0)
+    : entity_type(std::move(entity_type_)), name(std::move(name_)), label(std::move(label_)),
+      unit(unit_), description(std::move(description_)), flags(flags_) {}
+
+  std::string entity_type;
+  std::string name;
+  std::string label;
+  MetricUnit::Type unit;
+  std::string description;
+  uint32_t flags;
+};
+
+template <class T>
+class OwningGaugePrototype : public OwningMetricCtorArgs, public GaugePrototype<T> {
+ public:
+  template <class... Args>
+  explicit OwningGaugePrototype(Args&&... args)
+      : OwningMetricCtorArgs(std::forward<Args>(args)...),
+        GaugePrototype<T>(MetricPrototype::CtorArgs(
+            OwningMetricCtorArgs::entity_type.c_str(), OwningMetricCtorArgs::name.c_str(),
+            OwningMetricCtorArgs::label.c_str(), unit, OwningMetricCtorArgs::description.c_str(),
+            flags)) {}
+};
 
 } // namespace yb
 

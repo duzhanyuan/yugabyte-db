@@ -15,6 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 //
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // The following only applies to changes made to this file as part of YugaByte development.
 //
 // Portions Copyright (c) YugaByte, Inc.
@@ -28,28 +40,25 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+
 #ifndef YB_UTIL_LOGGING_H
 #define YB_UTIL_LOGGING_H
 
+#include <fcntl.h>
+
+#include <mutex>
 #include <string>
+
 #include <glog/logging.h>
+#include <boost/preprocessor/cat.hpp>
+#include <boost/preprocessor/stringize.hpp>
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/walltime.h"
+#include "yb/util/fault_injection.h"
 #include "yb/util/logging_callback.h"
+#include "yb/util/monotime.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Throttled logging support
@@ -64,12 +73,25 @@
 // Example usage:
 //   YB_LOG_EVERY_N_SECS(WARNING, 1) << "server is low on memory" << THROTTLE_MSG;
 #define YB_LOG_EVERY_N_SECS(severity, n_secs) \
-  static logging_internal::LogThrottler LOG_THROTTLER;  \
+  static yb::logging_internal::LogThrottler LOG_THROTTLER;  \
   int num_suppressed = 0; \
   if (LOG_THROTTLER.ShouldLog(n_secs, &num_suppressed)) \
-    google::LogMessage( \
-      __FILE__, __LINE__, google::GLOG_ ## severity, num_suppressed, \
-      &google::LogMessage::SendToLog).stream()
+    BOOST_PP_CAT(GOOGLE_LOG_, severity)(num_suppressed).stream()
+
+#define YB_LOG_WITH_PREFIX_EVERY_N_SECS(severity, n_secs) \
+    YB_LOG_EVERY_N_SECS(severity, n_secs) << LogPrefix()
+
+#define YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(severity, n_secs) \
+    YB_LOG_EVERY_N_SECS(severity, n_secs) << LogPrefixUnlocked()
+
+// Logs a messages with 2 different severities. By default used severity1, but if during
+// duration there were more than count messages, then it will use severity2.
+#define YB_LOG_HIGHER_SEVERITY_WHEN_TOO_MANY(severity1, severity2, duration, count) \
+  static yb::logging_internal::LogRateThrottler LOG_THROTTLER(duration, count);  \
+  google::LogMessage( \
+    __FILE__, __LINE__, \
+    LOG_THROTTLER.TooMany() ? BOOST_PP_CAT(google::GLOG_, severity2) \
+                            : BOOST_PP_CAT(google::GLOG_, severity1)).stream()
 
 namespace yb {
 enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
@@ -124,10 +146,13 @@ enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
 
 // The direct user-facing macros.
 #define YB_LOG_EVERY_N(severity, n) \
-  GOOGLE_GLOG_COMPILE_ASSERT(google::GLOG_ ## severity < \
-                             google::NUM_SEVERITIES, \
-                             INVALID_REQUESTED_LOG_SEVERITY); \
+  static_assert(google::GLOG_ ## severity < google::NUM_SEVERITIES, \
+                "Invalid requested log severity"); \
   YB_SOME_KIND_OF_LOG_EVERY_N(severity, (n), google::LogMessage::SendToLog)
+
+#define YB_LOG_WITH_PREFIX_EVERY_N(severity, n) YB_LOG_EVERY_N(severity, n) << LogPrefix()
+#define YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N(severity, n) \
+    YB_LOG_EVERY_N(severity, n) << LogPrefixUnlocked()
 
 #define YB_SYSLOG_EVERY_N(severity, n) \
   YB_SOME_KIND_OF_LOG_EVERY_N(severity, (n), google::LogMessage::SendToSyslogAndLog)
@@ -162,9 +187,6 @@ enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
 #define LOG_IF_EVERY_N(severity, condition, n) \
   GOOGLE_GLOG_COMPILE_ASSERT(false, "LOG_IF_EVERY_N is deprecated. Please use YB_LOG_IF_EVERY_N.")
 
-
-
-
 namespace yb {
 
 // glog doesn't allow multiple invocations of InitGoogleLogging. This method conditionally
@@ -179,6 +201,11 @@ void InitGoogleLoggingSafe(const char* arg);
 //
 // These properties make it attractive for us in libraries.
 void InitGoogleLoggingSafeBasic(const char* arg);
+
+// Check if Google Logging has been initialized. Can be used e.g. to determine whether to print
+// something to stderr or log it. The implementation takes the logging mutex, so should not be used
+// in hot codepaths.
+bool IsLoggingInitialized();
 
 // Demotes stderr logging to ERROR or higher and registers 'cb' as the
 // recipient for all log events.
@@ -205,7 +232,11 @@ void ShutdownLoggingSafe();
 // Writes all command-line flags to the log at level INFO.
 void LogCommandLineFlags();
 
+// Internal function. Used by tooling for integrating with PostgreSQL C codebase.
+void InitializeGoogleLogging(const char *arg);
+
 namespace logging_internal {
+
 // Internal implementation class used for throttling log messages.
 class LogThrottler {
  public:
@@ -227,6 +258,24 @@ class LogThrottler {
   Atomic32 num_suppressed_;
   uint64_t last_ts_;
 };
+
+// Utility class that is used by YB_LOG_HIGHER_SEVERITY_WHEN_TOO_MANY macros.
+class LogRateThrottler {
+ public:
+  LogRateThrottler(const CoarseMonoClock::duration& duration, int count)
+      : duration_(duration), queue_(count) {}
+
+  bool TooMany();
+ private:
+  std::mutex mutex_;
+  CoarseMonoClock::duration duration_;
+  // Use manual queue implementation to avoid including too heavy boost/circular_buffer
+  // to this very frequently used header.
+  std::vector<CoarseMonoClock::time_point> queue_;
+  size_t head_ = 0;
+  size_t count_ = 0;
+};
+
 } // namespace logging_internal
 
 std::ostream& operator<<(std::ostream &os, const PRIVATE_ThrottleMsg&);
@@ -241,8 +290,10 @@ std::ostream& operator<<(std::ostream &os, const PRIVATE_ThrottleMsg&);
 
 // Same as the above, but obtain the lock.
 #define LOG_WITH_PREFIX(severity) LOG(severity) << LogPrefix()
-#define VLOG_WITH_PREFIX(verboselevel) LOG_IF(INFO, VLOG_IS_ON(verboselevel)) << LogPrefix()
+#define VLOG_WITH_PREFIX(verboselevel) VLOG(verboselevel) << LogPrefix()
+#define DVLOG_WITH_PREFIX(verboselevel) DVLOG(verboselevel) << LogPrefix()
 #define LOG_IF_WITH_PREFIX(severity, condition) LOG_IF(severity, condition) << LogPrefix()
+#define VLOG_IF_WITH_PREFIX(verboselevel, condition) VLOG_IF(verboselevel, condition) << LogPrefix()
 
 // DCHECK_ONLY_NOTNULL is like DCHECK_NOTNULL, but does not result in an unused expression in
 // release mode, so it is suitable for being used as a stand-alone statement. In other words, use
@@ -273,6 +324,27 @@ std::ostream& operator<<(std::ostream &os, const PRIVATE_ThrottleMsg&);
     LOG(FATAL) << (msg); \
     abort(); \
   } while (false)
+
+void DisableCoreDumps();
+
+// Get the path prefix for files that will contain details of a fatal crash (message and stack
+// trace). This is based on the --fatal_details_path_prefix flag and the
+// YB_FATAL_DETAILS_PATH_PREFIX environment variable. If neither of those are set, the result is
+// based on the FATAL log path.
+string GetFatalDetailsPathPrefix();
+
+// Implements special handling for LOG(FATAL) and CHECK failures, such as disabling core dumps and
+// printing the failure stack trace into a separate file.
+class LogFatalHandlerSink : public google::LogSink {
+ public:
+  LogFatalHandlerSink();
+  ~LogFatalHandlerSink();
+  void send(google::LogSeverity severity, const char* /* full_filename */,
+            const char* base_filename, int line, const struct tm* tm_time, const char* message,
+            size_t message_len) override;
+};
+
+#define EXPR_VALUE_FOR_LOG(expr) BOOST_PP_STRINGIZE(expr) << "=" << (yb::ToString(expr))
 
 } // namespace yb
 

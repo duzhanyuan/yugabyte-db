@@ -31,7 +31,6 @@ namespace itest {
 
 using client::YBClient;
 using client::YBClientBuilder;
-using client::YBScanner;
 using client::YBTable;
 using integration_tests::YBTableTestBase;
 using std::shared_ptr;
@@ -66,10 +65,10 @@ TEST_F(StepDownUnderLoadTest, TestStepDownUnderLoad) {
   static constexpr bool kStopOnEmptyRead = true;
 
   // Create two separate clients for read and writes.
-  shared_ptr<YBClient> write_client = CreateYBClient();
-  shared_ptr<YBClient> read_client = CreateYBClient();
-  yb::load_generator::YBSessionFactory write_session_factory(write_client.get(), table_.get());
-  yb::load_generator::YBSessionFactory read_session_factory(read_client.get(), table_.get());
+  auto write_client = CreateYBClient();
+  auto read_client = CreateYBClient();
+  yb::load_generator::YBSessionFactory write_session_factory(write_client.get(), &table_);
+  yb::load_generator::YBSessionFactory read_session_factory(read_client.get(), &table_);
 
   yb::load_generator::MultiThreadedWriter writer(kRows, kStartKey, kWriterThreads,
                                                  &write_session_factory, &stop_requested_flag,
@@ -83,7 +82,7 @@ TEST_F(StepDownUnderLoadTest, TestStepDownUnderLoad) {
 
   auto* const emc = external_mini_cluster();
   TabletServerMap ts_map;
-  ASSERT_OK(itest::CreateTabletServerMap(emc->master_proxy().get(), emc->messenger(), &ts_map));
+  ASSERT_OK(itest::CreateTabletServerMap(emc->master_proxy().get(), &emc->proxy_cache(), &ts_map));
 
   vector<TabletId> tablet_ids;
   {

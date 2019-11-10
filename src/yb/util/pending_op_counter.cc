@@ -16,24 +16,31 @@
 #include <glog/logging.h>
 
 #include "yb/gutil/strings/substitute.h"
-#include "yb/util/monotime.h"
-#include "yb/util/status.h"
 
 using strings::Substitute;
 
 namespace yb {
 namespace util {
 
+uint64_t PendingOperationCounter::Update(uint64_t delta) {
+  const uint64_t result = counters_.fetch_add(delta, std::memory_order::memory_order_release);
+  VLOG(2) << "[" << this << "] Update(" << static_cast<int64_t>(delta) << "), result = " << result;
+  // Ensure that there is no underflow in either counter.
+  DCHECK_EQ((result & (1ull << 63)), 0); // Counter of DisableAndWaitForOps() calls.
+  DCHECK_EQ((result & (kDisabledDelta >> 1)), 0); // Counter of pending operations.
+  return result;
+}
+
 // The implementation is based on OperationTracker::WaitForAllToFinish.
-Status PendingOperationCounter::WaitForAllOpsToFinish(const MonoDelta& timeout) const {
+Status PendingOperationCounter::WaitForOpsToFinish(const MonoDelta& timeout) {
   const int complain_ms = 1000;
-  MonoTime start_time = MonoTime::Now(MonoTime::FINE);
+  const MonoTime start_time = MonoTime::Now();
   int64_t num_pending_ops = 0;
   int num_complaints = 0;
   int wait_time_usec = 250;
-  while ((num_pending_ops = Get()) > 0) {
-    const MonoDelta diff = MonoTime::Now(MonoTime::FINE).GetDeltaSince(start_time);
-    if (diff.MoreThan(timeout)) {
+  while ((num_pending_ops = GetOpCounter()) > 0) {
+    const MonoDelta diff = MonoTime::Now() - start_time;
+    if (diff > timeout) {
       return STATUS(TimedOut, Substitute(
           "Timed out waiting for all pending operations to complete. "
           "$0 transactions pending. Waited for $1",
@@ -48,7 +55,13 @@ Status PendingOperationCounter::WaitForAllOpsToFinish(const MonoDelta& timeout) 
     wait_time_usec = std::min(wait_time_usec * 5 / 4, 1000000);
     SleepFor(MonoDelta::FromMicroseconds(wait_time_usec));
   }
-  CHECK_EQ(num_pending_ops, 0) << "Number of pending operations must be non-negative.";
+  CHECK_EQ(num_pending_ops, 0) << "Number of pending operations must be 0";
+
+  const MonoTime deadline = start_time + timeout;
+  if (PREDICT_FALSE(!disable_.try_lock_until(deadline.ToSteadyTimePoint()))) {
+    return STATUS(TimedOut, "Timed out waiting to disable the resource exclusively");
+  }
+
   return Status::OK();
 }
 

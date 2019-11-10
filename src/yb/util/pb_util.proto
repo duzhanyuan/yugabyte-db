@@ -29,6 +29,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+syntax = "proto2";
+
 package yb;
 
 option java_package = "org.yb";
@@ -50,6 +52,6 @@ message ContainerSupHeaderPB {
   required google.protobuf.FileDescriptorSet protos = 1;
 
   // The PB message type expected in each data entry in this container. Must
-  // be fully qualified (i.e. yb.tablet.TabletSuperBlockPB).
+  // be fully qualified (i.e. yb.tablet.RaftGroupReplicaSuperBlockPB).
   required string pb_type = 2;
 }

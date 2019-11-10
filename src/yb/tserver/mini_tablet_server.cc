@@ -33,26 +33,34 @@
 #include "yb/tserver/mini_tablet_server.h"
 
 #include <utility>
+#include <functional>
 
 #include <glog/logging.h>
 
-#include "yb/common/schema.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/common/schema.h"
+#include "yb/consensus/log.h"
+#include "yb/consensus/log.pb.h"
+#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus.pb.h"
+
+#include "yb/rpc/messenger.h"
+
 #include "yb/server/metadata.h"
 #include "yb/server/rpc_server.h"
 #include "yb/server/webserver.h"
+
 #include "yb/tablet/maintenance_manager.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet-test-util.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
-#include "yb/consensus/log.h"
-#include "yb/consensus/log.pb.h"
-#include "yb/consensus/consensus.h"
-#include "yb/consensus/consensus.pb.h"
+
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/net/tunnel.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 
 using std::pair;
@@ -65,22 +73,33 @@ using yb::consensus::RaftConfigPB;
 using yb::log::Log;
 using yb::log::LogOptions;
 using strings::Substitute;
+using yb::tablet::TabletPeer;
 
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
+DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 
 namespace yb {
 namespace tserver {
 
 MiniTabletServer::MiniTabletServer(const string& fs_root,
                                    uint16_t rpc_port,
-                                   const TabletServerOptions& extra_opts)
+                                   const TabletServerOptions& extra_opts,
+                                   int index)
   : started_(false),
-    opts_(extra_opts) {
+    opts_(extra_opts),
+    index_(index + 1) {
 
   // Start RPC server on loopback.
   FLAGS_rpc_server_allow_ephemeral_ports = true;
-  opts_.rpc_opts.rpc_bind_addresses = Substitute("127.0.0.1:$0", rpc_port);
+  opts_.rpc_opts.rpc_bind_addresses = server::TEST_RpcBindEndpoint(index_, rpc_port);
+  // A.B.C.D.xip.io resolves to A.B.C.D so it is very useful for testing.
+  opts_.broadcast_addresses = {
+      HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
   opts_.webserver_opts.port = 0;
+  opts_.webserver_opts.bind_interface = opts_.broadcast_addresses.front().host();
+  if (!opts_.has_placement_cloud()) {
+    opts_.SetPlacement(Format("cloud$0", (index_ + 1) / 2), Format("rack$0", index_), "zone");
+  }
   opts_.fs_opts.wal_paths = { fs_root };
   opts_.fs_opts.data_paths = { fs_root };
 }
@@ -88,16 +107,50 @@ MiniTabletServer::MiniTabletServer(const string& fs_root,
 MiniTabletServer::~MiniTabletServer() {
 }
 
+Result<std::unique_ptr<MiniTabletServer>> MiniTabletServer::CreateMiniTabletServer(
+    const string& fs_root, uint16_t rpc_port, int index) {
+  auto options_result = TabletServerOptions::CreateTabletServerOptions();
+  RETURN_NOT_OK(options_result);
+  return std::make_unique<MiniTabletServer>(fs_root, rpc_port, *options_result, index);
+}
+
 Status MiniTabletServer::Start() {
   CHECK(!started_);
 
-  gscoped_ptr<TabletServer> server(new YB_EDITION_NS_PREFIX TabletServer(opts_));
+  gscoped_ptr<TabletServer> server(new enterprise::TabletServer(opts_));
   RETURN_NOT_OK(server->Init());
+
+  server::TEST_SetupConnectivity(server->messenger(), index_);
+
   RETURN_NOT_OK(server->Start());
 
   server_.swap(server);
+
+  tunnel_ = std::make_unique<Tunnel>(&server_->messenger()->io_service());
+  auto se = ScopeExit([this] {
+    if (!started_) {
+      tunnel_->Shutdown();
+    }
+  });
+
+  std::vector<Endpoint> local;
+  RETURN_NOT_OK(opts_.broadcast_addresses[0].ResolveAddresses(&local));
+  Endpoint remote = VERIFY_RESULT(ParseEndpoint(opts_.rpc_opts.rpc_bind_addresses, 0));
+  RETURN_NOT_OK(tunnel_->Start(
+      local.front(), remote, [messenger = server_->messenger()](const IpAddress& address) {
+    return !messenger->TEST_ShouldArtificiallyRejectIncomingCallsFrom(address);
+  }));
+
   started_ = true;
   return Status::OK();
+}
+
+void MiniTabletServer::SetIsolated(bool isolated) {
+  if (isolated) {
+    server::TEST_Isolate(server_->messenger());
+  } else {
+    server::TEST_SetupConnectivity(server_->messenger(), index_);
+  }
 }
 
 Status MiniTabletServer::WaitStarted() {
@@ -105,36 +158,85 @@ Status MiniTabletServer::WaitStarted() {
 }
 
 void MiniTabletServer::Shutdown() {
+  if (tunnel_) {
+    tunnel_->Shutdown();
+  }
   if (started_) {
+    // Save bind address and port so we can later restart the server.
+    opts_.rpc_opts.rpc_bind_addresses = server::TEST_RpcBindEndpoint(
+        index_, bound_rpc_addr().port());
+    opts_.webserver_opts.port = bound_http_addr().port();
     server_->Shutdown();
+    tunnel_.reset();
     server_.reset();
   }
   started_ = false;
 }
 
-void MiniTabletServer::FlushTablets() {
-  std::vector<tablet::TabletPeerPtr> tablets;
-  server_->tablet_manager()->GetTabletPeers(&tablets);
-  for (const auto& tablet : tablets) {
-    CHECK_OK(tablet->tablet()->Flush(tablet::FlushMode::kSync));
+namespace {
+
+CHECKED_STATUS ForAllTablets(
+    MiniTabletServer* mts,
+    std::function<Status(TabletPeer* tablet_peer)> action) {
+  if (!mts->server()) {
+    return STATUS(IllegalState, "Server is not running");
   }
+  auto tablets = mts->server()->tablet_manager()->GetTabletPeers();
+  for (const auto& tablet : tablets) {
+    RETURN_NOT_OK(action(tablet.get()));
+  }
+  return Status::OK();
 }
 
-void MiniTabletServer::CleanTabletLogs() {
-  std::vector<tablet::TabletPeerPtr> tablets;
-  server_->tablet_manager()->GetTabletPeers(&tablets);
-  for (const auto& tablet : tablets) {
-    CHECK_OK(tablet->RunLogGC());
+}  // namespace
+
+Status MiniTabletServer::FlushTablets(tablet::FlushMode mode, tablet::FlushFlags flags) {
+  if (!server_) {
+    return Status::OK();
   }
+  return ForAllTablets(this, [mode, flags](TabletPeer* tablet_peer) -> Status {
+    if (!tablet_peer->tablet()) {
+      return Status::OK();
+    }
+    return tablet_peer->tablet()->Flush(mode, flags);
+  });
+}
+
+Status MiniTabletServer::CompactTablets() {
+  if (!server_) {
+    return Status::OK();
+  }
+  return ForAllTablets(this, [](TabletPeer* tablet_peer) {
+    tablet_peer->tablet()->ForceRocksDBCompactInTest();
+    return Status::OK();
+  });
+}
+
+Status MiniTabletServer::SwitchMemtables() {
+  return ForAllTablets(this, [](TabletPeer* tablet_peer) {
+    return tablet_peer->tablet()->TEST_SwitchMemtable();
+  });
+}
+
+Status MiniTabletServer::CleanTabletLogs() {
+  if (!server_) {
+    // Nothing to clean.
+    return Status::OK();
+  }
+  return ForAllTablets(this, [](TabletPeer* tablet_peer) {
+    return tablet_peer->RunLogGC();
+  });
 }
 
 Status MiniTabletServer::Restart() {
   CHECK(started_);
-  opts_.rpc_opts.rpc_bind_addresses = Substitute("127.0.0.1:$0", bound_rpc_addr().port());
-  opts_.webserver_opts.port = bound_http_addr().port();
   Shutdown();
-  RETURN_NOT_OK(Start());
-  return Status::OK();
+  return Start();
+}
+
+Status MiniTabletServer::RestartStoppedServer() {
+  Shutdown();
+  return Start();
 }
 
 RaftConfigPB MiniTabletServer::CreateLocalConfig() const {
@@ -142,8 +244,10 @@ RaftConfigPB MiniTabletServer::CreateLocalConfig() const {
   RaftConfigPB config;
   RaftPeerPB* peer = config.add_peers();
   peer->set_permanent_uuid(server_->instance_pb().permanent_uuid());
-  peer->mutable_last_known_addr()->set_host(bound_rpc_addr().address().to_string());
-  peer->mutable_last_known_addr()->set_port(bound_rpc_addr().port());
+  peer->set_member_type(RaftPeerPB::VOTER);
+  auto host_port = peer->mutable_last_known_private_addr()->Add();
+  host_port->set_host(bound_rpc_addr().address().to_string());
+  host_port->set_port(bound_rpc_addr().port());
   return config;
 }
 
@@ -164,7 +268,7 @@ Status MiniTabletServer::AddTestTablet(const std::string& table_id,
   pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(schema_with_ids);
 
   return server_->tablet_manager()->CreateNewTablet(table_id, tablet_id, partition.second, table_id,
-    table_type, schema_with_ids, partition.first, config, nullptr);
+    table_type, schema_with_ids, partition.first, boost::none /* index_info */, config, nullptr);
 }
 
 void MiniTabletServer::FailHeartbeats() {

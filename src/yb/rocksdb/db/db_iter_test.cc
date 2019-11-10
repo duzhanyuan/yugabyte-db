@@ -33,7 +33,7 @@
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/table/iterator_wrapper.h"
 #include "yb/rocksdb/table/merger.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/utilities/merge_operators.h"
@@ -47,7 +47,11 @@ class TestIterator : public InternalIterator {
         valid_(false),
         sequence_number_(0),
         iter_(0),
-        cmp(comparator) {}
+        cmp(comparator) {
+    // Reserve memory to avoid re-allocations, so key() slice returned by iterator will remain
+    // valid when more key-value pair are added.
+    data_.reserve(256);
+  }
 
   void AddPut(std::string argkey, std::string argvalue) {
     Add(argkey, kTypeValue, argvalue);
@@ -353,8 +357,8 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
         7, options.max_sequential_skip_in_iterations, 0,
         ro.iterate_upper_bound));
 
-    SetPerfLevel(kEnableCount);
-    ASSERT_TRUE(GetPerfLevel() == kEnableCount);
+    SetPerfLevel(PerfLevel::kEnableCount);
+    ASSERT_TRUE(GetPerfLevel() == PerfLevel::kEnableCount);
 
     perf_context.Reset();
     db_iter->SeekToLast();
@@ -363,7 +367,7 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ASSERT_EQ(static_cast<int>(perf_context.internal_key_skipped_count), 1);
     ASSERT_EQ(db_iter->key().ToString(), "b");
 
-    SetPerfLevel(kDisable);
+    SetPerfLevel(PerfLevel::kDisable);
   }
   // Test to check the SeekToLast() with the iterate_upper_bound set
   // (Checking the value of the key which has sequence ids greater than
@@ -476,8 +480,8 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
         7, options.max_sequential_skip_in_iterations, 0,
         ro.iterate_upper_bound));
 
-    SetPerfLevel(kEnableCount);
-    ASSERT_TRUE(GetPerfLevel() == kEnableCount);
+    SetPerfLevel(PerfLevel::kEnableCount);
+    ASSERT_TRUE(GetPerfLevel() == PerfLevel::kEnableCount);
 
     perf_context.Reset();
     db_iter->SeekToLast();
@@ -486,7 +490,7 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ASSERT_EQ(static_cast<int>(perf_context.internal_delete_skipped_count), 0);
     ASSERT_EQ(db_iter->key().ToString(), "b");
 
-    SetPerfLevel(kDisable);
+    SetPerfLevel(PerfLevel::kDisable);
   }
 
   {

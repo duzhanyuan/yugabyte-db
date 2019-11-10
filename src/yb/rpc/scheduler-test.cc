@@ -23,6 +23,7 @@
 #include "yb/rpc/scheduler.h"
 
 #include "yb/util/countdown_latch.h"
+#include "yb/util/memory/memory.h"
 #include "yb/util/tostring.h"
 
 namespace yb {
@@ -35,7 +36,7 @@ using namespace std::literals;
 class SchedulerTest : public RpcTestBase {
  public:
   void SetUp() override {
-    pool_.emplace(1);
+    pool_.emplace("test", 1);
     scheduler_.emplace(&pool_->io_service());
   }
 
@@ -59,8 +60,9 @@ auto SetPromiseValueToStatusFunctor(std::promise<Status>* promise) {
 TEST_F(SchedulerTest, TestFunctionIsCalled) {
   for (int i = 0; i != kCycles; ++i) {
     std::promise<Status> promise;
+    auto future = promise.get_future();
     scheduler_->Schedule(SetPromiseValueToStatusFunctor(&promise), 0s);
-    ASSERT_OK(promise.get_future().get());
+    ASSERT_OK(future.get());
   }
 }
 
@@ -71,8 +73,9 @@ TEST_F(SchedulerTest, TestFunctionIsCalledAtTheRightTime) {
     auto before = std::chrono::steady_clock::now();
     auto delay = 50ms;
     std::promise<Status> promise;
+    auto future = promise.get_future();
     scheduler_->Schedule(SetPromiseValueToStatusFunctor(&promise), delay);
-    ASSERT_OK(promise.get_future().get());
+    ASSERT_OK(future.get());
     auto after = std::chrono::steady_clock::now();
     auto delta = after - before;
 #if defined(OS_MACOSX)
@@ -87,18 +90,18 @@ TEST_F(SchedulerTest, TestFunctionIsCalledAtTheRightTime) {
 
 TEST_F(SchedulerTest, TestFunctionIsCalledIfReactorShutdown) {
   std::promise<Status> promise;
+  auto future = promise.get_future();
   scheduler_->Schedule(SetPromiseValueToStatusFunctor(&promise), 60s);
   scheduler_->Shutdown();
-  auto status = promise.get_future().get();
-  ASSERT_TRUE(status.IsAborted());
+  ASSERT_TRUE(future.get().IsAborted());
 }
 
 TEST_F(SchedulerTest, Abort) {
   for (int i = 0; i != kCycles; ++i) {
     std::promise<Status> promise;
+    auto future = promise.get_future();
     auto task_id = scheduler_->Schedule(SetPromiseValueToStatusFunctor(&promise), 1s);
     scheduler_->Abort(task_id);
-    auto future = promise.get_future();
     ASSERT_EQ(std::future_status::ready, future.wait_for(100ms));
     auto status = future.get();
     ASSERT_TRUE(status.IsAborted());

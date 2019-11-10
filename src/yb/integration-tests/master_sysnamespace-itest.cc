@@ -36,12 +36,14 @@ class MasterSysNamespaceTest : public YBTest {
     cluster_.reset(new MiniCluster(env_.get(), opts));
     ASSERT_OK(cluster_->Start());
     rpc::MessengerBuilder bld("Client");
-    ASSERT_OK(bld.Build().MoveTo(&client_messenger_));
-    proxy_.reset(new MasterServiceProxy(client_messenger_,
+    client_messenger_ = ASSERT_RESULT(bld.Build());
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
+    proxy_.reset(new MasterServiceProxy(&proxy_cache,
                                         cluster_->leader_mini_master()->bound_rpc_addr()));
   }
 
   void TearDown() override {
+    client_messenger_->Shutdown();
     if (cluster_) {
       cluster_->Shutdown();
       cluster_.reset();
@@ -56,22 +58,21 @@ class MasterSysNamespaceTest : public YBTest {
     ASSERT_EQ(3, locs_pb.replicas_size());
     for (const TabletLocationsPB::ReplicaPB& replica : locs_pb.replicas()) {
       if (replica.role() == consensus::RaftPeerPB::LEADER) {
-        ASSERT_EQ(cluster_->leader_mini_master()->bound_rpc_addr().address().to_string(),
-                  replica.ts_info().rpc_addresses(0).host());
+        ASSERT_EQ(cluster_->leader_mini_master()->bound_rpc_addr().host(),
+                  replica.ts_info().private_rpc_addresses(0).host());
         ASSERT_EQ(cluster_->leader_mini_master()->bound_rpc_addr().port(),
-                  replica.ts_info().rpc_addresses(0).port());
+                  replica.ts_info().private_rpc_addresses(0).port());
         ASSERT_EQ(cluster_->leader_mini_master()->permanent_uuid(),
                   replica.ts_info().permanent_uuid());
       } else {
         // Search for appropriate master.
         int i;
         for (i = 0; i < cluster_->num_masters(); i++) {
-          if (cluster_->mini_master(i)->permanent_uuid() ==
-              replica.ts_info().permanent_uuid()) {
-            ASSERT_EQ(cluster_->mini_master(i)->bound_rpc_addr().address().to_string(),
-                      replica.ts_info().rpc_addresses(0).host());
+          if (cluster_->mini_master(i)->permanent_uuid() == replica.ts_info().permanent_uuid()) {
+            ASSERT_EQ(cluster_->mini_master(i)->bound_rpc_addr().host(),
+                      replica.ts_info().private_rpc_addresses(0).host());
             ASSERT_EQ(cluster_->mini_master(i)->bound_rpc_addr().port(),
-                      replica.ts_info().rpc_addresses(0).port());
+                      replica.ts_info().private_rpc_addresses(0).port());
             ASSERT_EQ(consensus::RaftPeerPB::FOLLOWER, replica.role());
             break;
           }
@@ -89,7 +90,7 @@ class MasterSysNamespaceTest : public YBTest {
 
   std::unique_ptr<MiniCluster> cluster_;
   std::unique_ptr<MasterServiceProxy> proxy_;
-  std::shared_ptr<rpc::Messenger> client_messenger_;
+  std::unique_ptr<rpc::Messenger> client_messenger_;
 };
 
 TEST_F(MasterSysNamespaceTest, TestSysNamespace) {

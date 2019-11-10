@@ -34,6 +34,8 @@
 #include <set>
 #include <string>
 
+#include "yb/consensus/consensus_meta.h"
+
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/util/status.h"
@@ -96,11 +98,44 @@ Status GetRaftConfigLeader(const ConsensusStatePB& cstate, RaftPeerPB* peer_pb) 
   return GetRaftConfigMember(cstate.config(), cstate.leader_uuid(), peer_pb);
 }
 
-bool RemoveFromRaftConfig(RaftConfigPB* config, const string& uuid) {
+Status GetHostPortFromConfig(const RaftConfigPB& config, const std::string& uuid,
+                             const CloudInfoPB& from, HostPort* hp) {
+  if (!hp) {
+    return STATUS(InvalidArgument, "Need a non-null hostport.");
+  }
+  for (const RaftPeerPB& peer : config.peers()) {
+    if (peer.permanent_uuid() == uuid) {
+      *hp = HostPortFromPB(DesiredHostPort(peer, from));
+      return Status::OK();
+    }
+  }
+  return STATUS(NotFound, Substitute("Consensus config did not find $0.", uuid));
+}
+
+bool RemoveFromRaftConfig(RaftConfigPB* config, const ChangeConfigRequestPB& req) {
   RepeatedPtrField<RaftPeerPB> modified_peers;
   bool removed = false;
+  bool use_host = req.has_use_host() && req.use_host();
+  const HostPortPB* hp = nullptr;
+  if (use_host) {
+    if (req.server().last_known_private_addr().size() != 1) {
+      LOG(WARNING) << "Remove from raft config with invalid host specified: "
+                << req.server().ShortDebugString();
+      return false;
+    }
+    hp = &req.server().last_known_private_addr()[0];
+    LOG(INFO) << "Using host/port " << hp->ShortDebugString() << " instead of UUID";
+  }
+  const std::string& uuid = req.server().permanent_uuid();
   for (const RaftPeerPB& peer : config->peers()) {
-    if (peer.permanent_uuid() == uuid) {
+    bool matches;
+    if (use_host) {
+      matches = HasHostPortPB(peer.last_known_private_addr(), *hp) ||
+                HasHostPortPB(peer.last_known_broadcast_addr(), *hp);
+    } else {
+      matches = peer.permanent_uuid() == uuid;
+    }
+    if (matches) {
       removed = true;
       continue;
     }
@@ -140,6 +175,16 @@ int MajoritySize(int num_voters) {
   return (num_voters / 2) + 1;
 }
 
+RaftPeerPB::MemberType GetConsensusMemberType(const std::string& permanent_uuid,
+                                              const ConsensusStatePB& cstate) {
+  for (const RaftPeerPB& peer : cstate.config().peers()) {
+    if (peer.permanent_uuid() == permanent_uuid) {
+      return peer.member_type();
+    }
+  }
+  return RaftPeerPB::UNKNOWN_MEMBER_TYPE;
+}
+
 RaftPeerPB::Role GetConsensusRole(const std::string& permanent_uuid,
                                   const ConsensusStatePB& cstate) {
   if (cstate.leader_uuid() == permanent_uuid) {
@@ -155,11 +200,13 @@ RaftPeerPB::Role GetConsensusRole(const std::string& permanent_uuid,
         case RaftPeerPB::VOTER:
           return RaftPeerPB::FOLLOWER;
 
-        // PRE_VOTER, PRE_OBSERVER, and OBSERVER peers are considered LEARNERs.
+        // PRE_VOTER, PRE_OBSERVER peers are considered LEARNERs.
         case RaftPeerPB::PRE_VOTER:
         case RaftPeerPB::PRE_OBSERVER:
-        case RaftPeerPB::OBSERVER:
           return RaftPeerPB::LEARNER;
+
+        case RaftPeerPB::OBSERVER:
+          return RaftPeerPB::READ_REPLICA;
 
         case RaftPeerPB::UNKNOWN_MEMBER_TYPE:
          return RaftPeerPB::UNKNOWN_ROLE;
@@ -206,7 +253,7 @@ Status VerifyRaftConfig(const RaftConfigPB& config, RaftConfigState type) {
     }
     uuids.insert(peer.permanent_uuid());
 
-    if (num_peers > 1 && !peer.has_last_known_addr()) {
+    if (num_peers > 1 && peer.last_known_private_addr().empty()) {
       return STATUS(IllegalState,
           Substitute("Peer: $0 has no address. RaftConfig: $1",
                      peer.permanent_uuid(), config.ShortDebugString()));

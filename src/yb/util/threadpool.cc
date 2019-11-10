@@ -30,7 +30,9 @@
 // under the License.
 //
 
+#include <algorithm>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 
@@ -38,10 +40,14 @@
 #include <glog/logging.h>
 
 #include "yb/gutil/callback.h"
+#include "yb/gutil/macros.h"
+#include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/sysinfo.h"
+#include "yb/util/errno.h"
 #include "yb/util/metrics.h"
+#include "yb/util/stopwatch.h"
 #include "yb/util/thread.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/trace.h"
@@ -52,24 +58,8 @@ using strings::Substitute;
 using std::unique_ptr;
 
 ////////////////////////////////////////////////////////
-// FunctionRunnable
-////////////////////////////////////////////////////////
-
-class FunctionRunnable : public Runnable {
- public:
-  explicit FunctionRunnable(std::function<void()> func) : func_(std::move(func)) {}
-
-  void Run() override {
-    func_();
-  }
-
- private:
-  std::function<void()> func_;
-};
-
-////////////////////////////////////////////////////////
 // ThreadPoolBuilder
-////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////
 
 ThreadPoolBuilder::ThreadPoolBuilder(std::string name)
     : name_(std::move(name)),
@@ -85,14 +75,24 @@ ThreadPoolBuilder& ThreadPoolBuilder::set_min_threads(int min_threads) {
 }
 
 ThreadPoolBuilder& ThreadPoolBuilder::set_max_threads(int max_threads) {
-  CHECK_GT(max_threads, 0);
+  CHECK_GE(max_threads, 0);
   max_threads_ = max_threads;
   return *this;
 }
 
+ThreadPoolBuilder& ThreadPoolBuilder::unlimited_threads() {
+  max_threads_ = std::numeric_limits<int>::max();
+  return *this;
+}
+
 ThreadPoolBuilder& ThreadPoolBuilder::set_max_queue_size(int max_queue_size) {
-  CHECK_GT(max_queue_size, 0);
+  CHECK_GE(max_queue_size, 0);
   max_queue_size_ = max_queue_size;
+  return *this;
+}
+
+ThreadPoolBuilder& ThreadPoolBuilder::set_metrics(ThreadPoolMetrics metrics) {
+  metrics_ = std::move(metrics);
   return *this;
 }
 
@@ -114,6 +114,180 @@ Status ThreadPoolBuilder::Build(unique_ptr<ThreadPool>* pool) const {
 }
 
 ////////////////////////////////////////////////////////
+// ThreadPoolToken
+////////////////////////////////////////////////////////
+
+ThreadPoolToken::ThreadPoolToken(ThreadPool* pool,
+                                 ThreadPool::ExecutionMode mode,
+                                 ThreadPoolMetrics metrics)
+    : mode_(mode),
+      pool_(pool),
+      metrics_(std::move(metrics)),
+      state_(ThreadPoolTokenState::kIdle),
+      not_running_cond_(&pool->lock_),
+      active_threads_(0) {
+}
+
+ThreadPoolToken::~ThreadPoolToken() {
+  Shutdown();
+  pool_->ReleaseToken(this);
+}
+
+Status ThreadPoolToken::SubmitClosure(Closure c) {
+  return Submit(std::make_shared<FunctionRunnable>((std::bind(&Closure::Run, c))));
+}
+
+Status ThreadPoolToken::SubmitFunc(std::function<void()> f) {
+  return Submit(std::make_shared<FunctionRunnable>(std::move(f)));
+}
+
+Status ThreadPoolToken::Submit(std::shared_ptr<Runnable> r) {
+  return pool_->DoSubmit(std::move(r), this);
+}
+
+void ThreadPoolToken::Shutdown() {
+  MutexLock unique_lock(pool_->lock_);
+  pool_->CheckNotPoolThreadUnlocked();
+
+  // Clear the queue under the lock, but defer the releasing of the tasks
+  // outside the lock, in case there are concurrent threads wanting to access
+  // the ThreadPool. The task's destructors may acquire locks, etc, so this
+  // also prevents lock inversions.
+  deque<ThreadPool::Task> to_release = std::move(entries_);
+  pool_->total_queued_tasks_ -= to_release.size();
+
+  switch (state()) {
+    case ThreadPoolTokenState::kIdle:
+      // There were no tasks outstanding; we can quiesce the token immediately.
+      Transition(ThreadPoolTokenState::kQuiesced);
+      break;
+    case ThreadPoolTokenState::kRunning:
+      // There were outstanding tasks. If any are still running, switch to
+      // kQuiescing and wait for them to finish (the worker thread executing
+      // the token's last task will switch the token to kQuiesced). Otherwise,
+      // we can quiesce the token immediately.
+
+      // Note: this is an O(n) operation, but it's expected to be infrequent.
+      // Plus doing it this way (rather than switching to kQuiescing and waiting
+      // for a worker thread to process the queue entry) helps retain state
+      // transition symmetry with ThreadPool::Shutdown.
+      for (auto it = pool_->queue_.begin(); it != pool_->queue_.end();) {
+        if (*it == this) {
+          it = pool_->queue_.erase(it);
+        } else {
+          it++;
+        }
+      }
+
+      if (active_threads_ == 0) {
+        Transition(ThreadPoolTokenState::kQuiesced);
+        break;
+      }
+      Transition(ThreadPoolTokenState::kQuiescing);
+      FALLTHROUGH_INTENDED;
+    case ThreadPoolTokenState::kQuiescing:
+      // The token is already quiescing. Just wait for a worker thread to
+      // switch it to kQuiesced.
+      while (state() != ThreadPoolTokenState::kQuiesced) {
+        not_running_cond_.Wait();
+      }
+      break;
+    default:
+      break;
+  }
+
+  // Finally release the queued tasks, outside the lock.
+  unique_lock.Unlock();
+  for (auto& t : to_release) {
+    if (t.trace) {
+      t.trace->Release();
+    }
+  }
+}
+
+void ThreadPoolToken::Wait() {
+  MutexLock unique_lock(pool_->lock_);
+  pool_->CheckNotPoolThreadUnlocked();
+  while (IsActive()) {
+    not_running_cond_.Wait();
+  }
+}
+
+bool ThreadPoolToken::WaitUntil(const MonoTime& until) {
+  MutexLock unique_lock(pool_->lock_);
+  pool_->CheckNotPoolThreadUnlocked();
+  while (IsActive()) {
+    if (!not_running_cond_.WaitUntil(until)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ThreadPoolToken::WaitFor(const MonoDelta& delta) {
+  return WaitUntil(MonoTime::Now() + delta);
+}
+
+void ThreadPoolToken::Transition(ThreadPoolTokenState new_state) {
+#ifndef NDEBUG
+  CHECK_NE(state_, new_state);
+
+  switch (state_) {
+    case ThreadPoolTokenState::kIdle:
+      CHECK(new_state == ThreadPoolTokenState::kRunning ||
+            new_state == ThreadPoolTokenState::kQuiesced);
+      if (new_state == ThreadPoolTokenState::kRunning) {
+        CHECK(!entries_.empty());
+      } else {
+        CHECK(entries_.empty());
+        CHECK_EQ(active_threads_, 0);
+      }
+      break;
+    case ThreadPoolTokenState::kRunning:
+      CHECK(new_state == ThreadPoolTokenState::kIdle ||
+            new_state == ThreadPoolTokenState::kQuiescing ||
+            new_state == ThreadPoolTokenState::kQuiesced);
+      CHECK(entries_.empty());
+      if (new_state == ThreadPoolTokenState::kQuiescing) {
+        CHECK_GT(active_threads_, 0);
+      }
+      break;
+    case ThreadPoolTokenState::kQuiescing:
+      CHECK(new_state == ThreadPoolTokenState::kQuiesced);
+      CHECK_EQ(active_threads_, 0);
+      break;
+    case ThreadPoolTokenState::kQuiesced:
+      CHECK(false); // kQuiesced is a terminal state
+      break;
+    default:
+      LOG(FATAL) << "Unknown token state: " << state_;
+  }
+#endif
+
+  // Take actions based on the state we're entering.
+  switch (new_state) {
+    case ThreadPoolTokenState::kIdle:
+    case ThreadPoolTokenState::kQuiesced:
+      not_running_cond_.Broadcast();
+      break;
+    default:
+      break;
+  }
+
+  state_ = new_state;
+}
+
+const char* ThreadPoolToken::StateToString(ThreadPoolTokenState s) {
+  switch (s) {
+    case ThreadPoolTokenState::kIdle: return "kIdle"; break;
+    case ThreadPoolTokenState::kRunning: return "kRunning"; break;
+    case ThreadPoolTokenState::kQuiescing: return "kQuiescing"; break;
+    case ThreadPoolTokenState::kQuiesced: return "kQuiesced"; break;
+  }
+  return "<cannot reach here>";
+}
+
+////////////////////////////////////////////////////////
 // ThreadPool
 ////////////////////////////////////////////////////////
 
@@ -129,10 +303,16 @@ ThreadPool::ThreadPool(const ThreadPoolBuilder& builder)
     not_empty_(&lock_),
     num_threads_(0),
     active_threads_(0),
-    queue_size_(0) {
+    total_queued_tasks_(0),
+    tokenless_(NewToken(ExecutionMode::CONCURRENT)),
+    metrics_(builder.metrics_) {
 }
 
 ThreadPool::~ThreadPool() {
+  // There should only be one live token: the one used in tokenless submission.
+  CHECK_EQ(1, tokens_.size()) << Substitute(
+      "Threadpool $0 destroyed with $1 allocated tokens",
+      name_, tokens_.size());
   Shutdown();
 }
 
@@ -152,28 +332,90 @@ Status ThreadPool::Init() {
   return Status::OK();
 }
 
-void ThreadPool::ClearQueue() {
-  for (QueueEntry& e : queue_) {
-    if (e.trace) {
-      e.trace->Release();
-    }
-  }
-  queue_.clear();
-  queue_size_ = 0;
-}
-
 void ThreadPool::Shutdown() {
   MutexLock unique_lock(lock_);
-  pool_status_ = STATUS(ServiceUnavailable, "The pool has been shut down.");
-  ClearQueue();
-  not_empty_.Broadcast();
+  CheckNotPoolThreadUnlocked();
 
-  // The Runnable doesn't have Abort() so we must wait
-  // and hopefully the abort is done outside before calling Shutdown().
+  // Note: this is the same error seen at submission if the pool is at
+  // capacity, so clients can't tell them apart. This isn't really a practical
+  // concern though because shutting down a pool typically requires clients to
+  // be quiesced first, so there's no danger of a client getting confused.
+  pool_status_ = STATUS(ServiceUnavailable, "The pool has been shut down.");
+
+  // Clear the various queues under the lock, but defer the releasing
+  // of the tasks outside the lock, in case there are concurrent threads
+  // wanting to access the ThreadPool. The task's destructors may acquire
+  // locks, etc, so this also prevents lock inversions.
+  queue_.clear();
+  deque<deque<Task>> to_release;
+  for (auto* t : tokens_) {
+    if (!t->entries_.empty()) {
+      to_release.emplace_back(std::move(t->entries_));
+    }
+    switch (t->state()) {
+      case ThreadPoolTokenState::kIdle:
+        // The token is idle; we can quiesce it immediately.
+        t->Transition(ThreadPoolTokenState::kQuiesced);
+        break;
+      case ThreadPoolTokenState::kRunning:
+        // The token has tasks associated with it. If they're merely queued
+        // (i.e. there are no active threads), the tasks will have been removed
+        // above and we can quiesce immediately. Otherwise, we need to wait for
+        // the threads to finish.
+        t->Transition(t->active_threads_ > 0 ?
+            ThreadPoolTokenState::kQuiescing :
+            ThreadPoolTokenState::kQuiesced);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // The queues are empty. Wake any sleeping worker threads and wait for all
+  // of them to exit. Some worker threads will exit immediately upon waking,
+  // while others will exit after they finish executing an outstanding task.
+  total_queued_tasks_ = 0;
+  not_empty_.Broadcast();
   while (num_threads_ > 0) {
     no_threads_cond_.Wait();
   }
+
+  // All the threads have exited. Check the state of each token.
+  for (auto* t : tokens_) {
+    DCHECK(t->state() == ThreadPoolTokenState::kIdle ||
+           t->state() == ThreadPoolTokenState::kQuiesced);
+  }
+
+  // Finally release the queued tasks, outside the lock.
+  unique_lock.Unlock();
+  for (auto& token : to_release) {
+    for (auto& t : token) {
+      if (t.trace) {
+        t.trace->Release();
+      }
+    }
+  }
 }
+
+unique_ptr<ThreadPoolToken> ThreadPool::NewToken(ExecutionMode mode) {
+  return NewTokenWithMetrics(mode, {});
+}
+
+unique_ptr<ThreadPoolToken> ThreadPool::NewTokenWithMetrics(
+    ExecutionMode mode, ThreadPoolMetrics metrics) {
+  MutexLock guard(lock_);
+  unique_ptr<ThreadPoolToken> t(new ThreadPoolToken(this, mode, std::move(metrics)));
+  InsertOrDie(&tokens_, t.get());
+  return t;
+}
+
+void ThreadPool::ReleaseToken(ThreadPoolToken* t) {
+  MutexLock guard(lock_);
+  CHECK(!t->IsActive()) << Substitute("Token with state $0 may not be released",
+                                      ThreadPoolToken::StateToString(t->state()));
+  CHECK_EQ(1, tokens_.erase(t));
+}
+
 
 Status ThreadPool::SubmitClosure(const Closure& task) {
   // TODO: once all uses of std::bind-based tasks are dead, implement this
@@ -182,21 +424,38 @@ Status ThreadPool::SubmitClosure(const Closure& task) {
 }
 
 Status ThreadPool::SubmitFunc(const std::function<void()>& func) {
-  return Submit(std::shared_ptr<Runnable>(new FunctionRunnable(func)));
+  return Submit(std::make_shared<FunctionRunnable>(func));
 }
 
-Status ThreadPool::Submit(const std::shared_ptr<Runnable>& task) {
-  MonoTime submit_time = MonoTime::Now(MonoTime::FINE);
+Status ThreadPool::SubmitFunc(std::function<void()>&& func) {
+  return Submit(std::make_shared<FunctionRunnable>(std::move(func)));
+}
+
+Status ThreadPool::Submit(const std::shared_ptr<Runnable>& r) {
+  return DoSubmit(std::move(r), tokenless_.get());
+}
+
+Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToken* token) {
+  DCHECK(token);
+  MonoTime submit_time = MonoTime::Now();
 
   MutexLock guard(lock_);
   if (PREDICT_FALSE(!pool_status_.ok())) {
     return pool_status_;
   }
 
+  if (PREDICT_FALSE(!token->MaySubmitNewTasks())) {
+    return STATUS(ServiceUnavailable, "Thread pool token was shut down.", "", Errno(ESHUTDOWN));
+  }
+
   // Size limit check.
-  if (queue_size_ == max_queue_size_) {
-    return STATUS(ServiceUnavailable, Substitute("Thread pool queue is full ($0 items)",
-                                                 queue_size_));
+  int64_t capacity_remaining = static_cast<int64_t>(max_threads_) - active_threads_ +
+                               static_cast<int64_t>(max_queue_size_) - total_queued_tasks_;
+  if (capacity_remaining < 1) {
+    return STATUS(ServiceUnavailable,
+                  Substitute("Thread pool is at capacity ($0/$1 tasks running, $2/$3 tasks queued)",
+                             num_threads_, max_threads_, total_queued_tasks_, max_queue_size_),
+                  "", Errno(ESHUTDOWN));
   }
 
   // Should we create another thread?
@@ -208,24 +467,25 @@ Status ThreadPool::Submit(const std::shared_ptr<Runnable>& task) {
   // It's also harmless.
   //
   // Of course, we never create more than max_threads_ threads no matter what.
+  int threads_from_this_submit =
+      token->IsActive() && token->mode() == ExecutionMode::SERIAL ? 0 : 1;
   int inactive_threads = num_threads_ - active_threads_;
-  int additional_threads = (queue_size_ + 1) - inactive_threads;
+  int additional_threads = (queue_.size() + threads_from_this_submit) - inactive_threads;
   if (additional_threads > 0 && num_threads_ < max_threads_) {
     Status status = CreateThreadUnlocked();
     if (!status.ok()) {
       if (num_threads_ == 0) {
         // If we have no threads, we can't do any work.
         return status;
-      } else {
-        // If we failed to create a thread, but there are still some other
-        // worker threads, log a warning message and continue.
-        LOG(WARNING) << "Thread pool failed to create thread: "
-                     << status.ToString();
       }
+      // If we failed to create a thread, but there are still some other
+      // worker threads, log a warning message and continue.
+      LOG(WARNING) << "Thread pool failed to create thread: "
+                   << status.ToString();
     }
   }
 
-  QueueEntry e;
+  Task e;
   e.runnable = task;
   e.trace = Trace::CurrentTrace();
   // Need to AddRef, since the thread which submitted the task may go away,
@@ -235,14 +495,28 @@ Status ThreadPool::Submit(const std::shared_ptr<Runnable>& task) {
   }
   e.submit_time = submit_time;
 
-  queue_.push_back(e);
-  int length_at_submit = queue_size_++;
+  // Add the task to the token's queue.
+  ThreadPoolTokenState state = token->state();
+  DCHECK(state == ThreadPoolTokenState::kIdle ||
+         state == ThreadPoolTokenState::kRunning);
+  token->entries_.emplace_back(std::move(e));
+  if (state == ThreadPoolTokenState::kIdle ||
+      token->mode() == ExecutionMode::CONCURRENT) {
+    queue_.emplace_back(token);
+    if (state == ThreadPoolTokenState::kIdle) {
+      token->Transition(ThreadPoolTokenState::kRunning);
+    }
+  }
+  int length_at_submit = total_queued_tasks_++;
 
   guard.Unlock();
   not_empty_.Signal();
 
-  if (queue_length_histogram_) {
-    queue_length_histogram_->Increment(length_at_submit);
+  if (metrics_.queue_length_histogram) {
+    metrics_.queue_length_histogram->Increment(length_at_submit);
+  }
+  if (token->metrics_.queue_length_histogram) {
+    token->metrics_.queue_length_histogram->Increment(length_at_submit);
   }
 
   return Status::OK();
@@ -256,33 +530,18 @@ void ThreadPool::Wait() {
 }
 
 bool ThreadPool::WaitUntil(const MonoTime& until) {
-  MonoDelta relative = until.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
-  return WaitFor(relative);
-}
-
-bool ThreadPool::WaitFor(const MonoDelta& delta) {
   MutexLock unique_lock(lock_);
   while ((!queue_.empty()) || (active_threads_ > 0)) {
-    if (!idle_cond_.TimedWait(delta)) {
+    if (!idle_cond_.WaitUntil(until)) {
       return false;
     }
   }
   return true;
 }
 
-
-void ThreadPool::SetQueueLengthHistogram(const scoped_refptr<Histogram>& hist) {
-  queue_length_histogram_ = hist;
+bool ThreadPool::WaitFor(const MonoDelta& delta) {
+  return WaitUntil(MonoTime::Now() + delta);
 }
-
-void ThreadPool::SetQueueTimeMicrosHistogram(const scoped_refptr<Histogram>& hist) {
-  queue_time_us_histogram_ = hist;
-}
-
-void ThreadPool::SetRunTimeMicrosHistogram(const scoped_refptr<Histogram>& hist) {
-  run_time_us_histogram_ = hist;
-}
-
 
 void ThreadPool::DispatchThread(bool permanent) {
   MutexLock unique_lock(lock_);
@@ -314,32 +573,74 @@ void ThreadPool::DispatchThread(bool permanent) {
       continue;
     }
 
-    // Fetch a pending task
-    QueueEntry entry = queue_.front();
+    // Get the next token and task to execute.
+    ThreadPoolToken* token = queue_.front();
     queue_.pop_front();
-    queue_size_--;
+    DCHECK_EQ(ThreadPoolTokenState::kRunning, token->state());
+    DCHECK(!token->entries_.empty());
+    Task task = std::move(token->entries_.front());
+    token->entries_.pop_front();
+    token->active_threads_++;
+    --total_queued_tasks_;
     ++active_threads_;
 
     unique_lock.Unlock();
 
-    // Update metrics
-    if (queue_time_us_histogram_) {
-      MonoTime now(MonoTime::Now(MonoTime::FINE));
-      queue_time_us_histogram_->Increment(now.GetDeltaSince(entry.submit_time).ToMicroseconds());
+    // Release the reference which was held by the queued item.
+    ADOPT_TRACE(task.trace);
+    if (task.trace) {
+      task.trace->Release();
     }
 
-    ADOPT_TRACE(entry.trace);
-    // Release the reference which was held by the queued item.
-    if (entry.trace) {
-      entry.trace->Release();
+    // Update metrics
+    MonoTime now(MonoTime::Now());
+    int64_t queue_time_us = (now - task.submit_time).ToMicroseconds();
+    if (metrics_.queue_time_us_histogram) {
+      metrics_.queue_time_us_histogram->Increment(queue_time_us);
     }
+    if (token->metrics_.queue_time_us_histogram) {
+      token->metrics_.queue_time_us_histogram->Increment(queue_time_us);
+    }
+
     // Execute the task
     {
-      ScopedLatencyMetric m(run_time_us_histogram_.get());
-      entry.runnable->Run();
+      MicrosecondsInt64 start_wall_us = GetMonoTimeMicros();
+      task.runnable->Run();
+      int64_t wall_us = GetMonoTimeMicros() - start_wall_us;
+
+      if (metrics_.run_time_us_histogram) {
+        metrics_.run_time_us_histogram->Increment(wall_us);
+      }
+      if (token->metrics_.run_time_us_histogram) {
+        token->metrics_.run_time_us_histogram->Increment(wall_us);
+      }
     }
+    // Destruct the task while we do not hold the lock.
+    //
+    // The task's destructor may be expensive if it has a lot of bound
+    // objects, and we don't want to block submission of the threadpool.
+    // In the worst case, the destructor might even try to do something
+    // with this threadpool, and produce a deadlock.
+    task.runnable.reset();
     unique_lock.Lock();
 
+    // Possible states:
+    // 1. The token was shut down while we ran its task. Transition to kQuiesced.
+    // 2. The token has no more queued tasks. Transition back to kIdle.
+    // 3. The token has more tasks. Requeue it and transition back to RUNNABLE.
+    ThreadPoolTokenState state = token->state();
+    DCHECK(state == ThreadPoolTokenState::kRunning ||
+           state == ThreadPoolTokenState::kQuiescing);
+    if (--token->active_threads_ == 0) {
+      if (state == ThreadPoolTokenState::kQuiescing) {
+        DCHECK(token->entries_.empty());
+        token->Transition(ThreadPoolTokenState::kQuiesced);
+      } else if (token->entries_.empty()) {
+        token->Transition(ThreadPoolTokenState::kIdle);
+      } else if (token->mode() == ExecutionMode::SERIAL) {
+        queue_.emplace_back(token);
+      }
+    }
     if (--active_threads_ == 0) {
       idle_cond_.Broadcast();
     }
@@ -350,25 +651,37 @@ void ThreadPool::DispatchThread(bool permanent) {
   // and add a new task just as the last running thread is about to exit.
   CHECK(unique_lock.OwnsLock());
 
+  CHECK_EQ(threads_.erase(Thread::current_thread()), 1);
   if (--num_threads_ == 0) {
     no_threads_cond_.Broadcast();
 
     // Sanity check: if we're the last thread exiting, the queue ought to be
     // empty. Otherwise it will never get processed.
     CHECK(queue_.empty());
-    DCHECK_EQ(0, queue_size_);
+    DCHECK_EQ(0, total_queued_tasks_);
   }
 }
 
 Status ThreadPool::CreateThreadUnlocked() {
   // The first few threads are permanent, and do not time out.
   bool permanent = (num_threads_ < min_threads_);
+  scoped_refptr<Thread> t;
   Status s = yb::Thread::Create("thread pool", strings::Substitute("$0 [worker]", name_),
-                                  &ThreadPool::DispatchThread, this, permanent, nullptr);
+                                  &ThreadPool::DispatchThread, this, permanent, &t);
   if (s.ok()) {
+    InsertOrDie(&threads_, t.get());
     num_threads_++;
   }
   return s;
+}
+
+void ThreadPool::CheckNotPoolThreadUnlocked() {
+  Thread* current = Thread::current_thread();
+  if (ContainsKey(threads_, current)) {
+    LOG(FATAL) << Substitute("Thread belonging to thread pool '$0' with "
+        "name '$1' called pool function that would result in deadlock",
+        name_, current->name());
+  }
 }
 
 } // namespace yb

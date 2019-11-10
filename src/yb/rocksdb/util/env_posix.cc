@@ -23,7 +23,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#if defined(OS_LINUX)
+#if defined(__linux__)
 #include <linux/fs.h>
 #endif
 #include <pthread.h>
@@ -34,7 +34,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#ifdef OS_LINUX
+#ifdef __linux__
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #endif
@@ -43,7 +43,7 @@
 #include <time.h>
 #include <algorithm>
 // Get nano time includes
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
+#if defined(__linux__) || defined(OS_FREEBSD)
 #elif defined(__MACH__)
 #include <mach/clock.h>
 #include <mach/mach.h>
@@ -57,14 +57,15 @@
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/io_posix.h"
 #include "yb/rocksdb/util/thread_posix.h"
-#include "yb/rocksdb/util/iostats_context_imp.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/posix_logger.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/string_util.h"
 #include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/thread_local.h"
 #include "yb/rocksdb/util/thread_status_updater.h"
+
+#include "yb/util/stats/iostats_context_imp.h"
+#include "yb/util/string_util.h"
 
 #if !defined(TMPFS_MAGIC)
 #define TMPFS_MAGIC 0x01021994
@@ -75,6 +76,10 @@
 #if !defined(EXT4_SUPER_MAGIC)
 #define EXT4_SUPER_MAGIC 0xEF53
 #endif
+
+#include "yb/util/file_system_posix.h"
+
+#define STATUS_IO_ERROR(context, err_number) STATUS(IOError, (context), strerror(err_number))
 
 namespace rocksdb {
 
@@ -126,6 +131,12 @@ static int LockOrUnlock(const std::string& fname, int fd, bool lock) {
   return value;
 }
 
+void SetFD_CLOEXEC(int fd, const EnvOptions* options) {
+  if ((options == nullptr || options->set_fd_cloexec) && fd > 0) {
+    fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+  }
+}
+
 class PosixFileLock : public FileLock {
  public:
   int fd_;
@@ -135,6 +146,7 @@ class PosixFileLock : public FileLock {
 class PosixEnv : public Env {
  public:
   PosixEnv();
+  explicit PosixEnv(std::unique_ptr<RocksDBFileFactory> file_factory);
 
   virtual ~PosixEnv() {
     for (const auto tid : threads_to_join_) {
@@ -148,146 +160,33 @@ class PosixEnv : public Env {
     delete thread_status_updater_;
   }
 
-  void SetFD_CLOEXEC(int fd, const EnvOptions* options) {
-    if ((options == nullptr || options->set_fd_cloexec) && fd > 0) {
-      fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-    }
-  }
-
   virtual Status NewSequentialFile(const std::string& fname,
                                    unique_ptr<SequentialFile>* result,
                                    const EnvOptions& options) override {
-    result->reset();
-    FILE* f = nullptr;
-    do {
-      IOSTATS_TIMER_GUARD(open_nanos);
-      f = fopen(fname.c_str(), "r");
-    } while (f == nullptr && errno == EINTR);
-    if (f == nullptr) {
-      *result = nullptr;
-      return IOError(fname, errno);
-    } else {
-      int fd = fileno(f);
-      SetFD_CLOEXEC(fd, &options);
-      result->reset(new PosixSequentialFile(fname, f, options));
-      return Status::OK();
-    }
+    return file_factory_->NewSequentialFile(fname, result, options);
   }
 
   virtual Status NewRandomAccessFile(const std::string& fname,
                                      unique_ptr<RandomAccessFile>* result,
                                      const EnvOptions& options) override {
-    result->reset();
-    Status s;
-    int fd;
-    {
-      IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), O_RDONLY);
-    }
-    SetFD_CLOEXEC(fd, &options);
-    if (fd < 0) {
-      s = IOError(fname, errno);
-    } else if (options.use_mmap_reads && sizeof(void*) >= 8) {
-      // Use of mmap for random reads has been removed because it
-      // kills performance when storage is fast.
-      // Use mmap when virtual address-space is plentiful.
-      uint64_t size;
-      s = GetFileSize(fname, &size);
-      if (s.ok()) {
-        void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
-        if (base != MAP_FAILED) {
-          result->reset(new PosixMmapReadableFile(fd, fname, base,
-                                                  size, options));
-        } else {
-          s = IOError(fname, errno);
-        }
-      }
-      close(fd);
-    } else {
-      result->reset(new PosixRandomAccessFile(fname, fd, options));
-    }
-    return s;
+    return file_factory_->NewRandomAccessFile(fname, result, options);
   }
 
   virtual Status NewWritableFile(const std::string& fname,
                                  unique_ptr<WritableFile>* result,
                                  const EnvOptions& options) override {
-    result->reset();
-    Status s;
-    int fd = -1;
-    do {
-      IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(fname.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
-    } while (fd < 0 && errno == EINTR);
-    if (fd < 0) {
-      s = IOError(fname, errno);
-    } else {
-      SetFD_CLOEXEC(fd, &options);
-      if (options.use_mmap_writes) {
-        if (!checkedDiskForMmap_) {
-          // this will be executed once in the program's lifetime.
-          // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
-          if (!SupportsFastAllocate(fname)) {
-            forceMmapOff = true;
-          }
-          checkedDiskForMmap_ = true;
-        }
-      }
-      if (options.use_mmap_writes && !forceMmapOff) {
-        result->reset(new PosixMmapFile(fname, fd, page_size_, options));
-      } else {
-        // disable mmap writes
-        EnvOptions no_mmap_writes_options = options;
-        no_mmap_writes_options.use_mmap_writes = false;
-
-        result->reset(new PosixWritableFile(fname, fd, no_mmap_writes_options));
-      }
-    }
-    return s;
+    return file_factory_->NewWritableFile(fname, result, options);
   }
 
   virtual Status ReuseWritableFile(const std::string& fname,
                                    const std::string& old_fname,
                                    unique_ptr<WritableFile>* result,
                                    const EnvOptions& options) override {
-    result->reset();
-    Status s;
-    int fd = -1;
-    do {
-      IOSTATS_TIMER_GUARD(open_nanos);
-      fd = open(old_fname.c_str(), O_RDWR, 0644);
-    } while (fd < 0 && errno == EINTR);
-    if (fd < 0) {
-      s = IOError(fname, errno);
-    } else {
-      SetFD_CLOEXEC(fd, &options);
-      // rename into place
-      if (rename(old_fname.c_str(), fname.c_str()) != 0) {
-        Status r = IOError(old_fname, errno);
-        close(fd);
-        return r;
-      }
-      if (options.use_mmap_writes) {
-        if (!checkedDiskForMmap_) {
-          // this will be executed once in the program's lifetime.
-          // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
-          if (!SupportsFastAllocate(fname)) {
-            forceMmapOff = true;
-          }
-          checkedDiskForMmap_ = true;
-        }
-      }
-      if (options.use_mmap_writes && !forceMmapOff) {
-        result->reset(new PosixMmapFile(fname, fd, page_size_, options));
-      } else {
-        // disable mmap writes
-        EnvOptions no_mmap_writes_options = options;
-        no_mmap_writes_options.use_mmap_writes = false;
+    return file_factory_->ReuseWritableFile(fname, old_fname, result, options);
+  }
 
-        result->reset(new PosixWritableFile(fname, fd, no_mmap_writes_options));
-      }
-    }
-    return s;
+  bool IsPlainText() const override {
+    return file_factory_->IsPlainText();
   }
 
   virtual Status NewDirectory(const std::string& name,
@@ -299,7 +198,7 @@ class PosixEnv : public Env {
       fd = open(name.c_str(), 0);
     }
     if (fd < 0) {
-      return IOError(name, errno);
+      return STATUS_IO_ERROR(name, errno);
     } else {
       result->reset(new PosixDirectory(fd));
     }
@@ -332,7 +231,7 @@ class PosixEnv : public Env {
     result->clear();
     DIR* d = opendir(dir.c_str());
     if (d == nullptr) {
-      return IOError(dir, errno);
+      return STATUS_IO_ERROR(dir, errno);
     }
     struct dirent* entry;
     while ((entry = readdir(d)) != nullptr) {
@@ -345,7 +244,7 @@ class PosixEnv : public Env {
   Status DeleteFile(const std::string& fname) override {
     Status result;
     if (unlink(fname.c_str()) != 0) {
-      result = IOError(fname, errno);
+      result = STATUS_IO_ERROR(fname, errno);
     }
     return result;
   };
@@ -353,7 +252,7 @@ class PosixEnv : public Env {
   Status CreateDir(const std::string& name) override {
     Status result;
     if (mkdir(name.c_str(), 0755) != 0) {
-      result = IOError(name, errno);
+      result = STATUS_IO_ERROR(name, errno);
     }
     return result;
   };
@@ -362,7 +261,8 @@ class PosixEnv : public Env {
     Status result;
     if (mkdir(name.c_str(), 0755) != 0) {
       if (errno != EEXIST) {
-        result = IOError(name, errno);
+        LOG(DFATAL) << "Not exists: " << name;
+        result = STATUS_IO_ERROR(name, errno);
       } else if (!DirExists(name)) { // Check that name is actually a
                                      // directory.
         // Message is taken from mkdir
@@ -375,29 +275,20 @@ class PosixEnv : public Env {
   Status DeleteDir(const std::string& name) override {
     Status result;
     if (rmdir(name.c_str()) != 0) {
-      result = IOError(name, errno);
+      result = STATUS_IO_ERROR(name, errno);
     }
     return result;
   };
 
-  virtual Status GetFileSize(const std::string& fname,
-                             uint64_t* size) override {
-    Status s;
-    struct stat sbuf;
-    if (stat(fname.c_str(), &sbuf) != 0) {
-      *size = 0;
-      s = IOError(fname, errno);
-    } else {
-      *size = sbuf.st_size;
-    }
-    return s;
+  Status GetFileSize(const std::string& fname, uint64_t* size) override {
+    return file_factory_->GetFileSize(fname, size);
   }
 
   virtual Status GetFileModificationTime(const std::string& fname,
                                          uint64_t* file_mtime) override {
     struct stat s;
     if (stat(fname.c_str(), &s) !=0) {
-      return IOError(fname, errno);
+      return STATUS_IO_ERROR(fname, errno);
     }
     *file_mtime = static_cast<uint64_t>(s.st_mtime);
     return Status::OK();
@@ -406,7 +297,7 @@ class PosixEnv : public Env {
                             const std::string& target) override {
     Status result;
     if (rename(src.c_str(), target.c_str()) != 0) {
-      result = IOError(src, errno);
+      result = STATUS_IO_ERROR(src, errno);
     }
     return result;
   }
@@ -418,7 +309,7 @@ class PosixEnv : public Env {
       if (errno == EXDEV) {
         return STATUS(NotSupported, "No cross FS links allowed");
       }
-      result = IOError(src, errno);
+      result = STATUS_IO_ERROR(src, errno);
     }
     return result;
   }
@@ -432,9 +323,9 @@ class PosixEnv : public Env {
       fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
     }
     if (fd < 0) {
-      result = IOError(fname, errno);
+      result = STATUS_IO_ERROR(fname, errno);
     } else if (LockOrUnlock(fname, fd, true) == -1) {
-      result = IOError("lock " + fname, errno);
+      result = STATUS_IO_ERROR("lock " + fname, errno);
       close(fd);
     } else {
       SetFD_CLOEXEC(fd, nullptr);
@@ -450,7 +341,7 @@ class PosixEnv : public Env {
     PosixFileLock* my_lock = reinterpret_cast<PosixFileLock*>(lock);
     Status result;
     if (LockOrUnlock(my_lock->filename, my_lock->fd_, false) == -1) {
-      result = IOError("unlock", errno);
+      result = STATUS_IO_ERROR("unlock", errno);
     }
     close(my_lock->fd_);
     delete my_lock;
@@ -513,7 +404,7 @@ class PosixEnv : public Env {
     }
     if (f == nullptr) {
       result->reset();
-      return IOError(fname, errno);
+      return STATUS_IO_ERROR(fname, errno);
     } else {
       int fd = fileno(f);
 #ifdef ROCKSDB_FALLOCATE_PRESENT
@@ -532,7 +423,7 @@ class PosixEnv : public Env {
   }
 
   uint64_t NowNanos() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
+#if defined(__linux__) || defined(OS_FREEBSD)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
@@ -557,7 +448,7 @@ class PosixEnv : public Env {
       if (errno == EFAULT || errno == EINVAL)
         return STATUS(InvalidArgument, strerror(errno));
       else
-        return IOError("GetHostName", errno);
+        return STATUS_IO_ERROR("GetHostName", errno);
     }
     return Status::OK();
   }
@@ -565,7 +456,7 @@ class PosixEnv : public Env {
   Status GetCurrentTime(int64_t* unix_time) override {
     time_t ret = time(nullptr);
     if (ret == (time_t) -1) {
-      return IOError("GetCurrentTime", errno);
+      return STATUS_IO_ERROR("GetCurrentTime", errno);
     }
     *unix_time = (int64_t) ret;
     return Status::OK();
@@ -602,7 +493,7 @@ class PosixEnv : public Env {
 
   void LowerThreadPoolIOPriority(Priority pool = LOW) override {
     assert(pool >= Priority::LOW && pool <= Priority::HIGH);
-#ifdef OS_LINUX
+#ifdef __linux__
     thread_pools_[pool].LowerIOPriority();
 #endif
   }
@@ -647,13 +538,14 @@ class PosixEnv : public Env {
     return optimized;
   }
 
+  RocksDBFileFactory* GetFileFactory() {
+    return file_factory_.get();
+  }
+
  private:
-  bool checkedDiskForMmap_;
-  bool forceMmapOff; // do we override Env options?
-
-
+  std::unique_ptr<RocksDBFileFactory> file_factory_;
   // Returns true iff the named directory exists and is a directory.
-  virtual bool DirExists(const std::string& dname) {
+  bool DirExists(const std::string& dname) override {
     struct stat statbuf;
     if (stat(dname.c_str(), &statbuf) == 0) {
       return S_ISDIR(statbuf.st_mode);
@@ -682,18 +574,209 @@ class PosixEnv : public Env {
 #endif
   }
 
-  size_t page_size_;
-
   std::vector<ThreadPool> thread_pools_;
   pthread_mutex_t mu_;
   std::vector<pthread_t> threads_to_join_;
 };
 
+class PosixRocksDBFileFactory : public RocksDBFileFactory {
+ public:
+  PosixRocksDBFileFactory() {}
+
+  ~PosixRocksDBFileFactory() {}
+
+  Status NewSequentialFile(const std::string& fname,
+                           unique_ptr<SequentialFile>* result,
+                           const EnvOptions& options) override {
+    result->reset();
+    FILE* f = nullptr;
+    do {
+      IOSTATS_TIMER_GUARD(open_nanos);
+      f = fopen(fname.c_str(), "r");
+    } while (f == nullptr && errno == EINTR);
+    if (f == nullptr) {
+      *result = nullptr;
+      return STATUS_IO_ERROR(fname, errno);
+    } else {
+      int fd = fileno(f);
+      SetFD_CLOEXEC(fd, &options);
+      *result = std::make_unique<yb::PosixSequentialFile>(fname, f, options);
+      return Status::OK();
+    }
+  }
+
+  Status NewRandomAccessFile(const std::string& fname,
+                             unique_ptr<RandomAccessFile>* result,
+                             const EnvOptions& options) override {
+    result->reset();
+    Status s;
+    int fd;
+    {
+      IOSTATS_TIMER_GUARD(open_nanos);
+      fd = open(fname.c_str(), O_RDONLY);
+    }
+    SetFD_CLOEXEC(fd, &options);
+    if (fd < 0) {
+      s = STATUS_IO_ERROR(fname, errno);
+    } else if (options.use_mmap_reads && sizeof(void*) >= 8) {
+      // Use of mmap for random reads has been removed because it
+      // kills performance when storage is fast.
+      // Use mmap when virtual address-space is plentiful.
+      uint64_t size;
+      s = GetFileSize(fname, &size);
+      if (s.ok()) {
+        void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (base != MAP_FAILED) {
+          *result = std::make_unique<PosixMmapReadableFile>(fd, fname, base, size, options);
+        } else {
+          s = STATUS_IO_ERROR(fname, errno);
+        }
+      }
+      close(fd);
+    } else {
+      *result = std::make_unique<yb::PosixRandomAccessFile>(fname, fd, options);
+    }
+    return s;
+  }
+
+  Status NewWritableFile(const std::string& fname,
+                         unique_ptr<WritableFile>* result,
+                         const EnvOptions& options) override {
+    result->reset();
+    Status s;
+    int fd = -1;
+    do {
+      IOSTATS_TIMER_GUARD(open_nanos);
+      fd = open(fname.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+      s = STATUS_IO_ERROR(fname, errno);
+    } else {
+      SetFD_CLOEXEC(fd, &options);
+      if (options.use_mmap_writes) {
+        if (!checkedDiskForMmap_) {
+          // this will be executed once in the program's lifetime.
+          // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
+          if (!SupportsFastAllocate(fname)) {
+            forceMmapOff = true;
+          }
+          checkedDiskForMmap_ = true;
+        }
+      }
+      if (options.use_mmap_writes && !forceMmapOff) {
+        *result = std::make_unique<PosixMmapFile>(fname, fd, page_size_, options);
+      } else {
+        // disable mmap writes
+        EnvOptions no_mmap_writes_options = options;
+        no_mmap_writes_options.use_mmap_writes = false;
+        *result = std::make_unique<PosixWritableFile>(fname, fd, no_mmap_writes_options);
+      }
+    }
+    return s;
+  }
+
+  Status ReuseWritableFile(const std::string& fname,
+                           const std::string& old_fname,
+                           unique_ptr<WritableFile>* result,
+                           const EnvOptions& options) override {
+    result->reset();
+    Status s;
+    int fd = -1;
+    do {
+      IOSTATS_TIMER_GUARD(open_nanos);
+      fd = open(old_fname.c_str(), O_RDWR, 0644);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+      s = STATUS_IO_ERROR(fname, errno);
+    } else {
+      SetFD_CLOEXEC(fd, &options);
+      // rename into place
+      if (rename(old_fname.c_str(), fname.c_str()) != 0) {
+        Status r = STATUS_IO_ERROR(old_fname, errno);
+        close(fd);
+        return r;
+      }
+      if (options.use_mmap_writes) {
+        if (!checkedDiskForMmap_) {
+          // this will be executed once in the program's lifetime.
+          // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
+          if (!SupportsFastAllocate(fname)) {
+            forceMmapOff = true;
+          }
+          checkedDiskForMmap_ = true;
+        }
+      }
+      if (options.use_mmap_writes && !forceMmapOff) {
+        *result = std::make_unique<PosixMmapFile>(fname, fd, page_size_, options);
+      } else {
+        // disable mmap writes
+        EnvOptions no_mmap_writes_options = options;
+        no_mmap_writes_options.use_mmap_writes = false;
+
+        *result = std::make_unique<PosixWritableFile>(fname, fd, no_mmap_writes_options);
+      }
+    }
+    return s;
+  }
+
+  Status GetFileSize(const std::string& fname, uint64_t* size) override {
+    Status s;
+    struct stat sbuf;
+    if (stat(fname.c_str(), &sbuf) != 0) {
+      *size = 0;
+      s = STATUS_IO_ERROR(fname, errno);
+    } else {
+      *size = sbuf.st_size;
+    }
+    return s;
+  }
+
+  bool IsPlainText() const override {
+    return true;
+  }
+
+ private:
+  bool checkedDiskForMmap_ = false;
+  bool forceMmapOff = false;
+  size_t page_size_ = getpagesize();
+
+  bool SupportsFastAllocate(const std::string& path) {
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+    struct statfs s;
+    if (statfs(path.c_str(), &s)) {
+      return false;
+    }
+    switch (s.f_type) {
+      case EXT4_SUPER_MAGIC:
+        return true;
+      case XFS_SUPER_MAGIC:
+        return true;
+      case TMPFS_MAGIC:
+        return true;
+      default:
+        return false;
+    }
+#else
+    return false;
+#endif
+  }
+
+};
+
 PosixEnv::PosixEnv()
-    : checkedDiskForMmap_(false),
-      forceMmapOff(false),
-      page_size_(getpagesize()),
-      thread_pools_(Priority::TOTAL) {
+    : file_factory_(std::make_unique<PosixRocksDBFileFactory>()), thread_pools_(Priority::TOTAL) {
+  ThreadPool::PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
+  for (int pool_id = 0; pool_id < Env::Priority::TOTAL; ++pool_id) {
+    thread_pools_[pool_id].SetThreadPriority(
+        static_cast<Env::Priority>(pool_id));
+    // This allows later initializing the thread-local-env of each thread.
+    thread_pools_[pool_id].SetHostEnv(this);
+  }
+  thread_status_updater_ = CreateThreadStatusUpdater();
+}
+
+PosixEnv::PosixEnv(std::unique_ptr<RocksDBFileFactory> file_factory) :
+    file_factory_(std::move(file_factory)), thread_pools_(Priority::TOTAL) {
   ThreadPool::PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
   for (int pool_id = 0; pool_id < Env::Priority::TOTAL; ++pool_id) {
     thread_pools_[pool_id].SetThreadPriority(
@@ -789,8 +872,21 @@ Env* Env::Default() {
   // the destructor of static PosixEnv will go first, then the
   // the singletons of ThreadLocalPtr.
   ThreadLocalPtr::InitSingletons();
+  // Make sure that SyncPoint inited before PosixEnv, to be deleted after it.
+#ifndef NDEBUG
+  SyncPoint::GetInstance();
+#endif
   static PosixEnv default_env;
   return &default_env;
+}
+
+RocksDBFileFactory* Env::DefaultFileFactory() {
+  return down_cast<PosixEnv*>(Env::Default())->GetFileFactory();
+}
+
+std::unique_ptr<Env> Env::NewRocksDBDefaultEnv(
+    std::unique_ptr<RocksDBFileFactory> file_factory) {
+  return std::make_unique<PosixEnv>(std::move(file_factory));
 }
 
 }  // namespace rocksdb

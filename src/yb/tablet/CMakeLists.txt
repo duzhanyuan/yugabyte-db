@@ -44,41 +44,19 @@ set(TABLET_SRCS
   transaction_participant.cc
   operation_order_verifier.cc
   operations/operation.cc
-  operations/alter_schema_operation.cc
+  operations/change_metadata_operation.cc
   operations/operation_driver.cc
   operations/operation_tracker.cc
+  operations/truncate_operation.cc
   operations/update_txn_operation.cc
   operations/write_operation.cc
-  cfile_set.cc
-  compaction.cc
-  compaction_policy.cc
-  delta_key.cc
-  diskrowset.cc
-  lock_manager.cc
+  operations/snapshot_operation.cc
   maintenance_manager.cc
-  memrowset.cc
-  multi_column_writer.cc
-  mutation.cc
   mvcc.cc
-  row_op.cc
-  rowset.cc
-  rowset_info.cc
-  rowset_tree.cc
-  svg_dump.cc
   tablet_metadata.cc
-  rowset_metadata.cc
-  deltafile.cc
-  deltamemstore.cc
-  delta_applier.cc
-  delta_compaction.cc
-  delta_iterator_merger.cc
-  delta_stats.cc
-  delta_store.cc
-  delta_tracker.cc
-  key_value_iterator.cc
   tablet_retention_policy.cc
-  prepare_thread.cc
-  ${TABLET_SRCS_EXTENTIONS})
+  preparer.cc
+  ${TABLET_SRCS_EXTENSIONS})
 
 PROTOBUF_GENERATE_CPP(
   TABLET_PROTO_SRCS TABLET_PROTO_HDRS TABLET_PROTO_TGTS
@@ -103,7 +81,6 @@ cotire(tablet)
 target_link_libraries(tablet
   tablet_proto
   yb_common
-  cfile
   gutil
   server_common
   yb_fs
@@ -112,10 +89,17 @@ target_link_libraries(tablet
   consensus
   rocksdb
   yb_docdb
-  yb_client)
+  yb_client
+  yb_pggate_util)
 
-set(YB_TEST_LINK_LIBS tablet ${YB_MIN_TEST_LIBS})
+add_library(tablet_test_util
+            local_tablet_writer.cc
+            tablet-test-util.cc)
+target_link_libraries(tablet_test_util tablet yb_common yb_test_util yb_util)
+
+set(YB_TEST_LINK_LIBS tablet tablet_test_util ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(tablet-test)
+ADD_YB_TEST(tablet-split-test)
 ADD_YB_TEST(tablet-metadata-test)
 ADD_YB_TEST(verifyrows-tablet-test)
 ADD_YB_TEST(tablet-pushdown-test)
@@ -123,11 +107,6 @@ ADD_YB_TEST(tablet-schema-test)
 ADD_YB_TEST(tablet_bootstrap-test)
 ADD_YB_TEST(maintenance_manager-test)
 ADD_YB_TEST(mvcc-test)
-ADD_YB_TEST(lock_manager-test)
 ADD_YB_TEST(composite-pushdown-test)
 ADD_YB_TEST(tablet_peer-test)
 ADD_YB_TEST(tablet_random_access-test)
-
-# Some tests don't have dependencies on other tablet stuff
-set(YB_TEST_LINK_LIBS yb_util gutil ${YB_MIN_TEST_LIBS})
-ADD_YB_TEST(cbtree-test RUN_SERIAL true)

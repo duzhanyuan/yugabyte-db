@@ -13,28 +13,19 @@
 
 #include "yb/master/yql_vtable_iterator.h"
 
+#include "yb/common/ql_value.h"
+
 namespace yb {
 namespace master {
 
-YQLVTableIterator::YQLVTableIterator(std::unique_ptr<QLRowBlock> vtable)
-    : vtable_(std::move(vtable)),
-      vtable_index_(0) {
+YQLVTableIterator::YQLVTableIterator(
+    std::shared_ptr<QLRowBlock> vtable,
+    const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values)
+    : vtable_(std::move(vtable)), hashed_column_values_(hashed_column_values) {
+  Advance(false /* increment */);
 }
 
-Status YQLVTableIterator::Init(ScanSpec* spec) {
-  return STATUS(NotSupported, "YQLVTableIterator::Init(ScanSpec*) not supported!");
-}
-
-Status YQLVTableIterator::Init(const common::QLScanSpec& spec) {
-  // As of 04/17, we don't use the scanspec for simplicity.
-  return Status::OK();
-}
-
-CHECKED_STATUS YQLVTableIterator::NextBlock(RowBlock *dst) {
-  return STATUS(NotSupported, "YQLVTableIterator::NextBlock(RowBlock*) not supported!");
-}
-
-CHECKED_STATUS YQLVTableIterator::NextRow(const Schema& projection, QLTableRow* table_row) {
+Status YQLVTableIterator::DoNextRow(const Schema& projection, QLTableRow* table_row) {
   if (vtable_index_ >= vtable_->row_count()) {
     return STATUS(NotFound, "No more rows left!");
   }
@@ -42,26 +33,20 @@ CHECKED_STATUS YQLVTableIterator::NextRow(const Schema& projection, QLTableRow* 
   // TODO: return columns in projection only.
   QLRow& row = vtable_->row(vtable_index_);
   for (int i = 0; i < row.schema().num_columns(); i++) {
-    (*table_row)[row.schema().column_id(i)].value =
-        down_cast<const QLValueWithPB&>(row.column(i)).value();
+    table_row->AllocColumn(row.schema().column_id(i),
+                           down_cast<const QLValue&>(row.column(i)));
   }
-  vtable_index_++;
+  Advance(true /* increment */);
   return Status::OK();
 }
 
 void YQLVTableIterator::SkipRow() {
   if (vtable_index_ < vtable_->row_count()) {
-    vtable_index_++;
+    Advance(true /* increment */);
   }
 }
 
-CHECKED_STATUS YQLVTableIterator::SetPagingStateIfNecessary(const QLReadRequestPB& request,
-                                                            QLResponsePB* response) const {
-  // We don't support paging in virtual tables.
-  return Status::OK();
-}
-
-bool YQLVTableIterator::HasNext() const {
+Result<bool> YQLVTableIterator::HasNext() const {
   return vtable_index_ < vtable_->row_count();
 }
 
@@ -73,8 +58,29 @@ const Schema& YQLVTableIterator::schema() const {
   return vtable_->schema();
 }
 
-void YQLVTableIterator::GetIteratorStats(std::vector<IteratorStats>* stats) const {
-  // Not supported.
+// Advances iterator to next valid row, filtering columns using hashed_column_values_.
+void YQLVTableIterator::Advance(bool increment) {
+  if (increment) {
+    ++vtable_index_;
+  }
+  size_t num_hashed_columns = hashed_column_values_.size();
+  if (num_hashed_columns == 0) {
+    return;
+  }
+  while (vtable_index_ < vtable_->row_count()) {
+    auto& row = vtable_->row(vtable_index_);
+    bool bad = false;
+    for (size_t idx = 0; idx != num_hashed_columns; ++idx) {
+      if (hashed_column_values_[idx].value() != row.column(idx)) {
+        bad = true;
+        break;
+      }
+    }
+    if (!bad) {
+      break;
+    }
+    ++vtable_index_;
+  }
 }
 
 YQLVTableIterator::~YQLVTableIterator() {

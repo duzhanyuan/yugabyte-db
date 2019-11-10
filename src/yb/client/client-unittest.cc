@@ -46,6 +46,7 @@ namespace client {
 using std::string;
 using std::vector;
 
+using namespace std::literals;
 using namespace std::placeholders;
 
 TEST(ClientUnitTest, TestSchemaBuilder_EmptySchema) {
@@ -130,26 +131,6 @@ TEST(ClientUnitTest, TestSchemaBuilder_CompoundKey_GoodSchema) {
   ASSERT_EQ(vector<int>({ 0, 1 }), key_columns);
 }
 
-TEST(ClientUnitTest, TestSchemaBuilder_DefaultValues) {
-  YBSchema s;
-  YBSchemaBuilder b;
-  b.AddColumn("a")->Type(INT32)->NotNull()->PrimaryKey();
-  b.AddColumn("b")->Type(INT32)->NotNull()
-    ->Default(YBValue::FromInt(12345));
-  ASSERT_EQ("OK", b.Build(&s).ToString());
-}
-
-TEST(ClientUnitTest, TestSchemaBuilder_DefaultValueString) {
-  YBSchema s;
-  YBSchemaBuilder b;
-  b.AddColumn("a")->Type(INT32)->NotNull()->PrimaryKey();
-  b.AddColumn("b")->Type(STRING)->NotNull()
-    ->Default(YBValue::CopyString("abc"));
-  b.AddColumn("c")->Type(BINARY)->NotNull()
-    ->Default(YBValue::CopyString("def"));
-  ASSERT_EQ("OK", b.Build(&s).ToString());
-}
-
 TEST(ClientUnitTest, TestSchemaBuilder_CompoundKey_KeyNotFirst) {
   YBSchema s;
   YBSchemaBuilder b;
@@ -173,16 +154,17 @@ TEST(ClientUnitTest, TestSchemaBuilder_CompoundKey_BadColumnName) {
 }
 
 namespace {
-Status TestFunc(const MonoTime& deadline, bool* retry, int* counter) {
-  (*counter)++;
+
+Status TestFunc(CoarseTimePoint deadline, bool* retry, int* counter) {
+  ++*counter;
   *retry = true;
   return STATUS(RuntimeError, "x");
 }
+
 } // anonymous namespace
 
 TEST(ClientUnitTest, TestRetryFunc) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromMilliseconds(100));
+  auto deadline = CoarseMonoClock::Now() + 100ms;
   int counter = 0;
   Status s =
       RetryFunc(deadline, "retrying test func", "timed out", std::bind(TestFunc, _1, _2, &counter));

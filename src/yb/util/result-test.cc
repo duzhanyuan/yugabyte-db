@@ -92,6 +92,10 @@ void CheckStatus() {
 template<class TValue>
 void CheckValue(TValue value) {
   typedef yb::Result<TValue> Result;
+
+  static_assert(sizeof(Result) == sizeof(void*) + std::max(sizeof(TValue), sizeof(void*)),
+                "Invalid Result size");
+
   auto value2 = value;
   auto value3 = value;
 
@@ -110,6 +114,19 @@ void CheckValue(TValue value) {
   CheckFromResult(result, [value](const auto& res) { CheckResultIsValue(res, value); });
 }
 
+Result<std::string&> GetStringReference() {
+  static std::string result = "shared string";
+  return result;
+}
+
+Result<std::string&> GetBadStringReference() {
+  return STATUS(RuntimeError, "Just for test");
+}
+
+Result<const std::string&> GetConstStringReference() {
+  return GetStringReference();
+}
+
 } // namespace
 
 TEST_F(ResultTest, Status) {
@@ -126,6 +143,140 @@ TEST_F(ResultTest, Result) {
   yb::Result<std::string> result(kString);
   ASSERT_TRUE(result.ok());
   ASSERT_EQ(result->size(), kString.size()); // Check of operator->
+}
+
+TEST_F(ResultTest, NonCopyable) {
+  Result<std::unique_ptr<int>> ptr = std::make_unique<int>(42);
+  Result<std::unique_ptr<int>> ptr2(std::move(ptr));
+  ASSERT_OK(ptr2);
+
+  std::unique_ptr<int>& unique = *ptr2;
+  ASSERT_EQ(42, *unique);
+}
+
+TEST_F(ResultTest, Reference) {
+  LOG(INFO) << GetStringReference();
+  LOG(INFO) << GetConstStringReference();
+  auto result = GetStringReference();
+  auto const_result = GetConstStringReference();
+
+  static_assert(sizeof(result) == 2 * sizeof(void*), "Invalid Result size");
+
+  ASSERT_OK(result);
+  Result<std::string&> result2(result);
+  const_result = result;
+  const_result = std::move(result);
+  result = GetBadStringReference();
+  ASSERT_NOK(result);
+  auto status = std::move(result.status());
+  ASSERT_NOK(status);
+  result = GetStringReference();
+  ASSERT_OK(result);
+}
+
+Result<std::unique_ptr<int>> ReturnVariable() {
+  std::unique_ptr<int> result;
+  result = std::make_unique<int>(42);
+  return result;
+}
+
+// Test that we could return non-copyable variable of type T from function with return type
+// Result<T>.
+TEST_F(ResultTest, ReturnVariable) {
+  auto ptr = ASSERT_RESULT(ReturnVariable());
+  ASSERT_EQ(42, *ptr);
+}
+
+Result<std::unique_ptr<int>> ReturnBadVariable() {
+  return STATUS(RuntimeError, "Just for test");
+}
+
+Status test_function(int* num_func_calls, std::unique_ptr<int> ptr) {
+  ++(*CHECK_NOTNULL(num_func_calls));
+  LOG(INFO) << "Called test_function() (call number " << *num_func_calls << ") with arg=" << *ptr;
+  EXPECT_EQ(42, *ptr);
+  return *num_func_calls == 1 ?
+      Status::OK() : STATUS(InternalError, "test_function() returned a error");
+}
+
+template<typename F, typename GetResult>
+Status GetStatus(int* num_func_calls, F f, GetResult get_result) {
+  RETURN_NOT_OK(f(num_func_calls, VERIFY_RESULT(get_result())));
+  return Status::OK();
+}
+
+TEST_F(ResultTest, VerifyResultMacro) {
+  int num_func_calls = 0;
+  // Good way - no returns from the macros.
+  Status s  = GetStatus(&num_func_calls, test_function, ReturnVariable);
+  LOG(INFO) << "GetStatus() returned status=" << s;
+  ASSERT_EQ(1, num_func_calls);
+  ASSERT_TRUE(s.ok());
+
+  // Bad way 1 - exit from VERIFY_RESULT().
+  s  = GetStatus(&num_func_calls, test_function, ReturnBadVariable);
+  LOG(INFO) << "GetStatus() returned status=" << s;
+  ASSERT_EQ(1, num_func_calls);
+  ASSERT_TRUE(s.IsRuntimeError());
+
+  // Bad way 2 - exit from RETURN_NOT_OK().
+  s  = GetStatus(&num_func_calls, test_function, ReturnVariable);
+  LOG(INFO) << "GetStatus() returned status=" << s;
+  ASSERT_EQ(2, num_func_calls);
+  ASSERT_TRUE(s.IsInternalError());
+}
+
+struct NonCopyableNonMovable {
+  NonCopyableNonMovable() = default;
+  NonCopyableNonMovable(const NonCopyableNonMovable&) = delete;
+  NonCopyableNonMovable& operator=(const NonCopyableNonMovable&) = delete;
+};
+
+class MoveCounter {
+ public:
+  MoveCounter() = default;
+  MoveCounter(const MoveCounter&) = delete;
+
+  MoveCounter(const MoveCounter&&) {
+    ++counter_;
+  }
+
+  MoveCounter& operator=(const MoveCounter&) = delete;
+
+  MoveCounter& operator=(MoveCounter&&) {
+    ++counter_;
+    return *this;
+  }
+
+  static size_t counter() {
+    return counter_;
+  }
+
+ private:
+  static size_t counter_;
+};
+
+size_t MoveCounter::counter_ = 0;
+
+// Next function won't compile in case VERIFY_RESULT will try to create copy of Result's data
+Status VerifyResultMacroReferenceNoCopyHelper() {
+  static const NonCopyableNonMovable data;
+  const auto& r ATTRIBUTE_UNUSED = VERIFY_RESULT_REF(Result<const NonCopyableNonMovable&>(data));
+  return Status::OK();
+}
+
+Status VerifyResultMacroMoveCountHelper() {
+  const auto result ATTRIBUTE_UNUSED = VERIFY_RESULT(Result<MoveCounter>(MoveCounter()));
+  return Status::OK();
+}
+
+TEST_F(ResultTest, VerifyResultMacroReferenceNoCopy) {
+  VerifyResultMacroReferenceNoCopyHelper();
+}
+
+TEST_F(ResultTest, VerifyResultMacroMoveCount) {
+  VerifyResultMacroMoveCountHelper();
+  ASSERT_EQ(2, MoveCounter::counter());
 }
 
 } // namespace test

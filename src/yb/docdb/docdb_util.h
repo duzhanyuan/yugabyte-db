@@ -17,7 +17,6 @@
 #define YB_DOCDB_DOCDB_UTIL_H
 
 #include "yb/common/schema.h"
-#include "yb/common/ql_value.h"
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/docdb_compaction_filter.h"
@@ -25,24 +24,21 @@
 
 namespace yb {
 namespace docdb {
-
-// Add primary key column values to the component group. Verify that they are in the same order
-// as in the table schema.
-CHECKED_STATUS QLKeyColumnValuesToPrimitiveValues(
-    const google::protobuf::RepeatedPtrField<QLExpressionPB> &column_values,
-    const Schema &schema, size_t column_idx, const size_t column_count,
-    vector<PrimitiveValue> *components);
-
 // A wrapper around a RocksDB instance and provides utility functions on top of it, such as
-// compacting the history until a certain point. This is also a convenient base class for GTest test
-// classes, because it exposes member functions such as rocksdb() and write_oiptions().
+// compacting the history until a certain point. This is used in the bulk load tool. This is also
+// convenient base class for GTest test classes, because it exposes member functions such as
+// rocksdb() and write_options().
 class DocDBRocksDBUtil {
 
  public:
-  DocDBRocksDBUtil();
-  explicit DocDBRocksDBUtil(const rocksdb::OpId& op_id);
-  virtual ~DocDBRocksDBUtil();
+  DocDBRocksDBUtil() {}
+  explicit DocDBRocksDBUtil(InitMarkerBehavior init_marker_behavior)
+      : init_marker_behavior_(init_marker_behavior) {
+  }
+
+  virtual ~DocDBRocksDBUtil() {}
   virtual CHECKED_STATUS InitRocksDBDir() = 0;
+
   // Initializes RocksDB options, should be called after constructor, because it uses virtual
   // function BlockCacheSize.
   virtual CHECKED_STATUS InitRocksDBOptions() = 0;
@@ -52,6 +48,8 @@ class DocDBRocksDBUtil {
   virtual size_t block_cache_size() const { return 16 * 1024 * 1024; }
 
   rocksdb::DB* rocksdb();
+  rocksdb::DB* intents_db();
+  DocDB doc_db() { return { rocksdb(), intents_db(), &KeyBounds::kNoBounds }; }
 
   CHECKED_STATUS InitCommonRocksDBOptions();
 
@@ -59,8 +57,8 @@ class DocDBRocksDBUtil {
 
   const rocksdb::Options& options() const { return rocksdb_options_; }
 
-  void SetRocksDBDir(const std::string& rocksdb_dir);
   CHECKED_STATUS OpenRocksDB();
+
   CHECKED_STATUS ReopenRocksDB();
   CHECKED_STATUS DestroyRocksDB();
   void ResetMonotonicCounter();
@@ -70,13 +68,18 @@ class DocDBRocksDBUtil {
   CHECKED_STATUS PopulateRocksDBWriteBatch(
       const DocWriteBatch& dwb,
       rocksdb::WriteBatch *rocksdb_write_batch,
-      HybridTime hybrid_time = HybridTime::kInvalidHybridTime,
+      HybridTime hybrid_time = HybridTime::kInvalid,
       bool decode_dockey = true,
-      bool increment_write_id = true) const;
+      bool increment_write_id = true,
+      PartialRangeKeyIntents partial_range_key_intents = PartialRangeKeyIntents::kTrue) const;
 
   // Writes the given DocWriteBatch to RocksDB. We substitue the hybrid time, if provided.
-  CHECKED_STATUS WriteToRocksDB(const DocWriteBatch& write_batch, const HybridTime& hybrid_time,
-                                bool decode_dockey = true, bool increment_write_id = true);
+  CHECKED_STATUS WriteToRocksDB(
+      const DocWriteBatch& write_batch,
+      const HybridTime& hybrid_time,
+      bool decode_dockey = true,
+      bool increment_write_id = true,
+      PartialRangeKeyIntents partial_range_key_intents = PartialRangeKeyIntents::kTrue);
 
   // The same as WriteToRocksDB but also clears the write batch afterwards.
   CHECKED_STATUS WriteToRocksDBAndClear(DocWriteBatch* dwb, const HybridTime& hybrid_time,
@@ -95,53 +98,53 @@ class DocDBRocksDBUtil {
       const DocPath& doc_path,
       const Value& value,
       HybridTime hybrid_time,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::REQUIRED);
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS SetPrimitive(
       const DocPath& doc_path,
       const PrimitiveValue& value,
       HybridTime hybrid_time,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::REQUIRED);
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS InsertSubDocument(
       const DocPath& doc_path,
       const SubDocument& value,
       HybridTime hybrid_time,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::OPTIONAL);
+      MonoDelta ttl = Value::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS ExtendSubDocument(
       const DocPath& doc_path,
       const SubDocument& value,
       HybridTime hybrid_time,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::OPTIONAL);
+      MonoDelta ttl = Value::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS ExtendList(
       const DocPath& doc_path,
       const SubDocument& value,
-      const ListExtendOrder extend_order,
       HybridTime hybrid_time,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::OPTIONAL);
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   CHECKED_STATUS ReplaceInList(
       const DocPath &doc_path,
       const std::vector<int>& indexes,
       const std::vector<SubDocument>& values,
-      const HybridTime& current_time, // Used for reading.
+      const ReadHybridTime& read_ht,
       const HybridTime& hybrid_time,
       const rocksdb::QueryId query_id,
-      MonoDelta table_ttl = Value::kMaxTtl,
+      MonoDelta default_ttl = Value::kMaxTtl,
       MonoDelta ttl = Value::kMaxTtl,
-      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::OPTIONAL);
+      UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp);
 
   CHECKED_STATUS DeleteSubDoc(
       const DocPath& doc_path,
       HybridTime hybrid_time,
-      InitMarkerBehavior use_init_marker = InitMarkerBehavior::REQUIRED);
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   void DocDBDebugDumpToConsole();
 
-  CHECKED_STATUS FlushRocksDB();
+  CHECKED_STATUS FlushRocksDbAndWait();
 
   void SetTableTTL(uint64_t ttl_msec);
 
@@ -168,17 +171,33 @@ class DocDBRocksDBUtil {
     return monotonic_counter_;
   }
 
+  DocWriteBatch MakeDocWriteBatch();
+  DocWriteBatch MakeDocWriteBatch(InitMarkerBehavior init_marker_behavior);
+
+  void SetInitMarkerBehavior(InitMarkerBehavior init_marker_behavior);
+
  protected:
+  std::string IntentsDBDir();
+
   std::unique_ptr<rocksdb::DB> rocksdb_;
+  std::unique_ptr<rocksdb::DB> intents_db_;
   rocksdb::Options rocksdb_options_;
-  string rocksdb_dir_;
+  std::string rocksdb_dir_;
+
+  // This is used for auto-assigning op ids to RocksDB write batches to emulate what a tablet would
+  // do in production.
   rocksdb::OpId op_id_;
+
   std::shared_ptr<rocksdb::Cache> block_cache_;
-  std::shared_ptr<FixedHybridTimeRetentionPolicy> retention_policy_;
+  std::shared_ptr<ManualHistoryRetentionPolicy> retention_policy_ {
+      std::make_shared<ManualHistoryRetentionPolicy>() };
+
   rocksdb::WriteOptions write_options_;
   Schema schema_;
   boost::optional<TransactionId> current_txn_id_;
+  mutable IntraTxnWriteId intra_txn_write_id_ = 0;
   IsolationLevel txn_isolation_level_ = IsolationLevel::NON_TRANSACTIONAL;
+  InitMarkerBehavior init_marker_behavior_ = InitMarkerBehavior::kOptional;
 
  private:
   std::atomic<int64_t> monotonic_counter_{0};

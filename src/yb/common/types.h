@@ -377,6 +377,17 @@ struct DataTypeTraits<INET> : public DerivedTypeTraits<BINARY>{
 };
 
 template<>
+struct DataTypeTraits<JSONB> : public DerivedTypeTraits<BINARY>{
+  static const char* name() {
+    return "jsonb";
+  }
+  static void AppendDebugStringForValue(const void *val, string *str) {
+    const Slice *s = reinterpret_cast<const Slice *>(val);
+    str->append(strings::Utf8SafeCEscape(s->ToString()));
+  }
+};
+
+template<>
 struct DataTypeTraits<UUID> : public DerivedTypeTraits<BINARY>{
   static const char* name() {
     return "uuid";
@@ -468,6 +479,18 @@ struct DataTypeTraits<DECIMAL> : public DerivedTypeTraits<BINARY>{
   }
 };
 
+template<>
+struct DataTypeTraits<VARINT> : public DerivedTypeTraits<BINARY>{
+  static const char* name() {
+    return "varint";
+  }
+  static void AppendDebugVarIntForValue(const void* val, string* str) {
+    const Slice *s = reinterpret_cast<const Slice *>(val);
+    str->append(strings::Utf8SafeCEscape(s->ToString()));
+  }
+};
+
+
 static const char* kDateFormat = "%Y-%m-%d %H:%M:%S";
 static const char* kDateMicrosAndTzFormat = "%s.%06d GMT";
 
@@ -493,9 +516,23 @@ struct DataTypeTraits<TIMESTAMP> : public DerivedTypeTraits<INT64>{
     gmtime_r(&secs_since_epoch, &tm_info);
     char time_up_to_secs[24];
     strftime(time_up_to_secs, sizeof(time_up_to_secs), kDateFormat, &tm_info);
-    char time[34];
+    char time[40];
     snprintf(time, sizeof(time), kDateMicrosAndTzFormat, time_up_to_secs, remaining_micros);
     str->append(time);
+  }
+};
+
+template<>
+struct DataTypeTraits<DATE> : public DerivedTypeTraits<UINT32>{
+  static const char* name() {
+    return "date";
+  }
+};
+
+template<>
+struct DataTypeTraits<TIME> : public DerivedTypeTraits<INT64>{
+  static const char* name() {
+    return "time";
   }
 };
 
@@ -559,9 +596,11 @@ class Variant {
         numeric_.i32 = *static_cast<const int32_t *>(value);
         break;
       case UINT32:
+      case DATE:
         numeric_.u32 = *static_cast<const uint32_t *>(value);
         break;
       case TIMESTAMP:
+      case TIME:
       case INT64:
         numeric_.i64 = *static_cast<const int64_t *>(value);
         break;
@@ -579,6 +618,7 @@ class Variant {
       case UUID: FALLTHROUGH_INTENDED;
       case TIMEUUID: FALLTHROUGH_INTENDED;
       case FROZEN: FALLTHROUGH_INTENDED;
+      case JSONB: FALLTHROUGH_INTENDED;
       case BINARY:
         {
           const Slice *str = static_cast<const Slice *>(value);

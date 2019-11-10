@@ -40,14 +40,23 @@
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/logging.h"
 #include "yb/util/path_util.h"
 #include "yb/util/status.h"
+#include "yb/util/version_info.h"
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 using std::string;
 
 DEFINE_string(fs_data_dirs, "",
               "Comma-separated list of data directories. This argument must be specified.");
 TAG_FLAG(fs_data_dirs, stable);
+DEFINE_bool(stop_on_parent_termination, false,
+            "When specified, this process will terminate when parent process terminates."
+            "Linux-only.");
 
 namespace yb {
 
@@ -79,10 +88,23 @@ Status SetupLogDir(const std::string& server_type) {
     std::vector<std::string> data_paths = strings::Split(
         FLAGS_fs_data_dirs, ",", strings::SkipEmpty());
     // Need at least one entry as we're picking the first one to drop the logs into.
-    CHECK(data_paths.size() >= 1) << "Flag fs_data_dirs needs at least 1 path in csv format!";
-    bool created;
+    if (data_paths.size() < 1) {
+      return STATUS(
+          InvalidArgument,
+          "Cannot initialize logging. Flag fs_data_dirs (a comma-separated list of data "
+          "directories) must contain at least one data directory.");
+    }
+
+    bool created = false;
     std::string out_dir;
-    SetupRootDir(Env::Default(), data_paths[0], server_type, &out_dir, &created);
+    Status s = SetupRootDir(Env::Default(), data_paths[0], server_type, &out_dir, &created);
+    if (!s.ok()) {
+      return STATUS(
+          InvalidArgument, strings::Substitute(
+          "Cannot create directory for logging, please check the --fs_data_dirs parameter "
+          "(Passed: $0). Path does not exist: $1\nDetails: $2",
+          FLAGS_fs_data_dirs, data_paths[0], s.ToString()));
+    }
     // Create the actual log dir.
     out_dir = JoinPathSegments(out_dir, "logs");
     RETURN_NOT_OK_PREPEND(env_util::CreateDirIfMissing(Env::Default(), out_dir, &created),
@@ -94,9 +116,18 @@ Status SetupLogDir(const std::string& server_type) {
   return Status::OK();
 }
 
-void InitYBOrDie(const std::string& server_type) {
-  CHECK_OK(CheckCPUFlags());
-  CHECK_OK(SetupLogDir(server_type));
+Status InitYB(const std::string &server_type, const char* argv0) {
+#if defined(__linux__)
+  if (FLAGS_stop_on_parent_termination) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+  }
+#endif
+  RETURN_NOT_OK(CheckCPUFlags());
+  RETURN_NOT_OK(SetupLogDir(server_type));
+  RETURN_NOT_OK(VersionInfo::Init());
+  google::SetApplicationFingerprint(VersionInfo::GetShortVersionString());
+  InitGoogleLoggingSafe(argv0);
+  return Status::OK();
 }
 
 } // namespace yb

@@ -50,6 +50,8 @@
 
 #include "yb/util/logging.h"
 
+DEFINE_int32(memstore_arena_size_kb, 128, "Size of each arena allocation for the memstore");
+
 namespace rocksdb {
 
 ColumnFamilyHandleImpl::ColumnFamilyHandleImpl(
@@ -172,7 +174,8 @@ ColumnFamilyOptions SanitizeOptions(const DBOptions& db_options,
   // if user sets arena_block_size, we trust user to use this value. Otherwise,
   // calculate a proper value from writer_buffer_size;
   if (result.arena_block_size <= 0) {
-    result.arena_block_size = result.write_buffer_size / 8;
+    result.arena_block_size = std::min(
+        result.write_buffer_size / 8, static_cast<size_t>(FLAGS_memstore_arena_size_kb << 10));
 
     // Align up to 4k
     const size_t align = 4 * 1024;
@@ -311,7 +314,7 @@ void SuperVersion::Cleanup() {
   MemTable* m = mem->Unref();
   if (m != nullptr) {
     auto* memory_usage = current->cfd()->imm()->current_memory_usage();
-    assert(*memory_usage >= m->ApproximateMemoryUsage());
+    DCHECK_GE(*memory_usage, m->ApproximateMemoryUsage());
     *memory_usage -= m->ApproximateMemoryUsage();
     to_delete.push_back(m);
   }
@@ -356,9 +359,9 @@ ColumnFamilyData::ColumnFamilyData(
       current_(nullptr),
       refs_(0),
       dropped_(false),
-      internal_comparator_(cf_options.comparator),
+      internal_comparator_(std::make_shared<InternalKeyComparator>(cf_options.comparator)),
       options_(*db_options,
-               SanitizeOptions(*db_options, &internal_comparator_, cf_options)),
+               SanitizeOptions(*db_options, internal_comparator_.get(), cf_options)),
       ioptions_(options_),
       mutable_cf_options_(options_, ioptions_),
       write_buffer_(write_buffer),
@@ -387,17 +390,17 @@ ColumnFamilyData::ColumnFamilyData(
     table_cache_.reset(new TableCache(ioptions_, env_options, _table_cache));
     if (ioptions_.compaction_style == kCompactionStyleLevel) {
       compaction_picker_.reset(
-          new LevelCompactionPicker(ioptions_, &internal_comparator_));
+          new LevelCompactionPicker(ioptions_, internal_comparator_.get()));
 #ifndef ROCKSDB_LITE
     } else if (ioptions_.compaction_style == kCompactionStyleUniversal) {
       compaction_picker_.reset(
-          new UniversalCompactionPicker(ioptions_, &internal_comparator_));
+          new UniversalCompactionPicker(ioptions_, internal_comparator_.get()));
     } else if (ioptions_.compaction_style == kCompactionStyleFIFO) {
       compaction_picker_.reset(
-          new FIFOCompactionPicker(ioptions_, &internal_comparator_));
+          new FIFOCompactionPicker(ioptions_, internal_comparator_.get()));
     } else if (ioptions_.compaction_style == kCompactionStyleNone) {
       compaction_picker_.reset(new NullCompactionPicker(
-          ioptions_, &internal_comparator_));
+          ioptions_, internal_comparator_.get()));
       RLOG(InfoLogLevel::WARN_LEVEL, ioptions_.info_log,
           "Column family %s does not use any background compaction. "
           "Compactions can only be done via CompactFiles\n",
@@ -409,7 +412,7 @@ ColumnFamilyData::ColumnFamilyData(
           "Column family %s will use kCompactionStyleLevel.\n",
           ioptions_.compaction_style, GetName().c_str());
       compaction_picker_.reset(
-          new LevelCompactionPicker(ioptions_, &internal_comparator_));
+          new LevelCompactionPicker(ioptions_, internal_comparator_.get()));
     }
 
     if (column_family_set_->NumberOfColumnFamilies() < 10) {
@@ -430,7 +433,7 @@ ColumnFamilyData::ColumnFamilyData(
 
 // DB mutex held
 ColumnFamilyData::~ColumnFamilyData() {
-  assert(refs_.load(std::memory_order_relaxed) == 0);
+  DCHECK_EQ(refs_.load(std::memory_order_relaxed), 0) << this;
   // remove from linked list
   auto prev = prev_;
   auto next = next_;
@@ -701,7 +704,7 @@ uint64_t ColumnFamilyData::GetTotalSstFilesSize() const {
 MemTable* ColumnFamilyData::ConstructNewMemtable(
     const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq) {
   assert(current() != nullptr);
-  return new MemTable(internal_comparator_, ioptions_, mutable_cf_options,
+  return new MemTable(*internal_comparator_, ioptions_, mutable_cf_options,
                       write_buffer_, earliest_seq);
 }
 
@@ -719,11 +722,11 @@ bool ColumnFamilyData::NeedsCompaction() const {
   return compaction_picker_->NeedsCompaction(current()->storage_info());
 }
 
-Compaction* ColumnFamilyData::PickCompaction(
+std::unique_ptr<Compaction> ColumnFamilyData::PickCompaction(
     const MutableCFOptions& mutable_options, LogBuffer* log_buffer) {
   // TODO: do we need to check if current() is not nullptr here?
   Version* const current_version = current();
-  auto* result = compaction_picker_->PickCompaction(
+  auto result = compaction_picker_->PickCompaction(
       GetName(), mutable_options, current_version->storage_info(), log_buffer);
   if (result != nullptr) {
     result->SetInputVersion(current_);
@@ -734,13 +737,13 @@ Compaction* ColumnFamilyData::PickCompaction(
 const int ColumnFamilyData::kCompactAllLevels = -1;
 const int ColumnFamilyData::kCompactToBaseLevel = -2;
 
-Compaction* ColumnFamilyData::CompactRange(
+std::unique_ptr<Compaction> ColumnFamilyData::CompactRange(
     const MutableCFOptions& mutable_cf_options, int input_level,
     int output_level, uint32_t output_path_id, const InternalKey* begin,
     const InternalKey* end, InternalKey** compaction_end, bool* conflict) {
   Version* const current_version = current();
   // TODO: do we need to check that current_version is not nullptr?
-  auto* result = compaction_picker_->CompactRange(
+  auto result = compaction_picker_->CompactRange(
       GetName(), mutable_cf_options, current_version->storage_info(), input_level,
       output_level, output_path_id, begin, end, compaction_end, conflict);
   if (result != nullptr) {

@@ -37,20 +37,29 @@
 #include "yb/client/client.h"
 #include "yb/consensus/consensus.h"
 #include "yb/gutil/strings/strcat.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/operations/operation_tracker.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/debug/trace_event.h"
+#include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/threadpool.h"
+#include "yb/util/thread_restrictions.h"
 #include "yb/util/trace.h"
+
+using namespace std::literals;
+
+DEFINE_test_flag(int32, TEST_delay_execute_async_ms, 0,
+                 "Delay execution of ExecuteAsync for specified amount of milliseconds during "
+                     "tests");
 
 namespace yb {
 namespace tablet {
 
+using namespace std::placeholders;
 using std::shared_ptr;
 
-using consensus::CommitMsg;
 using consensus::Consensus;
 using consensus::ConsensusRound;
 using consensus::ReplicateMsg;
@@ -65,56 +74,58 @@ using server::Clock;
 OperationDriver::OperationDriver(OperationTracker *operation_tracker,
                                  Consensus* consensus,
                                  Log* log,
-                                 PrepareThread* prepare_thread,
-                                 ThreadPool* apply_pool,
+                                 Preparer* preparer,
                                  OperationOrderVerifier* order_verifier,
                                  TableType table_type)
     : operation_tracker_(operation_tracker),
       consensus_(consensus),
       log_(log),
-      prepare_thread_(prepare_thread),
-      apply_pool_(apply_pool),
+      preparer_(preparer),
       order_verifier_(order_verifier),
       trace_(new Trace()),
-      start_time_(MonoTime::Now(MonoTime::FINE)),
+      start_time_(MonoTime::Now()),
       replication_state_(NOT_REPLICATING),
       prepare_state_(NOT_PREPARED),
       table_type_(table_type) {
   if (Trace::CurrentTrace()) {
     Trace::CurrentTrace()->AddChildTrace(trace_.get());
   }
+  DCHECK(op_id_copy_.is_lock_free());
 }
 
-Status OperationDriver::Init(std::unique_ptr<Operation> operation, DriverType type) {
-  operation_ = std::move(operation);
+Status OperationDriver::Init(std::unique_ptr<Operation>* operation, int64_t term) {
+  if (operation) {
+    operation_ = std::move(*operation);
+  }
 
-  if (type == consensus::REPLICA) {
-    std::lock_guard<simple_spinlock> lock(opid_lock_);
-    op_id_copy_ = operation_->state()->op_id();
-    DCHECK(op_id_copy_.IsInitialized());
+  if (term == OpId::kUnknownTerm) {
+    if (operation_) {
+      op_id_copy_.store(yb::OpId::FromPB(operation_->state()->op_id()),
+                                         boost::memory_order_release);
+    }
     replication_state_ = REPLICATING;
   } else {
-    DCHECK_EQ(type, consensus::LEADER);
     if (consensus_) {  // sometimes NULL in tests
       // Unretained is required to avoid a refcount cycle.
       consensus::ReplicateMsgPtr replicate_msg = operation_->NewReplicateMsg();
       mutable_state()->set_consensus_round(
         consensus_->NewRound(std::move(replicate_msg),
-                             Bind(&OperationDriver::ReplicationFinished, Unretained(this))));
-      if (table_type_ != TableType::KUDU_COLUMNAR_TABLE_TYPE) {
-        mutable_state()->consensus_round()->SetAppendCallback(this);
-      }
+                             std::bind(&OperationDriver::ReplicationFinished, this, _1, _2, _3)));
+      mutable_state()->consensus_round()->BindToTerm(term);
+      mutable_state()->consensus_round()->SetAppendCallback(this);
     }
   }
 
-  RETURN_NOT_OK(operation_tracker_->Add(this));
+  auto result = operation_tracker_->Add(this);
+  if (!result.ok() && operation) {
+    *operation = std::move(operation_);
+  }
 
-  return Status::OK();
+  return result;
 }
 
-consensus::OpId OperationDriver::GetOpId() {
-  std::lock_guard<simple_spinlock> lock(opid_lock_);
-  return op_id_copy_;
+yb::OpId OperationDriver::GetOpId() {
+  return op_id_copy_.load(boost::memory_order_acquire);
 }
 
 const OperationState* OperationDriver::state() const {
@@ -125,8 +136,8 @@ OperationState* OperationDriver::mutable_state() {
   return operation_ != nullptr ? operation_->state() : nullptr;
 }
 
-Operation::OperationType OperationDriver::operation_type() const {
-  return operation_->operation_type();
+OperationType OperationDriver::operation_type() const {
+  return operation_ ? operation_->operation_type() : OperationType::kEmpty;
 }
 
 string OperationDriver::ToString() const {
@@ -150,16 +161,16 @@ void OperationDriver::ExecuteAsync() {
   TRACE_EVENT_FLOW_BEGIN0("operation", "ExecuteAsync", this);
   ADOPT_TRACE(trace());
 
-  Status s;
-  if (replication_state_ == NOT_REPLICATING) {
-    // We're a leader operation. Before submitting, check that we are the leader and
-    // determine the current term.
-    s = consensus_->CheckLeadershipAndBindTerm(mutable_state()->consensus_round());
+  auto delay = GetAtomicFlag(&FLAGS_TEST_delay_execute_async_ms);
+  if (delay != 0 &&
+      operation_type() == OperationType::kWrite &&
+      operation_->state()->tablet()->tablet_id() != "00000000000000000000000000000000") {
+    LOG(INFO) << "T " << operation_->state()->tablet()->tablet_id()
+              << " Debug sleep for: " << MonoDelta(1ms * delay) << "\n" << GetStackTrace();
+    std::this_thread::sleep_for(1ms * delay);
   }
 
-  if (s.ok()) {
-    s = prepare_thread_->Submit(this);
-  }
+  auto s = preparer_->Submit(this);
 
   if (!s.ok()) {
     HandleFailure(s);
@@ -167,15 +178,15 @@ void OperationDriver::ExecuteAsync() {
 }
 
 void OperationDriver::HandleConsensusAppend() {
-  // YB tables only.
-  CHECK_NE(table_type_, TableType::KUDU_COLUMNAR_TABLE_TYPE);
+  if (!StartOperation()) {
+    return;
+  }
   ADOPT_TRACE(trace());
-  operation_->Start();
   auto* const replicate_msg = operation_->state()->consensus_round()->replicate_msg().get();
   CHECK(!replicate_msg->has_hybrid_time());
   replicate_msg->set_hybrid_time(operation_->state()->hybrid_time().ToUint64());
   replicate_msg->set_monotonic_counter(
-      *operation_->state()->tablet_peer()->tablet()->monotonic_counter());
+      *operation_->state()->tablet()->monotonic_counter());
 }
 
 void OperationDriver::PrepareAndStartTask() {
@@ -186,13 +197,31 @@ void OperationDriver::PrepareAndStartTask() {
   }
 }
 
+bool OperationDriver::StartOperation() {
+  if (operation_) {
+    operation_->Start();
+    std::lock_guard<simple_spinlock> lock(lock_);
+    op_id_copy_.store(yb::OpId::FromPB(operation_->state()->op_id()), boost::memory_order_release);
+  }
+  if (propagated_safe_time_) {
+    mvcc_->SetPropagatedSafeTimeOnFollower(propagated_safe_time_);
+  }
+  if (!operation_) {
+    operation_tracker_->Release(this, nullptr /* applied_op_ids */);
+    return false;
+  }
+  return true;
+}
+
 Status OperationDriver::PrepareAndStart() {
   ADOPT_TRACE(trace());
   TRACE_EVENT1("operation", "PrepareAndStart", "operation", this);
   VLOG_WITH_PREFIX(4) << "PrepareAndStart()";
   // Actually prepare and start the operation.
   prepare_physical_hybrid_time_ = GetMonoTimeMicros();
-  RETURN_NOT_OK(operation_->Prepare());
+  if (operation_) {
+    RETURN_NOT_OK(operation_->Prepare());
+  }
 
   // Only take the lock long enough to take a local copy of the
   // replication state and set our prepare state. This ensures that
@@ -205,12 +234,12 @@ Status OperationDriver::PrepareAndStart() {
     repl_state_copy = replication_state_;
   }
 
-  if (table_type_ == TableType::KUDU_COLUMNAR_TABLE_TYPE ||
-      repl_state_copy != NOT_REPLICATING) {
-    // For Kudu tables and for non-leader codepath in YB tables, we want to call Start() as soon
-    // as possible, because the operation already has the hybrid_time assigned. This will get a
-    // bit simpler as Kudu tables go away.
-    operation_->Start();
+  if (repl_state_copy != NOT_REPLICATING) {
+    // We want to call Start() as soon as possible, because the operation already has the
+    // hybrid_time assigned.
+    if (!StartOperation()) {
+      return Status::OK();
+    }
   }
 
   {
@@ -233,23 +262,13 @@ Status OperationDriver::PrepareAndStart() {
   switch (repl_state_copy) {
     case NOT_REPLICATING:
     {
-      ReplicateMsg* replicate_msg = operation_->state()->consensus_round()->replicate_msg().get();
-
-      if (table_type_ == TableType::KUDU_COLUMNAR_TABLE_TYPE) {
-        // Kudu tables only: set the hybrid_time in the message, now that it's prepared.
-        replicate_msg->set_hybrid_time(operation_->state()->hybrid_time().ToUint64());
-
-        // For YB tables, we set the hybrid_time at the same time as we append the entry to the
-        // consensus queue, to guarantee that hybrid_times increase monotonically with Raft indexes.
-      }
-
       {
         std::lock_guard<simple_spinlock> lock(lock_);
         replication_state_ = REPLICATING;
       }
 
       // After the batching changes from 07/2017, It is the caller's responsibility to call
-      // Consensus::Replicate. See PrepareThread for details.
+      // Consensus::Replicate. See Preparer for details.
       return Status::OK();
     }
     case REPLICATING:
@@ -262,46 +281,57 @@ Status OperationDriver::PrepareAndStart() {
       FALLTHROUGH_INTENDED;
     case REPLICATED:
     {
-      // We can move on to apply.
-      // Note that ApplyAsync() will handle the error status in the
+      // We can move on to apply.  Note that ApplyOperation() will handle the error status in the
       // REPLICATION_FAILED case.
-      return ApplyAsync();
+      return ApplyOperation(yb::OpId::kUnknownTerm, nullptr /* applied_op_ids */);
     }
   }
   FATAL_INVALID_ENUM_VALUE(ReplicationState, repl_state_copy);
 }
 
-void OperationDriver::SetReplicationFailed(const Status& replication_status) {
-  std::lock_guard<simple_spinlock> lock(lock_);
-  CHECK_EQ(replication_state_, REPLICATING);
-  operation_status_ = replication_status;
-  replication_state_ = REPLICATION_FAILED;
+void OperationDriver::ReplicationFailed(const Status& replication_status) {
+  {
+    std::lock_guard<simple_spinlock> lock(lock_);
+    if (replication_state_ == REPLICATION_FAILED) {
+      return;
+    }
+    CHECK_EQ(replication_state_, REPLICATING);
+    operation_status_ = replication_status;
+    replication_state_ = REPLICATION_FAILED;
+  }
+  HandleFailure();
 }
 
-void OperationDriver::HandleFailure(const Status& s) {
-  VLOG_WITH_PREFIX(2) << "Failed operation: " << s.ToString();
-  CHECK(!s.ok());
-  ADOPT_TRACE(trace());
-  TRACE("HandleFailure($0)", s.ToString());
-
+void OperationDriver::HandleFailure(Status status) {
   ReplicationState repl_state_copy;
 
   {
     std::lock_guard<simple_spinlock> lock(lock_);
-    operation_status_ = s;
+    if (!status.ok()) {
+      if (!operation_status_.ok()) {
+        LOG(DFATAL) << "Operation already failed with: " << operation_status_ << ", new status: "
+                    << status << ", state: " << replication_state_;
+      }
+      operation_status_ = status;
+    } else {
+      status = operation_status_;
+    }
     repl_state_copy = replication_state_;
   }
 
+  VLOG_WITH_PREFIX(2) << "Failed operation: " << status;
+  CHECK(!status.ok());
+  ADOPT_TRACE(trace());
+  TRACE("HandleFailure($0)", status.ToString());
 
   switch (repl_state_copy) {
     case NOT_REPLICATING:
     case REPLICATION_FAILED:
     {
       VLOG_WITH_PREFIX(1) << "Operation " << ToString() << " failed prior to "
-          "replication success: " << s.ToString();
-      operation_->Finish(Operation::ABORTED);
-      mutable_state()->completion_callback()->CompleteWithStatus(operation_status_);
-      operation_tracker_->Release(this);
+          "replication success: " << status;
+      operation_->Aborted(status);
+      operation_tracker_->Release(this, nullptr /* applied_op_ids */);
       return;
     }
 
@@ -309,26 +339,16 @@ void OperationDriver::HandleFailure(const Status& s) {
     case REPLICATED:
     {
       LOG_WITH_PREFIX(FATAL) << "Cannot cancel operations that have already replicated"
-          << ": " << operation_status_.ToString()
-          << " operation:" << ToString();
+                             << ": " << status << " operation:" << ToString();
     }
   }
 }
 
-void OperationDriver::ReplicationFinished(const Status& status) {
-  consensus::OpId op_id_local;
-  {
-    std::lock_guard<simple_spinlock> op_id_lock(opid_lock_);
-    // TODO: it's a bit silly that we have three copies of the opid:
-    // one here, one in ConsensusRound, and one in OperationState.
-
-    op_id_copy_ = DCHECK_NOTNULL(mutable_state()->consensus_round())->id();
-    DCHECK(op_id_copy_.IsInitialized());
-    // We can't update mutable_state()->mutable_op_id() here, because it is guarded by a different
-    // lock. Instead, we save it in a local variable and write it to the other location when
-    // holding the other lock.
-    op_id_local = op_id_copy_;
-  }
+void OperationDriver::ReplicationFinished(
+    const Status& status, int64_t leader_term, OpIds* applied_op_ids) {
+  auto op_id_local = DCHECK_NOTNULL(mutable_state()->consensus_round())->id();
+  DCHECK(!status.ok() || op_id_local.IsInitialized());
+  op_id_copy_.store(yb::OpId::FromPB(op_id_local), boost::memory_order_release);
 
   PrepareState prepare_state_copy;
   {
@@ -345,13 +365,13 @@ void OperationDriver::ReplicationFinished(const Status& status) {
   }
 
   // If we have prepared and replicated, we're ready to move ahead and apply this operation.
-  // Note that if we set the state to REPLICATION_FAILED above, ApplyAsync() will actually abort the
-  // operation, i.e. ApplyTask() will never be called and the operation will never be applied to
+  // Note that if we set the state to REPLICATION_FAILED above, ApplyOperation() will actually abort
+  // the operation, i.e. ApplyTask() will never be called and the operation will never be applied to
   // the tablet.
   if (prepare_state_copy == PREPARED) {
     // We likely need to do cleanup if this fails so for now just
     // CHECK_OK
-    CHECK_OK(ApplyAsync());
+    CHECK_OK(ApplyOperation(leader_term, applied_op_ids));
   }
 }
 
@@ -371,48 +391,37 @@ void OperationDriver::Abort(const Status& status) {
   // Apply hasn't started yet this prevents it from starting, but if it has then
   // the operation runs to completion.
   if (repl_state_copy == NOT_REPLICATING) {
-    HandleFailure(status);
+    HandleFailure();
   }
 }
 
-Status OperationDriver::ApplyAsync() {
+Status OperationDriver::ApplyOperation(
+    int64_t leader_term, OpIds* applied_op_ids) {
   {
     std::unique_lock<simple_spinlock> lock(lock_);
     DCHECK_EQ(prepare_state_, PREPARED);
     if (operation_status_.ok()) {
       DCHECK_EQ(replication_state_, REPLICATED);
-      order_verifier_->CheckApply(op_id_copy_.index(),
+      order_verifier_->CheckApply(op_id_copy_.load(boost::memory_order_relaxed).index,
                                   prepare_physical_hybrid_time_);
-      // Now that the operation is committed in consensus advance the safe time.
-      if (operation_->state()->external_consistency_mode() != COMMIT_WAIT) {
-        operation_->state()->tablet_peer()->tablet()->mvcc_manager()->
-            OfflineAdjustSafeTime(operation_->state()->hybrid_time());
-      }
     } else {
       DCHECK_EQ(replication_state_, REPLICATION_FAILED);
       DCHECK(!operation_status_.ok());
       lock.unlock();
-      HandleFailure(operation_status_);
+      HandleFailure();
       return Status::OK();
     }
   }
 
   TRACE_EVENT_FLOW_BEGIN0("operation", "ApplyTask", this);
-  switch (table_type_) {
-    case TableType::YQL_TABLE_TYPE: FALLTHROUGH_INTENDED;
-    case TableType::REDIS_TABLE_TYPE:
-      // Key-value tables backed by RocksDB require that we apply changes synchronously to enforce
-      // the order.
-      ApplyTask();
-      return Status::OK();
-    case TableType::KUDU_COLUMNAR_TABLE_TYPE:
-      return apply_pool_->SubmitClosure(Bind(&OperationDriver::ApplyTask, Unretained(this)));
-  }
-  LOG(FATAL) << "Invalid table type: " << table_type_;
-  return STATUS_FORMAT(IllegalState, "Invalid table type: $0", table_type_);
+
+  // RocksDB-backed tables require that we apply changes in the same order they appear in the Raft
+  // log.
+  ApplyTask(leader_term, applied_op_ids);
+  return Status::OK();
 }
 
-void OperationDriver::ApplyTask() {
+void OperationDriver::ApplyTask(int64_t leader_term, OpIds* applied_op_ids) {
   TRACE_EVENT_FLOW_END0("operation", "ApplyTask", this);
   ADOPT_TRACE(trace());
 
@@ -429,63 +438,10 @@ void OperationDriver::ApplyTask() {
   scoped_refptr<OperationDriver> ref(this);
 
   {
-    gscoped_ptr<CommitMsg> commit_msg;
-    CHECK_OK(operation_->Apply(&commit_msg));
-    if (commit_msg) {
-      commit_msg->mutable_commited_op_id()->CopyFrom(op_id_copy_);
-    }
-
-    // If the client requested COMMIT_WAIT as the external consistency mode
-    // calculate the latest that the prepare hybrid_time could be and wait
-    // until now.earliest > prepare_latest. Only after this are the locks
-    // released.
-    if (mutable_state()->external_consistency_mode() == COMMIT_WAIT) {
-      // TODO: only do this on the leader side
-      TRACE("APPLY: Commit Wait.");
-      // If we can't commit wait and have already applied we might have consistency
-      // issues if we still reply to the client that the operation was a success.
-      // On the other hand we don't have rollbacks as of yet thus we can't undo the
-      // the apply either, so we just CHECK_OK for now.
-      CHECK_OK(CommitWait());
-    }
-
-    operation_->PreCommit();
-
-    // We only write the "commit" records to the local log for legacy Kudu tables. We are not
-    // writing these records for RocksDB-based tables.
-    if (table_type_ == TableType::KUDU_COLUMNAR_TABLE_TYPE) {
-      TRACE_EVENT1("operation", "AsyncAppendCommit", "operation", this);
-      CHECK_OK(log_->AsyncAppendCommit(commit_msg.Pass(), Bind(DoNothingStatusCB)));
-    }
-
-    Finalize();
+    CHECK_OK(operation_->Replicated(leader_term));
+    operation_tracker_->Release(this, applied_op_ids);
   }
 }
-
-Status OperationDriver::CommitWait() {
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
-  DCHECK(mutable_state()->external_consistency_mode() == COMMIT_WAIT);
-  // TODO: we could plumb the RPC deadline in here, and not bother commit-waiting
-  // if the deadline is already expired.
-  RETURN_NOT_OK(
-      mutable_state()->tablet_peer()->clock().WaitUntilAfter(mutable_state()->hybrid_time(),
-                                                             MonoTime::Max()));
-  mutable_state()->mutable_metrics()->commit_wait_duration_usec =
-      MonoTime::Now(MonoTime::FINE).GetDeltaSince(before).ToMicroseconds();
-  return Status::OK();
-}
-
-void OperationDriver::Finalize() {
-  ADOPT_TRACE(trace());
-  // TODO: this is an ugly hack so that the Release() call doesn't delete the
-  // object while we still hold the lock.
-  scoped_refptr<OperationDriver> ref(this);
-  std::lock_guard<simple_spinlock> lock(lock_);
-  operation_->Finish(Operation::COMMITTED);
-  mutable_state()->completion_callback()->OperationCompleted();
-  operation_tracker_->Release(this);
-}
-
 
 std::string OperationDriver::StateString(ReplicationState repl_state,
                                            PrepareState prep_state) {
@@ -529,7 +485,8 @@ std::string OperationDriver::LogPrefix() const {
     std::lock_guard<simple_spinlock> lock(lock_);
     repl_state_copy = replication_state_;
     prep_state_copy = prepare_state_;
-    ts_string = state()->has_hybrid_time() ? state()->hybrid_time().ToString() : "No hybrid_time";
+    ts_string = state() && state()->has_hybrid_time()
+        ? state()->hybrid_time().ToString() : "No hybrid_time";
   }
 
   string state_str = StateString(repl_state_copy, prep_state_copy);
@@ -541,6 +498,17 @@ std::string OperationDriver::LogPrefix() const {
                              PREDICT_TRUE(consensus_) ? consensus_->peer_uuid() : "(unknown)",
                              state_str,
                              ts_string);
+}
+
+int64_t OperationDriver::SpaceUsed() {
+  if (!operation_) {
+    return 0;
+  }
+  auto consensus_round = operation_->state()->consensus_round();
+  if (consensus_round) {
+    return consensus_round->replicate_msg()->SpaceUsedLong();
+  }
+  return state()->request()->SpaceUsedLong();
 }
 
 }  // namespace tablet

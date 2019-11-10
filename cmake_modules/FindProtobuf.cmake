@@ -76,6 +76,33 @@
 # or implied.  See the License for the specific language governing permissions and limitations
 # under the License.
 #
+
+# Convert a relative path to a .proto file to the name of a custom target used for generating the
+# protobuf. This custom target enforces that there's just one invocation of protoc when there are
+# multiple consumers of the generated files. The target name must be unique; adding parts of the
+# filename helps ensure this.
+#
+# Example:
+# PROTO_REL_TO_YB_SRC_ROOT=src/yb/util/jsonwriter_test.proto ->
+#   TGT_NAME=gen_src_yb_util_jsonwriter_test_proto
+# PROTO_REL_TO_YB_SRC_ROOT=src/yb/util/proto_container_test.proto ->
+#   TGT_NAME=gen_src_yb_util_proto_container_test_proto
+function(GET_PROTOBUF_GENERATION_TARGET_NAME PROTO_REL_TO_YB_SRC_ROOT OUTPUT_VAR_NAME)
+  set(TGT_NAME "gen_${PROTO_REL_TO_YB_SRC_ROOT}")
+  string(REPLACE "@" "_" TGT_NAME ${TGT_NAME})
+  string(REPLACE "." "_" TGT_NAME ${TGT_NAME})
+  string(REPLACE "-" "_" TGT_NAME ${TGT_NAME})
+  string(REPLACE "/" "_" TGT_NAME ${TGT_NAME})
+  string(TOLOWER "${TGT_NAME}" TGT_NAME)
+  if (${YB_CMAKE_VERBOSE})
+    message(
+      "GET_PROTOBUF_GENERATION_TARGET_NAME: "
+      "PROTO_REL_TO_YB_SRC_ROOT=${PROTO_REL_TO_YB_SRC_ROOT} -> "
+      "TGT_NAME=${TGT_NAME}")
+  endif()
+  set("${OUTPUT_VAR_NAME}" "${TGT_NAME}" PARENT_SCOPE)
+endfunction()
+
 function(PROTOBUF_GENERATE_CPP SRCS HDRS TGTS)
   if(NOT ARGN)
     message(SEND_ERROR "Error: PROTOBUF_GENERATE_CPP() called without any proto files")
@@ -116,6 +143,7 @@ function(PROTOBUF_GENERATE_CPP SRCS HDRS TGTS)
     # Ensure that the protobuf file is within the source root.
     # This is a requirement of protoc.
     FILE(RELATIVE_PATH PROTO_REL_TO_ROOT "${ARG_SOURCE_ROOT}" "${ABS_FIL}")
+    FILE(RELATIVE_PATH PROTO_REL_TO_YB_SRC_ROOT "${YB_SRC_ROOT}" "${ABS_FIL}")
 
     GET_FILENAME_COMPONENT(REL_DIR "${PROTO_REL_TO_ROOT}" PATH)
 
@@ -143,13 +171,13 @@ function(PROTOBUF_GENERATE_CPP SRCS HDRS TGTS)
       COMMENT "Running C++ protocol buffer compiler on ${FIL}"
       VERBATIM )
 
-    # This custom target enforces that there's just one invocation of protoc
-    # when there are multiple consumers of the generated files. The target name
-    # must be unique; adding parts of the filename helps ensure this.
-    set(TGT_NAME ${REL_DIR}${FIL})
-    string(REPLACE "/" "-" TGT_NAME ${TGT_NAME})
+    GET_PROTOBUF_GENERATION_TARGET_NAME("${PROTO_REL_TO_YB_SRC_ROOT}" TGT_NAME)
+    message("Adding protobuf target: ${TGT_NAME}")
     add_custom_target(${TGT_NAME}
-      DEPENDS "${PROTO_CC_OUT}" "${PROTO_H_OUT}")
+      DEPENDS "${PROTO_CC_OUT}" "${PROTO_H_OUT}" protoc-gen-insertions)
+    add_dependencies(gen_proto ${TGT_NAME})
+    # This might be unnecessary, but we've seen issues with plugins not having been built in time.
+    add_dependencies("${TGT_NAME}" protoc-gen-insertions)
     list(APPEND ${TGTS} "${TGT_NAME}")
   endforeach()
 

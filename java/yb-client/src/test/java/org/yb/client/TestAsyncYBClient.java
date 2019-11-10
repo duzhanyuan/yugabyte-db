@@ -36,12 +36,16 @@ import com.google.protobuf.ByteString;
 import com.stumbleupon.async.Deferred;
 import org.junit.Ignore;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.yb.Common;
 import org.yb.consensus.Metadata;
 import org.yb.master.Master;
 
-import static org.junit.Assert.*;
+import static org.yb.AssertionWrappers.*;
 
+import org.yb.YBTestRunner;
+
+@RunWith(value=YBTestRunner.class)
 public class TestAsyncYBClient extends BaseYBClientTest {
 
   private static final String TABLE_NAME =
@@ -51,9 +55,8 @@ public class TestAsyncYBClient extends BaseYBClientTest {
   @Override
   protected void afterStartingMiniCluster() throws Exception {
     super.afterStartingMiniCluster();
-    // Set to 1 for testDisconnect to always test disconnecting the right server.
-    CreateTableOptions options = new CreateTableOptions().setNumReplicas(1);
-    table = createTable(TABLE_NAME, basicSchema, options);
+    CreateTableOptions options = new CreateTableOptions();
+    table = createTable(TABLE_NAME, hashKeySchema, options);
   }
 
   @Test
@@ -86,7 +89,7 @@ public class TestAsyncYBClient extends BaseYBClientTest {
       Common.HostPortPB.Builder hostBuilder = Common.HostPortPB.newBuilder();
       hostBuilder.setHost(badHostname + i);
       hostBuilder.setPort(i);
-      tsInfoBuilder.addRpcAddresses(hostBuilder);
+      tsInfoBuilder.addPrivateRpcAddresses(hostBuilder);
       tsInfoBuilder.setPermanentUuid(ByteString.copyFromUtf8("some uuid"));
       Master.TabletLocationsPB.ReplicaPB.Builder replicaBuilder =
           Master.TabletLocationsPB.ReplicaPB.newBuilder();

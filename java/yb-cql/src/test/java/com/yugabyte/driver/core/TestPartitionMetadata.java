@@ -18,16 +18,24 @@ import com.datastax.driver.core.TableMetadata;
 
 import org.yb.cql.BaseCQLTest;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestPartitionMetadata extends BaseCQLTest {
+
+  private TableSplitMetadata getPartitionMap(TableMetadata table) {
+    return cluster.getMetadata().getTableSplitMetadata(table.getKeyspace().getName(),
+                                                       table.getName());
+  }
 
   @Test
   public void testCreateDropTable() throws Exception {
 
-    // Create a PartitionMetadata with no refresh cycle.
-    PartitionMetadata metadata = new PartitionMetadata(cluster, 0);
     final int MAX_WAIT_SECONDS = 10;
 
     // Create test table. Verify that the PartitionMetadata gets notified of the table creation
@@ -39,7 +47,8 @@ public class TestPartitionMetadata extends BaseCQLTest {
                           .getTable("test_partition1");
     boolean found = false;
     for (int i = 0; i < MAX_WAIT_SECONDS; i++) {
-      if (metadata.getHostsForKey(table, 0).size() > 0) {
+      TableSplitMetadata partitionMap = getPartitionMap(table);
+      if (partitionMap != null && partitionMap.getHosts(0).size() > 0) {
         found = true;
         break;
       }
@@ -51,24 +60,12 @@ public class TestPartitionMetadata extends BaseCQLTest {
     // and clears the the metadata.
     session.execute("Drop table test_partition1;");
     for (int i = 0; i < MAX_WAIT_SECONDS; i++) {
-      if (metadata.getHostsForKey(table, 0).size() == 0) {
+      if (getPartitionMap(table) == null) {
         found = false;
         break;
       }
       Thread.sleep(1000);
     }
     assertFalse(found);
-
-    // Create a PartitionMetadata with 1-second refresh cycle. Verify the metadata is refreshed
-    // periodically even without table creation/drop.
-    metadata = new PartitionMetadata(cluster, 1);
-    final int MIN_LOAD_COUNT = 5;
-    for (int i = 0; i < MAX_WAIT_SECONDS; i++) {
-      if (metadata.loadCount.get() >= MIN_LOAD_COUNT)
-        break;
-      Thread.sleep(1000);
-    }
-    LOG.info("PartitionMetadata load count = " + metadata.loadCount.get());
-    assertTrue(metadata.loadCount.get() >= MIN_LOAD_COUNT);
   }
 }

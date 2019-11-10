@@ -20,9 +20,12 @@
 #include <boost/thread/mutex.hpp>
 
 #include "yb/client/client.h"
+#include "yb/client/meta_cache.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/table_handle.h"
 #include "yb/common/partition.h"
-#include "yb/redisserver/redis_constants.h"
-#include "yb/redisserver/redis_parser.h"
+#include "yb/yql/redis/redisserver/redis_constants.h"
+#include "yb/yql/redis/redisserver/redis_parser.h"
 #include "yb/common/common.pb.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
@@ -73,8 +76,6 @@ DEFINE_int64(max_noop_errors,
              1000,
              "Maximum number of noop errors. The test is aborted after this number of errors.");
 
-DEFINE_int32(num_replicas, 3, "Replication factor for the load test table");
-
 DEFINE_int32(num_tablets, 16, "Number of tablets to create in the table");
 
 DEFINE_bool(noop_only, false, "Only perform noop requests");
@@ -93,8 +94,6 @@ DEFINE_bool(
     drop_table, false,
     "Whether to drop the table if it already exists. If true, the table is deleted and "
     "then recreated");
-
-DEFINE_bool(use_kv_table, true, "Use key-value table type backed by RocksDB");
 
 DEFINE_int64(value_size_bytes, 16, "Size of each value in a row being inserted");
 
@@ -127,6 +126,7 @@ using yb::CountDownLatch;
 using yb::Slice;
 using yb::YBPartialRow;
 using yb::TableType;
+using yb::YQLDatabase;
 
 using strings::Substitute;
 
@@ -143,19 +143,19 @@ using yb::load_generator::FormatHexForLoadTestKey;
 
 // ------------------------------------------------------------------------------------------------
 
-void CreateTable(const YBTableName &table_name, const shared_ptr<YBClient> &client);
-void CreateRedisTable(const YBTableName &table_name, const shared_ptr<YBClient> &client);
-void CreateYBTable(const YBTableName &table_name, const shared_ptr<YBClient> &client);
+void CreateTable(const YBTableName &table_name, YBClient* client);
+void CreateRedisTable(const YBTableName &table_name, YBClient* client);
+void CreateYBTable(const YBTableName &table_name, YBClient* client);
 
 void LaunchYBLoadTest(SessionFactory *session_factory);
 
-shared_ptr<YBClient> CreateYBClient();
+std::unique_ptr<YBClient> CreateYBClient();
 
-void SetupYBTable(const shared_ptr<YBClient> &client);
+void SetupYBTable(YBClient* client);
 
-bool DropTableIfNecessary(const shared_ptr<YBClient> &client, const YBTableName &table_name);
+bool DropTableIfNecessary(YBClient* client, const YBTableName &table_name);
 
-bool YBTableExistsAlready(const shared_ptr<YBClient> &client, const YBTableName &table_name);
+bool YBTableExistsAlready(YBClient* client, const YBTableName &table_name);
 
 int main(int argc, char *argv[]) {
   gflags::SetUsageMessage(
@@ -181,27 +181,27 @@ int main(int argc, char *argv[]) {
     LOG(INFO) << "num_keys = " << FLAGS_num_rows;
 
   for (int i = 0; i < FLAGS_num_iter; ++i) {
+    auto client = CreateYBClient();
     if (!use_redis_table) {
       const YBTableName table_name("my_keyspace", FLAGS_table_name);
-      shared_ptr<YBClient> client = CreateYBClient();
-      SetupYBTable(client);
+      SetupYBTable(client.get());
 
-      shared_ptr<YBTable> table;
-      CHECK_OK(client->OpenTable(table_name, &table));
+      yb::client::TableHandle table;
+      CHECK_OK(table.Open(table_name, client.get()));
       if (FLAGS_reads_only) {
-        SingleThreadedScanner scanner(table.get());
+        SingleThreadedScanner scanner(&table);
         scanner.CountRows();
       } else if (FLAGS_noop_only) {
-        NoopSessionFactory session_factory(client.get(), table.get());
+        NoopSessionFactory session_factory(client.get(), &table);
         // Noop operations are done as write operations.
         FLAGS_writes_only = true;
         LaunchYBLoadTest(&session_factory);
       } else {
-        YBSessionFactory session_factory(client.get(), table.get());
+        YBSessionFactory session_factory(client.get(), &table);
         LaunchYBLoadTest(&session_factory);
       }
     } else {
-      SetupYBTable(CreateYBClient());
+      SetupYBTable(client.get());
       if (FLAGS_create_redis_table_and_exit) {
         LOG(INFO) << "Done creating redis table";
         return 0;
@@ -222,8 +222,7 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
-shared_ptr<YBClient> CreateYBClient() {
-  shared_ptr<YBClient> client;
+std::unique_ptr<YBClient> CreateYBClient() {
   YBClientBuilder client_builder;
   client_builder.default_rpc_timeout(MonoDelta::FromSeconds(FLAGS_rpc_timeout_sec));
   if (!FLAGS_load_test_master_addresses.empty() && !FLAGS_load_test_master_endpoint.empty()) {
@@ -234,12 +233,10 @@ shared_ptr<YBClient> CreateYBClient() {
   } else if (!FLAGS_load_test_master_endpoint.empty()) {
     client_builder.add_master_server_endpoint(FLAGS_load_test_master_endpoint);
   }
-  CHECK_OK(client_builder.Build(&client));
-
-  return client;
+  return CHECK_RESULT(client_builder.Build());
 }
 
-void SetupYBTable(const shared_ptr<YBClient> &client) {
+void SetupYBTable(YBClient* client) {
   string keyspace = "my_keyspace";
   if (!FLAGS_target_redis_server_addresses.empty() || FLAGS_create_redis_table_and_exit) {
     LOG(INFO) << "Ignoring FLAGS_table_name. Redis proxy expects table name to be "
@@ -248,28 +245,15 @@ void SetupYBTable(const shared_ptr<YBClient> &client) {
     keyspace = yb::common::kRedisKeyspaceName;
   }
   const YBTableName table_name(keyspace, FLAGS_table_name);
-  CHECK_OK(client->CreateNamespaceIfNotExists(table_name.namespace_name()));
+  CHECK_OK(client->CreateNamespaceIfNotExists(table_name.namespace_name(),
+                                              YQLDatabase::YQL_DATABASE_REDIS));
 
   if (!YBTableExistsAlready(client, table_name) || DropTableIfNecessary(client, table_name)) {
     CreateTable(table_name, client);
   }
 }
 
-vector<const YBPartialRow *> GetSplitsForTable(const YBSchema *schema) {
-  // Create the number of partitions based on the split keys.
-  vector<const YBPartialRow *> splits;
-  for (uint64_t j = 1; j < FLAGS_num_tablets; j++) {
-    YBPartialRow *row = schema->NewRow();
-    // We divide the interval between 0 and 2**64 into the requested number of intervals.
-    string split_key = FormatHexForLoadTestKey(((uint64_t)1 << 62) * 4.0 * j / (FLAGS_num_tablets));
-    LOG(INFO) << "split_key #" << j << "=" << split_key;
-    CHECK_OK(row->SetBinaryCopy(0, split_key));
-    splits.push_back(row);
-  }
-  return splits;
-}
-
-void CreateTable(const YBTableName &table_name, const shared_ptr<YBClient> &client) {
+void CreateTable(const YBTableName &table_name, YBClient* client) {
   if (!FLAGS_target_redis_server_addresses.empty() || FLAGS_create_redis_table_and_exit) {
     CreateRedisTable(table_name, client);
   } else {
@@ -282,12 +266,11 @@ void CreateTable(const YBTableName &table_name, const shared_ptr<YBClient> &clie
   sleep(10);
 }
 
-void CreateRedisTable(const YBTableName &table_name, const shared_ptr<YBClient> &client) {
+void CreateRedisTable(const YBTableName &table_name, YBClient* client) {
   LOG(INFO) << "Creating table with " << FLAGS_num_tablets << " hash based partitions.";
   gscoped_ptr<YBTableCreator> table_creator(client->NewTableCreator());
   Status table_creation_status = table_creator->table_name(table_name)
                                      .num_tablets(FLAGS_num_tablets)
-                                     .num_replicas(FLAGS_num_replicas)
                                      .table_type(yb::client::YBTableType::REDIS_TABLE_TYPE)
                                      .Create();
   if (!table_creation_status.ok()) {
@@ -299,7 +282,7 @@ void CreateRedisTable(const YBTableName &table_name, const shared_ptr<YBClient> 
   }
 }
 
-void CreateYBTable(const YBTableName &table_name, const shared_ptr<YBClient> &client) {
+void CreateYBTable(const YBTableName &table_name, YBClient* client) {
   LOG(INFO) << "Building schema";
   YBSchemaBuilder schemaBuilder;
   schemaBuilder.AddColumn("k")->PrimaryKey()->Type(yb::BINARY)->NotNull();
@@ -307,18 +290,12 @@ void CreateYBTable(const YBTableName &table_name, const shared_ptr<YBClient> &cl
   YBSchema schema;
   CHECK_OK(schemaBuilder.Build(&schema));
 
-  vector<const YBPartialRow *> splits = GetSplitsForTable(&schema);
-
   LOG(INFO) << "Creating table";
   gscoped_ptr<YBTableCreator> table_creator(client->NewTableCreator());
   Status table_creation_status =
       table_creator->table_name(table_name)
           .schema(&schema)
-          .split_rows(splits)
-          .num_replicas(FLAGS_num_replicas)
-          .table_type(
-              FLAGS_use_kv_table ? yb::client::YBTableType::YQL_TABLE_TYPE
-                                 : yb::client::YBTableType::KUDU_COLUMNAR_TABLE_TYPE)
+          .table_type(yb::client::YBTableType::YQL_TABLE_TYPE)
           .Create();
   if (!table_creation_status.ok()) {
     LOG(INFO) << "Table creation status message: " << table_creation_status.message().ToString();
@@ -329,7 +306,7 @@ void CreateYBTable(const YBTableName &table_name, const shared_ptr<YBClient> &cl
   }
 }
 
-bool YBTableExistsAlready(const shared_ptr<YBClient> &client, const YBTableName &table_name) {
+bool YBTableExistsAlready(YBClient* client, const YBTableName &table_name) {
   LOG(INFO) << "Checking if table '" << table_name.ToString() << "' already exists";
   {
     YBSchema existing_schema;
@@ -344,7 +321,7 @@ bool YBTableExistsAlready(const shared_ptr<YBClient> &client, const YBTableName 
   }
 }
 
-bool DropTableIfNecessary(const shared_ptr<YBClient> &client, const YBTableName &table_name) {
+bool DropTableIfNecessary(YBClient* client, const YBTableName &table_name) {
   if (FLAGS_drop_table) {
     LOG(INFO) << "Table '" << table_name.ToString() << "' already exists, deleting";
     // Table with the same name already exists, drop it.

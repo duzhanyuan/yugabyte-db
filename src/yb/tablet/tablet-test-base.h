@@ -43,8 +43,10 @@
 #include <gtest/gtest.h>
 
 #include "yb/common/partial_row.h"
+#include "yb/common/ql_expr.h"
+#include "yb/common/ql_protocol_util.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/row.h"
-#include "yb/common/scan_spec.h"
 #include "yb/common/schema.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
@@ -56,12 +58,8 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/tablet/local_tablet_writer.h"
-#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet-test-util.h"
 #include "yb/gutil/strings/numbers.h"
-
-using std::unordered_set;
-using strings::Substitute;
 
 namespace yb {
 namespace tablet {
@@ -71,30 +69,25 @@ namespace tablet {
 // get coverage on various schemas without duplicating test code.
 struct StringKeyTestSetup {
   static Schema CreateSchema() {
-    return Schema({ ColumnSchema("key", STRING),
+    return Schema({ ColumnSchema("key", STRING, false, true),
                     ColumnSchema("key_idx", INT32),
                     ColumnSchema("val", INT32) },
                   1);
   }
 
-  void BuildRowKey(YBPartialRow *row, int64_t key_idx) {
+  void BuildRowKey(QLWriteRequestPB *req, int64_t key_idx) {
     // This is called from multiple threads, so can't move this buffer
     // to be a class member. However, it's likely to get inlined anyway
     // and loop-hosted.
     char buf[256];
     FormatKey(buf, sizeof(buf), key_idx);
-    CHECK_OK(row->SetStringCopy(0, Slice(buf)));
+    QLAddStringHashValue(req, buf);
   }
 
-  // builds a row key from an existing row for updates
-  void BuildRowKeyFromExistingRow(YBPartialRow *row, const RowBlockRow& src_row) {
-    CHECK_OK(row->SetStringCopy(0, *reinterpret_cast<const Slice*>(src_row.cell_ptr(0))));
-  }
-
-  void BuildRow(YBPartialRow *row, int64_t key_idx, int32_t val = 0) {
-    BuildRowKey(row, key_idx);
-    CHECK_OK(row->SetInt32(1, key_idx));
-    CHECK_OK(row->SetInt32(2, val));
+  void BuildRow(QLWriteRequestPB *req, int64_t key_idx, int32_t val = 0) {
+    BuildRowKey(req, key_idx);
+    QLAddInt32ColumnValue(req, kFirstColumnId + 1, key_idx);
+    QLAddInt32ColumnValue(req, kFirstColumnId + 2, val);
   }
 
   static void FormatKey(char *buf, size_t buf_size, int64_t key_idx) {
@@ -105,8 +98,8 @@ struct StringKeyTestSetup {
     char buf[256];
     FormatKey(buf, sizeof(buf), key_idx);
 
-    return Substitute(
-      "(string key=$0, int32 key_idx=$1, int32 val=$2)",
+    return strings::Substitute(
+      "{ string_value: \"$0\" int32_value: $1 int32_value: $2 }",
       buf, key_idx, val);
   }
 
@@ -120,17 +113,11 @@ struct StringKeyTestSetup {
 // Setup for testing composite keys
 struct CompositeKeyTestSetup {
   static Schema CreateSchema() {
-    return Schema({ ColumnSchema("key1", STRING),
-                    ColumnSchema("key2", INT32),
+    return Schema({ ColumnSchema("key1", STRING, false, true),
+                    ColumnSchema("key2", INT32, false, true),
                     ColumnSchema("key_idx", INT32),
                     ColumnSchema("val", INT32) },
                   2);
-  }
-
-  // builds a row key from an existing row for updates
-  void BuildRowKeyFromExistingRow(YBPartialRow *row, const RowBlockRow& src_row) {
-    CHECK_OK(row->SetStringCopy(0, *reinterpret_cast<const Slice*>(src_row.cell_ptr(0))));
-    CHECK_OK(row->SetInt32(1, *reinterpret_cast<const int32_t*>(src_row.cell_ptr(1))));
   }
 
   static void FormatKey(char *buf, size_t buf_size, int64_t key_idx) {
@@ -140,7 +127,7 @@ struct CompositeKeyTestSetup {
   string FormatDebugRow(int64_t key_idx, int32_t val, bool updated) {
     char buf[256];
     FormatKey(buf, sizeof(buf), key_idx);
-    return Substitute(
+    return strings::Substitute(
       "(string key1=$0, int32 key2=$1, int32 val=$2, int32 val=$3)",
       buf, key_idx, key_idx, val);
   }
@@ -156,12 +143,12 @@ struct CompositeKeyTestSetup {
 template<DataType Type>
 struct IntKeyTestSetup {
   static Schema CreateSchema() {
-    return Schema({ ColumnSchema("key", Type),
+    return Schema({ ColumnSchema("key", Type, false, true),
                     ColumnSchema("key_idx", INT32),
                     ColumnSchema("val", INT32) }, 1);
   }
 
-  void BuildRowKey(YBPartialRow *row, int64_t i) {
+  void BuildRowKey(QLWriteRequestPB *req, int64_t i) {
     CHECK(false) << "Unsupported type";
   }
 
@@ -171,11 +158,10 @@ struct IntKeyTestSetup {
     CHECK(false) << "Unsupported type";
   }
 
-  void BuildRow(YBPartialRow *row, int64_t key_idx,
-                int32_t val = 0) {
-    BuildRowKey(row, key_idx);
-    CHECK_OK(row->SetInt32(1, key_idx));
-    CHECK_OK(row->SetInt32(2, val));
+  void BuildRow(QLWriteRequestPB* req, int64_t key_idx, int32_t val = 0) {
+    BuildRowKey(req, key_idx);
+    QLAddInt32ColumnValue(req, kFirstColumnId + 1, key_idx);
+    QLAddInt32ColumnValue(req, kFirstColumnId + 2, val);
   }
 
   string FormatDebugRow(int64_t key_idx, int32_t val, bool updated) {
@@ -189,23 +175,23 @@ struct IntKeyTestSetup {
 };
 
 template<>
-void IntKeyTestSetup<INT8>::BuildRowKey(YBPartialRow *row, int64_t i) {
-  CHECK_OK(row->SetInt8(0, (int8_t) i * (i % 2 == 0 ? -1 : 1)));
+void IntKeyTestSetup<INT8>::BuildRowKey(QLWriteRequestPB *req, int64_t i) {
+  QLAddInt8HashValue(req, i * (i % 2 == 0 ? -1 : 1));
 }
 
 template<>
-void IntKeyTestSetup<INT16>::BuildRowKey(YBPartialRow *row, int64_t i) {
-  CHECK_OK(row->SetInt16(0, (int16_t) i * (i % 2 == 0 ? -1 : 1)));
+void IntKeyTestSetup<INT16>::BuildRowKey(QLWriteRequestPB *req, int64_t i) {
+  QLAddInt16HashValue(req, i * (i % 2 == 0 ? -1 : 1));
 }
 
 template<>
-void IntKeyTestSetup<INT32>::BuildRowKey(YBPartialRow *row, int64_t i) {
-  CHECK_OK(row->SetInt32(0, (int32_t) i * (i % 2 == 0 ? -1 : 1)));
+void IntKeyTestSetup<INT32>::BuildRowKey(QLWriteRequestPB *req, int64_t i) {
+  QLAddInt32HashValue(req, i * (i % 2 == 0 ? -1 : 1));
 }
 
 template<>
-void IntKeyTestSetup<INT64>::BuildRowKey(YBPartialRow *row, int64_t i) {
-  CHECK_OK(row->SetInt64(0, (int64_t) i * (i % 2 == 0 ? -1 : 1)));
+void IntKeyTestSetup<INT64>::BuildRowKey(QLWriteRequestPB *req, int64_t i) {
+  QLAddInt64HashValue(req, i * (i % 2 == 0 ? -1 : 1));
 }
 
 template<> template<class RowType>
@@ -233,42 +219,42 @@ void IntKeyTestSetup<INT64>::BuildRowKeyFromExistingRow(YBPartialRow *row,
 
 template<>
 string IntKeyTestSetup<INT8>::FormatDebugRow(int64_t key_idx, int32_t val, bool updated) {
-  return Substitute(
-    "(int8 key=$0, int32 key_idx=$1, int32 val=$2)",
+  return strings::Substitute(
+    "{ int8_value: $0 int32_value: $1 int32_value: $2 }",
     (key_idx % 2 == 0) ? -key_idx : key_idx, key_idx, val);
 }
 
 template<>
 string IntKeyTestSetup<INT16>::FormatDebugRow(int64_t key_idx, int32_t val, bool updated) {
-  return Substitute(
-    "(int16 key=$0, int32 key_idx=$1, int32 val=$2)",
+  return strings::Substitute(
+    "{ int16_value: $0 int32_value: $1 int32_value: $2 }",
     (key_idx % 2 == 0) ? -key_idx : key_idx, key_idx, val);
 }
 
 template<>
 string IntKeyTestSetup<INT32>::FormatDebugRow(int64_t key_idx, int32_t val, bool updated) {
-  return Substitute(
-    "(int32 key=$0, int32 key_idx=$1, int32 val=$2)",
+  return strings::Substitute(
+    "{ int32_value: $0 int32_value: $1 int32_value: $2 }",
     (key_idx % 2 == 0) ? -key_idx : key_idx, key_idx, val);
 }
 
 template<>
 string IntKeyTestSetup<INT64>::FormatDebugRow(int64_t key_idx, int32_t val, bool updated) {
-  return Substitute(
-    "(int64 key=$0, int32 key_idx=$1, int32 val=$2)",
+  return strings::Substitute(
+    "{ int64_value: $0 int32_value: $1 int32_value: $2 }",
     (key_idx % 2 == 0) ? -key_idx : key_idx, key_idx, val);
 }
 
 // Setup for testing nullable columns
 struct NullableValueTestSetup {
   static Schema CreateSchema() {
-    return Schema({ ColumnSchema("key", INT32),
+    return Schema({ ColumnSchema("key", INT32, false, true),
                     ColumnSchema("key_idx", INT32),
                     ColumnSchema("val", INT32, true) }, 1);
   }
 
-  void BuildRowKey(YBPartialRow *row, int64_t i) {
-    CHECK_OK(row->SetInt32(0, (int32_t)i));
+  void BuildRowKey(QLWriteRequestPB *req, int64_t i) {
+    QLAddInt32HashValue(req, i);
   }
 
   // builds a row key from an existing row for updates
@@ -277,25 +263,24 @@ struct NullableValueTestSetup {
     CHECK_OK(row->SetInt32(0, *reinterpret_cast<const int32_t*>(src_row.cell_ptr(0))));
   }
 
-  void BuildRow(YBPartialRow *row, int64_t key_idx, int32_t val = 0) {
-    BuildRowKey(row, key_idx);
-    CHECK_OK(row->SetInt32(1, key_idx));
-    if (ShouldInsertAsNull(key_idx)) {
-      CHECK_OK(row->SetNull(2));
-    } else {
-      CHECK_OK(row->SetInt32(2, val));
+  void BuildRow(QLWriteRequestPB *req, int64_t key_idx, int32_t val = 0) {
+    BuildRowKey(req, key_idx);
+    QLAddInt32ColumnValue(req, kFirstColumnId + 1, key_idx);
+
+    if (!ShouldInsertAsNull(key_idx)) {
+      QLAddInt32ColumnValue(req, kFirstColumnId + 2, val);
     }
   }
 
   string FormatDebugRow(int64_t key_idx, int64_t val, bool updated) {
     if (!updated && ShouldInsertAsNull(key_idx)) {
-      return Substitute(
+      return strings::Substitute(
       "(int32 key=$0, int32 key_idx=$1, int32 val=NULL)",
         (int32_t)key_idx, key_idx);
     }
 
-    return Substitute(
-      "(int32 key=$0, int32 key_idx=$1, int32 val=$2)",
+    return strings::Substitute(
+      "{ int32_value: $0 int32_value: $1 int32_value: $2 }",
       (int32_t)key_idx, key_idx, val);
   }
 
@@ -323,7 +308,6 @@ class TabletTestBase : public YBTabletTest {
  public:
   TabletTestBase() :
     YBTabletTest(TESTSETUP::CreateSchema()),
-    setup_(),
     max_rows_(setup_.GetMaxRows()),
     arena_(1024, 4*1024*1024)
   {}
@@ -333,14 +317,13 @@ class TabletTestBase : public YBTabletTest {
                       int64_t count,
                       int32_t val,
                       TimeSeries *ts = NULL) {
-
-    LocalTabletWriter writer(tablet().get(), &client_schema_);
-    YBPartialRow row(&client_schema_);
+    LocalTabletWriter writer(tablet().get());
 
     uint64_t inserted_since_last_report = 0;
     for (int64_t i = first_row; i < first_row + count; i++) {
-      setup_.BuildRow(&row, i, val);
-      CHECK_OK(writer.Insert(row));
+      QLWriteRequestPB req;
+      setup_.BuildRow(&req, i, val);
+      CHECK_OK(writer.Write(&req));
 
       if ((inserted_since_last_report++ > 100) && ts) {
         ts->AddValue(static_cast<double>(inserted_since_last_report));
@@ -357,40 +340,38 @@ class TabletTestBase : public YBTabletTest {
   CHECKED_STATUS InsertTestRow(LocalTabletWriter* writer,
                                int64_t key_idx,
                                int32_t val) {
-    YBPartialRow row(&client_schema_);
-    setup_.BuildRow(&row, key_idx, val);
-    return writer->Insert(row);
+    QLWriteRequestPB req;
+    req.set_type(QLWriteRequestPB::QL_STMT_INSERT);
+    setup_.BuildRow(&req, key_idx, val);
+    return writer->Write(&req);
   }
 
   CHECKED_STATUS UpdateTestRow(LocalTabletWriter* writer,
                                int64_t key_idx,
                                int32_t new_val) {
-    YBPartialRow row(&client_schema_);
-    setup_.BuildRowKey(&row, key_idx);
-
+    QLWriteRequestPB req;
+    req.set_type(QLWriteRequestPB::QL_STMT_UPDATE);
+    setup_.BuildRowKey(&req, key_idx);
     // select the col to update (the third if there is only one key
     // or the fourth if there are two col keys).
-    int col_idx = schema_.num_key_columns() == 1 ? 2 : 3;
-    CHECK_OK(row.SetInt32(col_idx, new_val));
-    return writer->Update(row);
+    QLAddInt32ColumnValue(&req, kFirstColumnId + (schema_.num_key_columns() == 1 ? 2 : 3), new_val);
+    return writer->Write(&req);
   }
 
   CHECKED_STATUS UpdateTestRowToNull(LocalTabletWriter* writer,
                                      int64_t key_idx) {
-    YBPartialRow row(&client_schema_);
-    setup_.BuildRowKey(&row, key_idx);
-
-    // select the col to update (the third if there is only one key
-    // or the fourth if there are two col keys).
-    int col_idx = schema_.num_key_columns() == 1 ? 2 : 3;
-    CHECK_OK(row.SetNull(col_idx));
-    return writer->Update(row);
+    QLWriteRequestPB req;
+    req.set_type(QLWriteRequestPB::QL_STMT_UPDATE);
+    setup_.BuildRowKey(&req, key_idx);
+    QLAddNullColumnValue(&req, kFirstColumnId + (schema_.num_key_columns() == 1 ? 2 : 3));
+    return writer->Write(&req);
   }
 
   CHECKED_STATUS DeleteTestRow(LocalTabletWriter* writer, int64_t key_idx) {
-    YBPartialRow row(&client_schema_);
-    setup_.BuildRowKey(&row, key_idx);
-    return writer->Delete(row);
+    QLWriteRequestPB req;
+    req.set_type(QLWriteRequestPB::QL_STMT_DELETE);
+    setup_.BuildRowKey(&req, key_idx);
+    return writer->Write(&req);
   }
 
   template <class RowType>
@@ -399,15 +380,8 @@ class TabletTestBase : public YBTabletTest {
   }
 
   void VerifyTestRows(int64_t first_row, uint64_t expected_count) {
-    gscoped_ptr<RowwiseIterator> iter;
-    ASSERT_OK(tablet()->NewRowIterator(client_schema_, boost::none, &iter));
-    ScanSpec scan_spec;
-    ASSERT_OK(iter->Init(&scan_spec));
-    int batch_size = std::max(
-      (size_t)1, std::min((size_t)(expected_count / 10),
-                          4*1024*1024 / schema_.byte_size()));
-    Arena arena(32*1024, 256*1024);
-    RowBlock block(schema_, batch_size, &arena);
+    auto iter = tablet()->NewRowIterator(client_schema_, boost::none);
+    ASSERT_OK(iter);
 
     if (expected_count > INT_MAX) {
       LOG(INFO) << "Not checking rows for duplicates -- duplicates expected since "
@@ -420,26 +394,24 @@ class TabletTestBase : public YBTabletTest {
     std::vector<bool> seen_rows;
     seen_rows.resize(expected_count);
 
-    while (iter->HasNext()) {
-      ASSERT_OK_FAST(iter->NextBlock(&block));
+    QLTableRow row;
+    QLValue value;
+    while (ASSERT_RESULT((**iter).HasNext())) {
+      ASSERT_OK_FAST((**iter).NextRow(&row));
 
-      RowBlockRow rb_row = block.row(0);
       if (VLOG_IS_ON(2)) {
-        VLOG(2) << "Fetched batch of " << block.nrows() << "\n"
-            << "First row: " << schema_.DebugRow(rb_row);
+        VLOG(2) << "Fetched row: " << row.ToString();
       }
 
-      for (int i = 0; i < block.nrows(); i++) {
-        rb_row.Reset(&block, i);
-        int32_t key_idx = *schema_.ExtractColumnFromRow<INT32>(rb_row, 1);
-        if (key_idx >= first_row && key_idx < first_row + expected_count) {
-          size_t rel_idx = key_idx - first_row;
-          if (seen_rows[rel_idx]) {
-            FAIL() << "Saw row " << key_idx << " twice!\n"
-                   << "Row: " << schema_.DebugRow(rb_row);
-          }
-          seen_rows[rel_idx] = true;
+      ASSERT_OK(row.GetValue(schema_.column_id(1), &value));
+      int32_t key_idx = value.int32_value();
+      if (key_idx >= first_row && key_idx < first_row + expected_count) {
+        size_t rel_idx = key_idx - first_row;
+        if (seen_rows[rel_idx]) {
+          FAIL() << "Saw row " << key_idx << " twice!\n"
+                 << "Row: " << row.ToString();
         }
+        seen_rows[rel_idx] = true;
       }
     }
 
@@ -454,12 +426,10 @@ class TabletTestBase : public YBTabletTest {
   // into the given vector. This is only useful in tests which insert
   // a very small number of rows.
   CHECKED_STATUS IterateToStringList(vector<string> *out) {
-    gscoped_ptr<RowwiseIterator> iter;
     // TODO(dtxn) pass correct transaction ID if needed
-    RETURN_NOT_OK(this->tablet()->NewRowIterator(this->client_schema_, boost::none, &iter));
-    ScanSpec scan_spec;
-    RETURN_NOT_OK(iter->Init(&scan_spec));
-    return yb::tablet::IterateToStringList(iter.get(), out);
+    auto iter = this->tablet()->NewRowIterator(this->client_schema_, boost::none);
+    RETURN_NOT_OK(iter);
+    return yb::tablet::IterateToStringList(iter->get(), out);
   }
 
   // because some types are small we need to
@@ -479,7 +449,6 @@ class TabletTestBase : public YBTabletTest {
 
   Arena arena_;
 };
-
 
 } // namespace tablet
 } // namespace yb

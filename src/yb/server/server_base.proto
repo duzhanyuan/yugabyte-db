@@ -29,6 +29,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+syntax = "proto2";
+
 package yb.server;
 
 option java_package = "org.yb.server";
@@ -91,6 +93,18 @@ message SetFlagResponsePB {
   optional string old_value = 3;
 }
 
+// Get the value of the gflag with the given flag name.
+message GetFlagRequestPB {
+  optional string flag = 1;
+}
+
+// If the flag name is valid, the value is set to its current value.
+// Else the valid field will be set to false.
+message GetFlagResponsePB {
+  optional bool valid = 1 [default = true];
+  optional string value = 2;
+}
+
 // Attempt to flush coverage information to disk, if running a coverage build.
 message FlushCoverageRequestPB {
 }
@@ -114,20 +128,6 @@ message GetStatusResponsePB {
   required ServerStatusPB status = 1;
 }
 
-// Makes the HybridClock of the server use these values for wall clock time and error,
-// for testing purposes.
-// Requires that the server was started with '--use_mock_wall_clock=true'.
-message SetServerWallClockForTestsRequestPB {
-  optional uint64 now_usec = 1;
-  optional uint64 max_error_usec = 2;
-}
-
-// Response corresponding to the request above.
-message SetServerWallClockForTestsResponsePB {
-  // Set to 'true' if the clock was updated successfully.
-  required bool success = 1;
-}
-
 message PingRequestPB {
 }
 
@@ -138,14 +138,14 @@ service GenericService {
   rpc SetFlag(SetFlagRequestPB)
     returns (SetFlagResponsePB);
 
+  rpc GetFlag(GetFlagRequestPB)
+    returns (GetFlagResponsePB);
+
   rpc FlushCoverage(FlushCoverageRequestPB)
     returns (FlushCoverageResponsePB);
 
   rpc ServerClock(ServerClockRequestPB)
     returns (ServerClockResponsePB);
-
-  rpc SetServerWallClockForTests(SetServerWallClockForTestsRequestPB)
-    returns (SetServerWallClockForTestsResponsePB);
 
   rpc GetStatus(GetStatusRequestPB)
     returns (GetStatusResponsePB);

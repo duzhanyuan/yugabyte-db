@@ -43,13 +43,12 @@
 #include "yb/common/schema.h"
 
 #include "yb/docdb/doc_operation.h"
-#include "yb/docdb/shared_lock_manager_fwd.h"
+#include "yb/docdb/intent.h"
 #include "yb/docdb/lock_batch.h"
+#include "yb/docdb/shared_lock_manager_fwd.h"
 
 #include "yb/gutil/macros.h"
 
-#include "yb/tablet/lock_manager.h"
-#include "yb/tablet/mvcc.h"
 #include "yb/tablet/tablet.pb.h"
 #include "yb/tablet/operations/operation.h"
 
@@ -58,7 +57,6 @@
 namespace yb {
 struct DecodedRowOperation;
 class ConstContiguousRow;
-class RowwiseRowBlockPB;
 
 namespace consensus {
 class Consensus;
@@ -70,21 +68,12 @@ class WriteResponsePB;
 }
 
 namespace tablet {
-struct RowOp;
-class RowSetKeyProbe;
-struct TabletComponents;
 class Tablet;
 
 using docdb::LockBatch;
 
 // A OperationState for a batch of inserts/mutates. This class holds and
-// owns most everything related to a transaction, including:
-// - A RowOp structure for each of the rows being inserted or mutated, which itself
-//   contains:
-//   - decoded/projected data
-//   - row lock reference
-//   - result of this particular insert/mutate operation, once executed
-// - the Replicate and Commit PB messages
+// owns most everything related to a transaction, including the Replicate and Commit PB messages
 //
 // All the transaction related pointers are owned by this class
 // and destroyed on Reset() or by the destructor.
@@ -100,23 +89,15 @@ using docdb::LockBatch;
 // NOTE: this class isn't thread safe.
 class WriteOperationState : public OperationState {
  public:
-  WriteOperationState(TabletPeer* tablet_peer = nullptr,
+  WriteOperationState(Tablet* tablet = nullptr,
                       const tserver::WriteRequestPB *request = nullptr,
-                      tserver::WriteResponsePB *response = nullptr);
+                      tserver::WriteResponsePB *response = nullptr,
+                      docdb::OperationKind kind = docdb::OperationKind::kWrite);
   virtual ~WriteOperationState();
-
-  // Returns the result of this transaction in its protocol buffers form.
-  // The transaction result holds information on exactly which memory stores
-  // were mutated in the context of this transaction and can be used to
-  // perform recovery.
-  //
-  // This releases part of the state of the transaction, and will crash
-  // if called more than once.
-  void ReleaseTxResultPB(TxResultPB* result) const;
 
   // Returns the original client request for this transaction, if there was
   // one.
-  const tserver::WriteRequestPB *request() const override {
+  const tserver::WriteRequestPB* request() const override {
     return request_;
   }
 
@@ -124,84 +105,24 @@ class WriteOperationState : public OperationState {
     return request_;
   }
 
-  void UpdateRequestFromConsensusRound() override {
-    request_ = consensus_round()->replicate_msg()->mutable_write_request();
-  }
+  void UpdateRequestFromConsensusRound() override;
 
   // Returns the prepared response to the client that will be sent when this
   // transaction is completed, if this transaction was started by a client.
-  tserver::WriteResponsePB *response() {
+  tserver::WriteResponsePB* response() {
     return response_;
   }
-
-  // Set the MVCC transaction associated with this Write operation.
-  // This must be called exactly once, during the PREPARE phase just
-  // after the MvccManager has assigned a hybrid_time.
-  // This also copies the hybrid_time from the MVCC transaction into the
-  // WriteOperationState object.
-  void SetMvccTxAndHybridTime(std::unique_ptr<ScopedWriteOperation> mvcc_tx);
-
-  // Set the Tablet components that this transaction will write into.
-  // Called exactly once at the beginning of Apply, before applying its
-  // in-memory edits.
-  void set_tablet_components(const scoped_refptr<const TabletComponents>& components);
-
-  // Take a shared lock on the given schema lock.
-  // This is required prior to decoding rows so that the schema does
-  // not change in between performing the projection and applying
-  // the writes.
-  void AcquireSchemaLock(rw_semaphore* schema_lock);
-
-  // Release the already-acquired schema lock.
-  void ReleaseSchemaLock();
-
-
-  void set_schema_at_decode_time(const Schema* schema) {
-    std::lock_guard<simple_spinlock> l(txn_state_lock_);
-    schema_at_decode_time_ = schema;
-  }
-
-  const Schema* schema_at_decode_time() const {
-    std::lock_guard<simple_spinlock> l(txn_state_lock_);
-    return schema_at_decode_time_;
-  }
-
-  const TabletComponents* tablet_components() const {
-    return tablet_components_.get();
-  }
-
-  // Notifies the MVCC manager that this operation is about to start applying
-  // its in-memory edits. After this method is called, the transaction _must_
-  // Commit() within a bounded amount of time (there may be other threads
-  // blocked on it).
-  void StartApplying();
 
   // Commits the Mvcc transaction and releases the component lock. After
   // this method is called all the inserts and mutations will become
   // visible to other transactions.
-  //
-  // Only one of Commit() or Abort() should be called.
-  // REQUIRES: StartApplying() was called.
   //
   // Note: request_ and response_ are set to nullptr after this method returns.
   void Commit();
 
   // Aborts the mvcc transaction and releases the component lock.
   // Only one of Commit() or Abort() should be called.
-  //
-  // REQUIRES: StartApplying() must never have been called.
   void Abort();
-
-  // Returns all the prepared row writes for this transaction. Usually called
-  // on the apply phase to actually make changes to the tablet.
-  const std::vector<RowOp*>& row_ops() const {
-    return row_ops_;
-  }
-
-  void swap_row_ops(std::vector<RowOp*>* new_ops) {
-    std::lock_guard<simple_spinlock> l(txn_state_lock_);
-    row_ops_.swap(*new_ops);
-  }
 
   // The QL write operations that return rowblocks that need to be returned as RPC sidecars
   // after the transaction completes.
@@ -209,33 +130,38 @@ class WriteOperationState : public OperationState {
     return &ql_write_ops_;
   }
 
+  // Returns PGSQL write operations.
+  // TODO(neil) These ops must report number of rows that was updated, deleted, or inserted.
+  std::vector<std::unique_ptr<docdb::PgsqlWriteOperation>>* pgsql_write_ops() {
+    return &pgsql_write_ops_;
+  }
+
   // Moves the given lock batch into this object so it can be unlocked when the operation is
   // complete.
   void ReplaceDocDBLocks(LockBatch&& docdb_locks) {
-    std::lock_guard<simple_spinlock> l(txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(mutex_);
     docdb_locks_ = std::move(docdb_locks);
   }
 
-  void UpdateMetricsForOp(const RowOp& op);
-
   // Releases all the DocDB locks acquired by this transaction.
-  void ReleaseDocDbLocks(Tablet* tablet);
+  void ReleaseDocDbLocks();
 
   // Resets this OperationState, releasing all locks, destroying all prepared
   // writes, clearing the transaction result _and_ committing the current Mvcc
   // transaction.
   void Reset();
 
-  virtual std::string ToString() const override;
+  std::string ToString() const override;
+
+  docdb::OperationKind kind() const {
+    return kind_;
+  }
 
  private:
   // Reset the response, and row_ops_ (which refers to data
   // from the request). Request is owned by WriteOperation using a unique_ptr.
   // A copy is made at initialization, so we don't need to reset it.
   void ResetRpcFields();
-
-  // Sets mvcc_tx_ to nullptr after commit/abort in a thread-safe manner.
-  void ResetMvccTx(std::function<void(ScopedWriteOperation*)> txn_action);
 
   // pointers to the rpc context, request and response, lifecycle
   // is managed by the rpc subsystem. These pointers maybe nullptr if the
@@ -244,49 +170,40 @@ class WriteOperationState : public OperationState {
 
   tserver::WriteResponsePB* response_;
 
-  // The row operations which are decoded from the request during PREPARE
-  // Protected by superclass's txn_state_lock_.
-  std::vector<RowOp*> row_ops_;
-
   // The QL write operations that return rowblocks that need to be returned as RPC sidecars
   // after the transaction completes.
   std::vector<std::unique_ptr<docdb::QLWriteOperation>> ql_write_ops_;
+
+  // The PGSQL write operations that return rowblocks that need to be returned as RPC sidecars
+  // after the transaction completes.
+  std::vector<std::unique_ptr<docdb::PgsqlWriteOperation>> pgsql_write_ops_;
 
   // Store the ids that have been locked for DocDB transaction. They need to be released on commit
   // or if an error happens.
   LockBatch docdb_locks_;
 
-  // The MVCC transaction, set up during PREPARE phase
-  std::unique_ptr<ScopedWriteOperation> mvcc_tx_;
-
-  // A lock protecting mvcc_tx_. This is important at least because mvcc_tx_ can be reset to nullptr
-  // when a transaction is being aborted (e.g. on server shutdown), and we don't want that to race
-  // with committing the transaction.
-  // TODO(mbautin): figure out why Kudu did not need this originally. Maybe that's because a
-  //                transaction cannot be aborted after the Apply process has started? See if
-  //                we actually get counterexamples for this in tests.
-  std::mutex mvcc_tx_mutex_;
-
-  // The tablet components, acquired at the same time as mvcc_tx_ is set.
-  scoped_refptr<const TabletComponents> tablet_components_;
-
-  // A lock held on the tablet's schema. Prevents concurrent schema change
-  // from racing with a write.
-  shared_lock<rw_semaphore> schema_lock_;
-
-  // The Schema of the tablet when the transaction was first decoded.
-  // This is verified at APPLY time to ensure we don't have races against
-  // schema change.
-  // Protected by superclass's txn_state_lock_.
-  const Schema* schema_at_decode_time_;
+  docdb::OperationKind kind_;
 
   DISALLOW_COPY_AND_ASSIGN(WriteOperationState);
+};
+
+class WriteOperationContext {
+ public:
+  // When operation completes, its callback is executed.
+  virtual void Submit(std::unique_ptr<Operation> operation, int64_t term) = 0;
+  virtual void Aborted(Operation* operation) = 0;
+  virtual HybridTime ReportReadRestart() = 0;
+
+  virtual ~WriteOperationContext() {}
 };
 
 // Executes a write transaction.
 class WriteOperation : public Operation {
  public:
-  WriteOperation(std::unique_ptr<WriteOperationState> operation_state, consensus::DriverType type);
+  WriteOperation(std::unique_ptr<WriteOperationState> operation_state, int64_t term,
+                 CoarseTimePoint deadline, WriteOperationContext* context);
+
+  ~WriteOperation();
 
   WriteOperationState* state() override {
     return down_cast<WriteOperationState*>(Operation::state());
@@ -301,12 +218,51 @@ class WriteOperation : public Operation {
   // Executes a Prepare for a write transaction
   //
   // Decodes the operations in the request PB and acquires row locks for each of the
-  // affected rows. This results in adding 'RowOp' objects for each of the operations
-  // into the WriteOperationState.
-  virtual CHECKED_STATUS Prepare() override;
+  // affected rows.
+  CHECKED_STATUS Prepare() override;
+
+  std::string ToString() const override;
+
+  tserver::WriteRequestPB* request() {
+    return state()->mutable_request();
+  }
+
+  tserver::WriteResponsePB* response() {
+    return state()->response();
+  }
+
+  ReadHybridTime read_time() {
+    return ReadHybridTime::FromReadTimePB(*request());
+  }
+
+  HybridTime restart_read_ht() const {
+    return restart_read_ht_;
+  }
+
+  void SetRestartReadHt(HybridTime value) {
+    restart_read_ht_ = value;
+  }
+
+  CoarseTimePoint deadline() const {
+    return deadline_;
+  }
+
+  docdb::DocOperations& doc_ops() {
+    return doc_ops_;
+  }
+
+  static void StartSynchronization(
+      std::unique_ptr<WriteOperation> operation, const Status& status) {
+    // We release here, because DoStartSynchronization takes ownership on this.
+    operation.release()->DoStartSynchronization(status);
+  }
+
+ private:
+  friend class DelayedApplyOperation;
 
   // Actually starts the Mvcc transaction and assigns a hybrid_time to this transaction.
-  virtual void Start() override;
+  void DoStart() override;
+  void DoStartSynchronization(const Status& status);
 
   // Executes an Apply for a write transaction.
   //
@@ -326,22 +282,27 @@ class WriteOperation : public Operation {
   // are placed in the queue (but not necessarily in the same order of the
   // original requests) which is already a requirement of the consensus
   // algorithm.
-  virtual CHECKED_STATUS Apply(gscoped_ptr<consensus::CommitMsg>* commit_msg) override;
+  // Commits the mvcc transaction and updates the metrics.
+  CHECKED_STATUS DoReplicated(int64_t leader_term, Status* complete_status) override;
 
-  // Releases the row locks (Early Lock Release).
-  virtual void PreCommit() override;
+  // Aborts the mvcc transaction.
+  CHECKED_STATUS DoAborted(const Status& status) override;
 
-  // If result == COMMITTED, commits the mvcc transaction and updates
-  // the metrics, if result == ABORTED aborts the mvcc transaction.
-  virtual void Finish(OperationResult result) override;
+  WriteOperationContext& context_;
+  const int64_t term_;
+  const CoarseTimePoint deadline_;
 
-  virtual std::string ToString() const override;
-
- private:
   // this transaction's start time
   MonoTime start_time_;
 
-  TabletPeer* tablet_peer() { return state()->tablet_peer(); }
+  HybridTime restart_read_ht_;
+
+  docdb::DocOperations doc_ops_;
+
+  // True if operation was submitted, i.e. context_.Submit(this) was invoked.
+  bool submitted_;
+
+  Tablet* tablet() { return state()->tablet(); }
 
   DISALLOW_COPY_AND_ASSIGN(WriteOperation);
 };

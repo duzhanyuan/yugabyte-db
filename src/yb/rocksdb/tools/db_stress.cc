@@ -73,7 +73,7 @@ int main() {
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/utilities/merge_operators.h"
 
@@ -1907,8 +1907,6 @@ class StressTest {
   }
 
   void PrintEnv() const {
-    fprintf(stdout, "RocksDB version           : %d.%d\n", kMajorVersion,
-            kMinorVersion);
     fprintf(stdout, "Column families           : %d\n", FLAGS_column_families);
     if (!FLAGS_test_batches_snapshots) {
       fprintf(stdout, "Clear CFs one in          : %d\n",

@@ -12,6 +12,10 @@
 //
 
 #include "yb/client/client.h"
+#include "yb/client/session.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/yb_op.h"
+
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 #include "yb/rpc/messenger.h"
@@ -22,20 +26,24 @@
 #include "yb/util/random.h"
 
 DECLARE_uint64(max_clock_sync_error_usec);
-DECLARE_bool(use_mock_wall_clock);
 DECLARE_bool(disable_clock_sync_error);
 DECLARE_int32(ht_lease_duration_ms);
+DECLARE_string(time_source);
 
 namespace yb {
+
+const std::string kMock = "mock";
 
 class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
  public:
   ClockSynchronizationTest() : random_(0) {
+    server::HybridClock::RegisterProvider(kMock, mock_clock_.AsProvider());
   }
 
   void SetUp() override {
-    FLAGS_use_mock_wall_clock = true;
     FLAGS_ht_lease_duration_ms = 0;
+    SetupFlags();
+
     YBMiniClusterTestBase::SetUp();
     MiniClusterOptions opts;
 
@@ -48,13 +56,11 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
     b.AddColumn("value")->Type(INT64)->NotNull();
     CHECK_OK(b.Build(&schema_));
 
-    rpc::MessengerBuilder bld("Client");
-    ASSERT_OK(bld.Build().MoveTo(&client_messenger_));
-    client::YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
   }
 
   void DoTearDown() override {
+    client_.reset();
     cluster_->Shutdown();
   }
 
@@ -68,7 +74,6 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_OK(table_creator->table_name(*table_name_.get())
                   .table_type(client::YBTableType::YQL_TABLE_TYPE)
                   .schema(&schema_)
-                  .num_replicas(cluster_->num_tablet_servers())
                   .num_tablets(10)
                   .wait(true)
                   .Create());
@@ -91,67 +96,31 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
       QLColumnValuePB *column = req->add_column_values();
       column->set_column_id(kFirstColumnId + 1);
       column->mutable_expr()->mutable_value()->set_int64_value(val);
-      EXPECT_OK(session->Apply(ql_write));
+      EXPECT_OK(session->ApplyAndFlush(ql_write));
       EXPECT_EQ(QLResponsePB::YQL_STATUS_OK, ql_write->response().status());
     }
   }
 
-  std::shared_ptr<client::YBClient> client_;
+  virtual void SetupFlags() {
+    FLAGS_time_source = "mock";
+  }
+
+  std::unique_ptr<client::YBClient> client_;
   client::YBSchema schema_;
   std::unique_ptr<client::YBTableName> table_name_;
   std::shared_ptr<client::YBTable> table_;
-  std::shared_ptr<rpc::Messenger> client_messenger_;
+  std::unique_ptr<rpc::Messenger> client_messenger_;
   Random random_;
+  MockClock mock_clock_;
   constexpr static const char* const kNamespace = "my_namespace";
   constexpr static const char* const kTableName = "my_table";
 };
 
-#if !defined(__APPLE__)
-class MockHybridClockNtpErrors : public server::HybridClock {
- public:
-
-  int NtpAdjtime(timex* timex) {
-    ntp_adjtime(timex);
-    // Always return error.
-    return TIME_ERROR;
-  }
-
-  int NtpGettime(ntptimeval* timeval) {
-    ntp_gettime(timeval);
-    // Always return error.
-    return TIME_ERROR;
-  }
-
-};
-#endif // !defined(__APPLE__)
-
 TEST_F(ClockSynchronizationTest, TestClockSkewError) {
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-    server::HybridClock* clock =
-        down_cast<server::HybridClock*>(cluster_->mini_tablet_server(i)->server()->Clock());
-    clock->SetMockMaxClockErrorForTests(FLAGS_max_clock_sync_error_usec + 1);
-  }
+  mock_clock_.Set({0, FLAGS_max_clock_sync_error_usec + 1});
 
   CreateTable();
   PerformOps(100);
 }
-
-#if !defined(__APPLE__)
-TEST_F(ClockSynchronizationTest, TestNtpErrors) {
-  using ::testing::AtLeast;
-  using ::testing::Return;
-  using ::testing::_;
-
-  FLAGS_use_mock_wall_clock = false;
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-    auto* mock_clock = new MockHybridClockNtpErrors();
-    EXPECT_OK(mock_clock->Init());
-    cluster_->mini_tablet_server(i)->server()->SetClockForTests(mock_clock);
-  }
-
-  CreateTable();
-  PerformOps(100);
-}
-#endif // !defined(__APPLE__)
 
 } // namespace yb

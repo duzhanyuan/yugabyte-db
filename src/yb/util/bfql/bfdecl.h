@@ -19,7 +19,10 @@
 #ifndef YB_UTIL_BFQL_BFDECL_H_
 #define YB_UTIL_BFQL_BFDECL_H_
 
-#include "yb/client/client.h"
+#include "yb/common/common.pb.h"
+
+#include "yb/gutil/macros.h"
+
 #include "yb/util/logging.h"
 #include "yb/util/bfql/tserver_opcodes.h"
 
@@ -37,12 +40,14 @@ class BFDecl {
  public:
   BFDecl(const char *cpp_name,
          const char *ql_name,
+         const char *bfopcode_name,
          DataType return_type,
          std::initializer_list<DataType> param_types,
          TSOpcode tsopcode = TSOpcode::kNoOp,
          bool implemented = true)
       : cpp_name_(cpp_name),
         ql_name_(ql_name),
+        bfopcode_name_(bfopcode_name),
         return_type_(return_type),
         param_types_(param_types),
         tsopcode_(tsopcode),
@@ -55,6 +60,10 @@ class BFDecl {
 
   const char *ql_name() const {
     return ql_name_;
+  }
+
+  const char *bfopcode_name() const {
+    return bfopcode_name_;
   }
 
   const DataType& return_type() const {
@@ -81,9 +90,46 @@ class BFDecl {
     return implemented_;
   }
 
+  bool is_collection_bcall() const {
+    return is_collection_op(tsopcode_);
+  }
+
+  bool is_aggregate_bcall() const {
+    return is_aggregate_op(tsopcode_);
+  }
+
+  static bool is_collection_op(TSOpcode tsopcode) {
+    switch (tsopcode) {
+      case TSOpcode::kMapExtend: FALLTHROUGH_INTENDED;
+      case TSOpcode::kMapRemove: FALLTHROUGH_INTENDED;
+      case TSOpcode::kSetExtend: FALLTHROUGH_INTENDED;
+      case TSOpcode::kSetRemove: FALLTHROUGH_INTENDED;
+      case TSOpcode::kListAppend: FALLTHROUGH_INTENDED;
+      case TSOpcode::kListPrepend: FALLTHROUGH_INTENDED;
+      case TSOpcode::kListRemove:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static bool is_aggregate_op(TSOpcode tsopcode) {
+    switch (tsopcode) {
+      case TSOpcode::kAvg: FALLTHROUGH_INTENDED;
+      case TSOpcode::kCount: FALLTHROUGH_INTENDED;
+      case TSOpcode::kMax: FALLTHROUGH_INTENDED;
+      case TSOpcode::kMin: FALLTHROUGH_INTENDED;
+      case TSOpcode::kSum:
+        return true;
+      default:
+        return false;
+    }
+  }
+
  private:
   const char *cpp_name_;
   const char *ql_name_;
+  const char *bfopcode_name_;
   DataType return_type_;
   std::vector<DataType> param_types_;
   TSOpcode tsopcode_;

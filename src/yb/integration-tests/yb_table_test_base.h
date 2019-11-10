@@ -22,9 +22,9 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "yb/client/client.h"
 #include "yb/client/callbacks.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/table_handle.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/strcat.h"
@@ -34,7 +34,6 @@
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/master/mini_master.h"
 #include "yb/tablet/maintenance_manager.h"
-#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tserver/mini_tablet_server.h"
@@ -52,37 +51,35 @@ namespace integration_tests {
 
 // This is a common base class from which SQLTableTest and RedisTableTest will inherit from.
 // In future some of the functionality may be migrated to sub-base classes when it becomes bigger.
-// i.e. scan related functions may be moved down because it is only supported for Kudu / SQL tables.
+// i.e. scan related functions may be moved down because it is only supported for SQL tables.
 class YBTableTestBase : public YBTest {
  protected:
   YBTableTestBase();
   virtual void SetUp() override;
   virtual void TearDown() override;
+  virtual void BeforeCreateTable();
 
   virtual bool use_external_mini_cluster();
   virtual int session_timeout_ms();
   virtual int num_masters();
   virtual int num_tablet_servers();
   virtual int num_tablets();
-  virtual int num_replicas();
   virtual int client_rpc_timeout_ms();
   virtual client::YBTableName table_name();
   virtual bool need_redis_table();
 
-  void CreateRedisTable(shared_ptr<yb::client::YBClient> client, client::YBTableName table_name);
+  void CreateRedisTable(client::YBTableName table_name);
   virtual void CreateTable();
   void OpenTable();
   void DeleteTable();
   virtual void PutKeyValue(yb::client::YBSession* session, string key, string value);
   virtual void PutKeyValue(string key, string value);
-  void ConfigureScanner(yb::client::YBScanner* scanner);
   void RestartCluster();
-  void GetScanResults(yb::client::YBScanner* scanner,
-                      vector<pair<string, string>>* result_kvs);
+  std::vector<std::pair<std::string, std::string>> GetScanResults(const client::TableRange& range);
   void FetchTSMetricsPage();
 
-  std::shared_ptr<yb::client::YBTable> table_;
-  std::shared_ptr<yb::client::YBClient> client_;
+  client::TableHandle table_;
+  std::unique_ptr<client::YBClient> client_;
   bool table_exists_ = false;
 
   yb::MiniCluster* mini_cluster() {
@@ -94,6 +91,8 @@ class YBTableTestBase : public YBTest {
     assert(use_external_mini_cluster());
     return external_mini_cluster_.get();
   }
+
+  virtual void CustomizeExternalMiniCluster(ExternalMiniClusterOptions* opts) {}
 
   vector<string> master_rpc_addresses_as_strings() {
     vector<string> host_ports;
@@ -122,9 +121,9 @@ class YBTableTestBase : public YBTest {
   // Calls CreateYBClient and assigns it to local class field
   void CreateClient();
   // Creates a ClientYB client without assigning it to the class field.
-  std::shared_ptr<yb::client::YBClient> CreateYBClient();
+  std::unique_ptr<yb::client::YBClient> CreateYBClient();
 
-  std::shared_ptr<yb::client::YBSession> NewSession(bool read_only_ = false);
+  std::shared_ptr<yb::client::YBSession> NewSession();
 
   yb::client::YBSchema schema_;
   std::shared_ptr<yb::client::YBSession> session_;

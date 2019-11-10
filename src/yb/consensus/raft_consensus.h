@@ -41,13 +41,15 @@
 #include <vector>
 
 #include <boost/optional/optional_fwd.hpp>
+
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus_peers.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_queue.h"
 
-#include "yb/util/failure_detector.h"
+#include "yb/util/opid.h"
+#include "yb/util/random.h"
 #include "yb/util/result.h"
 
 DECLARE_int32(leader_lease_duration_ms);
@@ -59,14 +61,17 @@ typedef std::lock_guard<simple_spinlock> Lock;
 typedef gscoped_ptr<Lock> ScopedLock;
 
 class Counter;
-class FailureDetector;
 class HostPort;
 class ThreadPool;
+class ThreadPoolToken;
 
 namespace server {
 class Clock;
 }
 
+namespace rpc {
+class PeriodicTimer;
+}
 namespace consensus {
 class ConsensusMetadata;
 class Peer;
@@ -75,44 +80,53 @@ class PeerManager;
 class ReplicaState;
 struct ElectionResult;
 
-typedef std::function<void()> LostLeadershipListener;
-
 constexpr int32_t kDefaultLeaderLeaseDurationMs = 2000;
 
-class RaftConsensus : public Consensus,
-                      public PeerMessageQueueObserver {
+YB_STRONGLY_TYPED_BOOL(WriteEmpty);
+YB_STRONGLY_TYPED_BOOL(PreElected);
+
+YB_DEFINE_ENUM(RejectMode, (kNone)(kAll)(kNonEmpty));
+
+class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+                      public Consensus,
+                      public PeerMessageQueueObserver,
+                      public SafeOpIdWaiter {
  public:
   class ConsensusFaultHooks;
 
-  static scoped_refptr<RaftConsensus> Create(
+  static std::shared_ptr<RaftConsensus> Create(
     const ConsensusOptions& options,
-    gscoped_ptr<ConsensusMetadata> cmeta,
+    std::unique_ptr<ConsensusMetadata> cmeta,
     const RaftPeerPB& local_peer_pb,
     const scoped_refptr<MetricEntity>& metric_entity,
     const scoped_refptr<server::Clock>& clock,
-    ReplicaOperationFactory* operation_factory,
-    const std::shared_ptr<rpc::Messenger>& messenger,
+    ConsensusContext* consensus_context,
+    rpc::Messenger* messenger,
+    rpc::ProxyCache* proxy_cache,
     const scoped_refptr<log::Log>& log,
+    const std::shared_ptr<MemTracker>& server_mem_tracker,
     const std::shared_ptr<MemTracker>& parent_mem_tracker,
     const Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
     TableType table_type,
-    LostLeadershipListener lost_leadership_listener);
+    ThreadPool* raft_pool,
+    RetryableRequests* retryable_requests);
 
-  RaftConsensus(const ConsensusOptions& options,
-    gscoped_ptr<ConsensusMetadata> cmeta,
+  RaftConsensus(
+    const ConsensusOptions& options,
+    std::unique_ptr<ConsensusMetadata> cmeta,
     gscoped_ptr<PeerProxyFactory> peer_proxy_factory,
     gscoped_ptr<PeerMessageQueue> queue,
     gscoped_ptr<PeerManager> peer_manager,
-    gscoped_ptr<ThreadPool> thread_pool,
+    std::unique_ptr<ThreadPoolToken> raft_pool_token,
     const scoped_refptr<MetricEntity>& metric_entity,
     const std::string& peer_uuid,
     const scoped_refptr<server::Clock>& clock,
-    ReplicaOperationFactory* operation_factory,
+    ConsensusContext* consensus_context,
     const scoped_refptr<log::Log>& log,
     std::shared_ptr<MemTracker> parent_mem_tracker,
     Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
     TableType table_type,
-    LostLeadershipListener lost_leadership_listener);
+    RetryableRequests* retryable_requests);
 
   virtual ~RaftConsensus();
 
@@ -124,66 +138,54 @@ class RaftConsensus : public Consensus,
   // in the configuration by sending a NO_OP to other peers.
   // This is NOT safe to use in a distributed configuration with failure detection
   // enabled, as it could result in a split-brain scenario.
-  virtual CHECKED_STATUS EmulateElection() override;
+  CHECKED_STATUS EmulateElection() override;
 
-  virtual CHECKED_STATUS StartElection(
-      ElectionMode mode,
-      const bool pending_commit = false,
-      const OpId& must_be_committed_opid = OpId::default_instance(),
-      const std::string& originator_uuid = std::string()) override;
+  CHECKED_STATUS ElectionLostByProtege(const std::string& election_lost_by_uuid) override;
 
-  virtual CHECKED_STATUS ElectionLostByProtege(const std::string& election_lost_by_uuid) override;
+  CHECKED_STATUS WaitUntilLeaderForTests(const MonoDelta& timeout) override;
 
-  virtual CHECKED_STATUS WaitUntilLeaderForTests(const MonoDelta& timeout) override;
-
-  virtual CHECKED_STATUS StepDown(const LeaderStepDownRequestPB* req,
+  CHECKED_STATUS StepDown(const LeaderStepDownRequestPB* req,
                           LeaderStepDownResponsePB* resp) override;
 
-  // Call StartElection(), log a warning if the call fails (usually due to
-  // being shut down).
-  void ReportFailureDetected(const std::string& name, const Status& msg);
+  CHECKED_STATUS TEST_Replicate(const ConsensusRoundPtr& round) override;
+  CHECKED_STATUS ReplicateBatch(ConsensusRounds* rounds) override;
 
-  virtual CHECKED_STATUS Replicate(const ConsensusRoundPtr& round) override;
-  virtual CHECKED_STATUS ReplicateBatch(const ConsensusRounds& rounds) override;
-
-  virtual CHECKED_STATUS CheckLeadershipAndBindTerm(const scoped_refptr<ConsensusRound>& round)
-      override;
-
-  virtual CHECKED_STATUS Update(
+  CHECKED_STATUS Update(
       ConsensusRequestPB* request,
-      ConsensusResponsePB* response) override;
+      ConsensusResponsePB* response,
+      CoarseTimePoint deadline) override;
 
-  virtual CHECKED_STATUS RequestVote(const VoteRequestPB* request,
-                                     VoteResponsePB* response) override;
+  CHECKED_STATUS RequestVote(const VoteRequestPB* request,
+                             VoteResponsePB* response) override;
 
-  virtual CHECKED_STATUS ChangeConfig(const ChangeConfigRequestPB& req,
-                              const StatusCallback& client_cb,
+  CHECKED_STATUS ChangeConfig(const ChangeConfigRequestPB& req,
+                              const StdStatusCallback& client_cb,
                               boost::optional<tserver::TabletServerErrorPB::Code>* error_code)
                               override;
 
   RaftPeerPB::Role GetRoleUnlocked() const;
 
-  virtual RaftPeerPB::Role role() const override;
+  RaftPeerPB::Role role() const override;
 
-  LeaderStatus leader_status() const override;
+  LeaderState GetLeaderState() const override;
 
-  virtual std::string peer_uuid() const override;
+  std::string peer_uuid() const override;
 
-  virtual std::string tablet_id() const override;
+  std::string tablet_id() const override;
 
-  virtual ConsensusStatePB ConsensusState(
+  ConsensusStatePB ConsensusState(
       ConsensusConfigType type,
       LeaderLeaseStatus* leader_lease_status) const override;
 
-  virtual ConsensusStatePB ConsensusStateUnlocked(
+  ConsensusStatePB ConsensusStateUnlocked(
       ConsensusConfigType type,
       LeaderLeaseStatus* leader_lease_status) const override;
 
-  virtual RaftConfigPB CommittedConfig() const override;
+  RaftConfigPB CommittedConfig() const override;
 
-  virtual void DumpStatusHtml(std::ostream& out) const override;
+  void DumpStatusHtml(std::ostream& out) const override;
 
-  virtual void Shutdown() override;
+  void Shutdown() override;
 
   // Return the active (as opposed to committed) role.
   RaftPeerPB::Role GetActiveRole() const;
@@ -197,23 +199,62 @@ class RaftConsensus : public Consensus,
   // operations were pending.
   // This is idempotent.
   void UpdateMajorityReplicated(const MajorityReplicatedData& data,
-                                OpId* committed_index) override;
+                                OpId* committed_op_id) override;
 
   void UpdateMajorityReplicatedInTests(const OpId &majority_replicated,
                                        OpId *committed_index) {
     UpdateMajorityReplicated({ majority_replicated,
-                               MonoTime::kMin,
+                               CoarseTimePoint::min(),
                                HybridTime::kMin.GetPhysicalValueMicros() },
                              committed_index);
   }
 
-  virtual void NotifyTermChange(int64_t term) override;
+  void NotifyTermChange(int64_t term) override;
 
-  virtual void NotifyFailedFollower(const std::string& uuid,
-                                    int64_t term,
-                                    const std::string& reason) override;
+  void NotifyFailedFollower(const std::string& uuid,
+                            int64_t term,
+                            const std::string& reason) override;
 
-  virtual CHECKED_STATUS GetLastOpId(OpIdType type, OpId* id) override;
+  yb::OpId GetLastReceivedOpId() override;
+
+  yb::OpId GetLastCommittedOpId() override;
+
+  MicrosTime MajorityReplicatedHtLeaseExpiration(
+      MicrosTime min_allowed, CoarseTimePoint deadline) const override;
+
+  // The on-disk size of the consensus metadata.
+  uint64_t OnDiskSize() const;
+
+  yb::OpId MinRetryableRequestOpId();
+
+  CHECKED_STATUS StartElection(const LeaderElectionData& data) override {
+    return DoStartElection(data, PreElected::kFalse);
+  }
+
+  size_t LogCacheSize();
+  size_t EvictLogCache(size_t bytes_to_evict);
+
+  RetryableRequestsCounts TEST_CountRetryableRequests();
+
+  void TEST_RejectMode(RejectMode value) {
+    reject_mode_.store(value, std::memory_order_release);
+  }
+
+  void TEST_DelayUpdate(MonoDelta duration) {
+    TEST_delay_update_.store(duration, std::memory_order_release);
+  }
+
+  CHECKED_STATUS ReadReplicatedMessagesForCDC(const OpId& from, ReplicateMsgs* msgs,
+                                              bool* have_more_messages) override;
+
+  void UpdateCDCConsumerOpId(const OpIdPB& op_id) override;
+
+  // Start memory tracking of following operation in case it is still present in our caches.
+  void TrackOperationMemory(const yb::OpId& op_id);
+
+  uint64_t MajorityNumSSTFiles() const {
+    return majority_num_sst_files_.load(std::memory_order_acquire);
+  }
 
  protected:
   // Trigger that a non-Operation ConsensusRound has finished replication.
@@ -223,7 +264,7 @@ class RaftConsensus : public Consensus,
   // type of message it is.
   // The 'client_cb' will be invoked at the end of this execution.
   virtual void NonTxRoundReplicationFinished(ConsensusRound* round,
-                                             const StatusCallback& client_cb,
+                                             const StdStatusCallback& client_cb,
                                              const Status& status);
 
   // As a leader, append a new ConsensusRound to the queue.
@@ -242,11 +283,22 @@ class RaftConsensus : public Consensus,
   // additional short time interval (e.g. 100 ms) in case we've just acquired the lease and the
   // waiting thread missed the notification. However, as of 08/14/2017 this is only used in a
   // context where this does not matter, such as catalog manager initialization.
-  Status WaitForLeaderLeaseImprecise(MonoTime deadline) override;
+  CHECKED_STATUS WaitForLeaderLeaseImprecise(MonoTime deadline) override;
 
-  Status CheckIsActiveLeaderAndHasLease() const override;
+  CHECKED_STATUS CheckIsActiveLeaderAndHasLease() const override;
+
+  MonoTime TimeSinceLastMessageFromLeader() override {
+    return last_message_from_leader_time_;
+  }
 
  private:
+  CHECKED_STATUS DoStartElection(const LeaderElectionData& data, PreElected preelected);
+
+  Result<LeaderElectionPtr> CreateElectionUnlocked(
+      const LeaderElectionData& data,
+      MonoDelta timeout,
+      PreElection preelection);
+
   friend class ReplicaState;
   friend class RaftConsensusQuorumTest;
 
@@ -261,7 +313,7 @@ class RaftConsensus : public Consensus,
   // append to our log, after they've been deduplicated.
   struct LeaderRequest {
     std::string leader_uuid;
-    const OpId* preceding_opid;
+    yb::OpId preceding_opid;
     ReplicateMsgs messages;
     // The positional index of the first message selected to be appended, in the
     // original leader's request message sequence.
@@ -269,8 +321,6 @@ class RaftConsensus : public Consensus,
 
     std::string OpsRangeString() const;
   };
-
-  std::string LogPrefixUnlocked();
 
   std::string LogPrefix();
 
@@ -283,11 +333,11 @@ class RaftConsensus : public Consensus,
   CHECKED_STATUS ReplicateConfigChangeUnlocked(const ReplicateMsgPtr& replicate_ref,
                                                const RaftConfigPB& new_config,
                                                ChangeConfigType type,
-                                               const StatusCallback& client_cb);
+                                               StdStatusCallback client_cb);
 
   // Update the peers and queue to be consistent with a new active configuration.
   // Should only be called by the leader.
-  CHECKED_STATUS RefreshConsensusQueueAndPeersUnlocked();
+  void RefreshConsensusQueueAndPeersUnlocked();
 
   // Makes the peer become leader.
   // Returns OK once the change config operation that has this peer as leader
@@ -297,15 +347,25 @@ class RaftConsensus : public Consensus,
   CHECKED_STATUS BecomeLeaderUnlocked();
 
   // Makes the peer become a replica, i.e. a FOLLOWER or a LEARNER.
+  // initial_fd_wait is the initial wait time before the FailureDetector wakes up and triggers a
+  // leader election.
   //
   // The ReplicaState must be locked for configuration change before calling.
-  CHECKED_STATUS BecomeReplicaUnlocked();
+  CHECKED_STATUS BecomeReplicaUnlocked(const std::string& new_leader_uuid,
+                                       MonoDelta initial_fd_wait = MonoDelta());
+
+  struct UpdateReplicaResult {
+    yb::OpId wait_for_op_id;
+
+    // Start an election after the writes are committed?
+    bool start_election = false;
+  };
 
   // Updates the state in a replica by storing the received operations in the log
   // and triggering the required operations. This method won't return until all
   // operations have been stored in the log and all Prepares() have been completed,
   // and a replica cannot accept any more Update() requests until this is done.
-  CHECKED_STATUS UpdateReplica(
+  Result<UpdateReplicaResult> UpdateReplica(
       ConsensusRequestPB* request,
       ConsensusResponsePB* response);
 
@@ -348,14 +408,15 @@ class RaftConsensus : public Consensus,
       LeaderRequest* deduped_req);
 
   // Returns the most recent OpId written to the Log.
-  OpId GetLatestOpIdFromLog();
+  yb::OpId GetLatestOpIdFromLog();
 
   // Begin a replica operation. If the type of message in 'msg' is not a type
   // that uses operations, delegates to StartConsensusOnlyRoundUnlocked().
-  CHECKED_STATUS StartReplicaOperationUnlocked(const ReplicateMsgPtr& msg);
+  CHECKED_STATUS StartReplicaOperationUnlocked(const ReplicateMsgPtr& msg,
+                                               HybridTime propagated_safe_time);
 
   // Return header string for RequestVote log messages. The ReplicaState lock must be held.
-  std::string GetRequestVoteLogPrefixUnlocked() const;
+  std::string GetRequestVoteLogPrefix(const VoteRequestPB& request) const;
 
   // Fills the response with the current status, if an update was successful.
   void FillConsensusResponseOKUnlocked(ConsensusResponsePB* response);
@@ -368,7 +429,7 @@ class RaftConsensus : public Consensus,
   // Fill VoteResponsePB with the following information:
   // - Update responder_term to current local term.
   // - Set vote_granted to true.
-  void FillVoteResponseVoteGranted(VoteResponsePB* response);
+  void FillVoteResponseVoteGranted(const VoteRequestPB& request, VoteResponsePB* response);
 
   // Fill VoteResponsePB with the following information:
   // - Update responder_term to current local term.
@@ -409,13 +470,13 @@ class RaftConsensus : public Consensus,
 
   // Callback for leader election driver. ElectionCallback is run on the
   // reactor thread, so it simply defers its work to DoElectionCallback.
-  void ElectionCallback(const std::string& originator_uuid, const ElectionResult& result);
-  void DoElectionCallback(const std::string& originator_uuid, const ElectionResult& result);
+  void ElectionCallback(const LeaderElectionData& data, const ElectionResult& result);
+  void DoElectionCallback(const LeaderElectionData& data, const ElectionResult& result);
   void NotifyOriginatorAboutLostElection(const std::string& originator_uuid);
 
   // Helper struct that tracks the RunLeaderElection as part of leadership transferral.
   struct RunLeaderElectionState {
-    gscoped_ptr<PeerProxy> proxy;
+    PeerProxyPtr proxy;
     RunLeaderElectionRequestPB req;
     RunLeaderElectionResponsePB resp;
     rpc::RpcController rpc;
@@ -426,38 +487,35 @@ class RaftConsensus : public Consensus,
 
   // Start tracking the leader for failures. This typically occurs at startup
   // and when the local peer steps down as leader.
+  //
+  // If 'delta' is set, it is used as the initial failure period. Otherwise,
+  // the minimum election timeout is used.
+  //
   // If the failure detector is already registered, has no effect.
-  CHECKED_STATUS EnsureFailureDetectorEnabledUnlocked();
+  void EnableFailureDetector(MonoDelta delta = MonoDelta());
 
-  // Untrack the current leader from failure detector.
+  // Stop tracking the current leader for failures.
   // This typically happens when the local peer becomes leader.
-  // If the failure detector is already unregistered, has no effect.
-  CHECKED_STATUS EnsureFailureDetectorDisabledUnlocked();
-
-  // Set the failure detector to an "expired" state, so that the next time
-  // the failure monitor runs it triggers an election.
-  // This is primarily intended to be used at startup time.
-  CHECKED_STATUS ExpireFailureDetectorUnlocked();
+  // If the failure detector is already disabled, has no effect.
+  void DisableFailureDetector();
 
   // "Reset" the failure detector to indicate leader activity.
-  // The failure detector must currently be enabled.
   // When this is called a failure is guaranteed not to be detected
   // before 'FLAGS_leader_failure_max_missed_heartbeat_periods' *
-  // 'FLAGS_raft_heartbeat_interval_ms' has elapsed.
-  CHECKED_STATUS SnoozeFailureDetectorUnlocked();
-
-  // Like the above but adds 'additional_delta' to the default timeout
-  // period. If allow_logging is set to ALLOW_LOGGING, then this method
+  // 'FLAGS_raft_heartbeat_interval_ms' has elapsed, unless 'delta' is set, in
+  // which case its value is used as the next failure period.
+  // If 'allow_logging' is set to ALLOW_LOGGING, then this method
   // will print a log message when called.
-  CHECKED_STATUS SnoozeFailureDetectorUnlocked(const MonoDelta& additional_delta,
-                                       AllowLogging allow_logging);
+  // If the failure detector is not registered, this method has no effect.
+  void SnoozeFailureDetector(AllowLogging allow_logging,
+                             MonoDelta delta = MonoDelta());
 
   // Return the minimum election timeout. Due to backoff and random
   // jitter, election timeouts may be longer than this.
   MonoDelta MinimumElectionTimeout() const;
 
-  // Calculates an additional snooze delta for leader election.
-  // The additional delta increases exponentially with the difference
+  // Calculates a snooze delta for leader election.
+  // The delta increases exponentially with the difference
   // between the current term and the term of the last committed
   // operation.
   // The maximum delta is capped by 'FLAGS_leader_failure_exp_backoff_max_delta_ms'.
@@ -484,7 +542,7 @@ class RaftConsensus : public Consensus,
   // Calls MarkDirty() if 'status' == OK. Then, always calls 'client_cb' with
   // 'status' as its argument.
   void MarkDirtyOnSuccess(std::shared_ptr<StateChangeContext> context,
-                          const StatusCallback& client_cb,
+                          const StdStatusCallback& client_cb,
                           const Status& status);
 
   // Attempt to remove the follower with the specified 'uuid' from the config,
@@ -498,6 +556,14 @@ class RaftConsensus : public Consensus,
   void TryRemoveFollowerTask(const std::string& uuid,
                              const RaftConfigPB& committed_config,
                              const std::string& reason);
+
+  // Called when the failure detector expires.
+  // Submits ReportFailureDetectedTask() to a thread pool.
+  void ReportFailureDetected();
+
+  // Call StartElection(), log a warning if the call fails (usually due to
+  // being shut down).
+  void ReportFailureDetectedTask();
 
   // Helper API to check if the pending/committed configuration has a PRE_VOTER. Non-null return
   // string implies there are servers in transit.
@@ -521,20 +587,23 @@ class RaftConsensus : public Consensus,
                                        LeaderRequest* deduped_req,
                                        ConsensusResponsePB* response);
   // Returns last op id received from leader.
-  OpId EnqueueWritesUnlocked(const LeaderRequest& deduped_req,
-                             const StatusCallback& sync_status_cb);
+  yb::OpId EnqueueWritesUnlocked(const LeaderRequest& deduped_req, const yb::OpId& committed_op_id,
+                                 WriteEmpty write_empty);
   CHECKED_STATUS MarkOperationsAsCommittedUnlocked(const ConsensusRequestPB& request,
                                                    const LeaderRequest& deduped_req,
-                                                   OpId last_from_leader);
-  CHECKED_STATUS WaitWritesUnlocked(const LeaderRequest& deduped_req,
-                                    Synchronizer* log_synchronizer);
+                                                   yb::OpId last_from_leader);
+  CHECKED_STATUS WaitForWrites(const yb::OpId& wait_for_op_id);
 
   // See comment for ReplicaState::CancelPendingOperation
   void RollbackIdAndDeleteOpId(const ReplicateMsgPtr& replicate_msg, bool should_exists);
 
-  // Threadpool for constructing requests to peers, handling RPC callbacks,
+  yb::OpId WaitForSafeOpIdToApply(const yb::OpId& op_id) override;
+
+  void AppendEmptyBatchToLeaderLog();
+
+  // Threadpool token for constructing requests to peers, handling RPC callbacks,
   // etc.
-  gscoped_ptr<ThreadPool> thread_pool_;
+  std::unique_ptr<ThreadPoolToken> raft_pool_token_;
 
   scoped_refptr<log::Log> log_;
   scoped_refptr<server::Clock> clock_;
@@ -545,44 +614,41 @@ class RaftConsensus : public Consensus,
   // The queue of messages that must be sent to peers.
   gscoped_ptr<PeerMessageQueue> queue_;
 
-  gscoped_ptr<ReplicaState> state_;
+  std::unique_ptr<ReplicaState> state_;
 
   Random rng_;
 
-  // TODO: Plumb this from RpcAndWebServerBase.
-  RandomizedFailureMonitor failure_monitor_;
+  MonoTime last_message_from_leader_time_ = MonoTime::kUninitialized;
 
-  scoped_refptr<FailureDetector> failure_detector_;
+  std::shared_ptr<rpc::PeriodicTimer> failure_detector_;
 
   // If any RequestVote() RPC arrives before this hybrid time,
   // the request will be ignored. This prevents abandoned or partitioned
   // nodes from disturbing the healthy leader.
   MonoTime withhold_votes_until_;
 
-  // This leader is ready to serve only if NoOp was successfully committed
-  // after the new leader successful election.
-  bool leader_no_op_committed_ = false;
-
   // UUID of new desired leader during stepdown.
   TabletServerId protege_leader_uuid_;
 
   // This is the time (in the MonoTime's uint64 representation) for which election should not start
   // on this peer.
-  std::atomic<uint64_t> withhold_election_start_until_;
+  std::atomic<MonoTime> withhold_election_start_until_{MonoTime::Min()};
 
   // We record the moment at which we discover that an election has been lost by our "protege"
   // during leader stepdown. Then, when the master asks us to step down again in favor of the same
   // server, we'll reply with the amount of time that has passed to avoid leader stepdown loops.s
   MonoTime election_lost_by_protege_at_;
 
+  // The number of times this node has called and lost a leader election since
+  // the last time it saw a stable leader (either itself or another node).
+  // This is used to calculate back-off of the election timeout.
+  std::atomic<int> failed_elections_since_stable_leader_{0};
+
   const Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk_;
 
-  // TODO hack to serialize updates due to repeated/out-of-order messages
-  // should probably be refactored out.
-  //
   // Lock ordering note: If both this lock and the ReplicaState lock are to be
   // taken, this lock must be taken first.
-  mutable simple_spinlock update_lock_;
+  mutable std::timed_mutex update_mutex_;
 
   AtomicBool shutdown_;
 
@@ -594,10 +660,22 @@ class RaftConsensus : public Consensus,
   TableType table_type_;
 
   // Mutex / condition used for waiting for acquiring a valid leader lease.
-  Mutex leader_lease_wait_mtx_;
-  ConditionVariable leader_lease_wait_cond_{&leader_lease_wait_mtx_};
+  std::mutex leader_lease_wait_mtx_;
+  std::condition_variable leader_lease_wait_cond_;
 
-  std::function<void()> lost_leadership_listener_;
+  scoped_refptr<Histogram> update_raft_config_dns_latency_;
+
+  // Used only when follower_reject_update_consensus_requests_seconds is greater than 0.
+  // Any requests to update the replica will be rejected until this time. For testing only.
+  MonoTime withold_replica_updates_until_ = MonoTime::kUninitialized;
+
+  std::atomic<RejectMode> reject_mode_{RejectMode::kNone};
+
+  CoarseTimePoint disable_pre_elections_until_ = CoarseTimePoint::min();
+
+  std::atomic<MonoDelta> TEST_delay_update_{MonoDelta::kZero};
+
+  std::atomic<uint64_t> majority_num_sst_files_{0};
 
   DISALLOW_COPY_AND_ASSIGN(RaftConsensus);
 };

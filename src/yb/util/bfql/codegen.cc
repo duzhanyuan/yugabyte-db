@@ -18,6 +18,8 @@
 #include <vector>
 #include <map>
 
+#include "yb/common/ql_type.h"
+
 #include "yb/util/bfql/directory.h"
 #include "yb/gutil/strings/substitute.h"
 
@@ -89,7 +91,10 @@ class BFCodegen {
     int op_index = 0;
     for (BFDecl entry : kBFDirectory) {
       // Form the opcode and print it.
-      string current_opcode = strings::Substitute("OPCODE_$0_$1", entry.cpp_name(), op_index);
+      string current_opcode = entry.bfopcode_name();
+      if (current_opcode.empty()) {
+        current_opcode = strings::Substitute("OPCODE_$0_$1", entry.cpp_name(), op_index);
+      }
       fopcode << "  " << current_opcode << "," << endl;
       if (op_index == 0) {
         min_opcode = current_opcode;
@@ -296,7 +301,8 @@ class BFCodegen {
       // SPECIAL CASE: For CAST operator, at compile time, we need two input parameter for type
       // resolution. However, at runtime, the associated function would take one parameter and
       // convert the value to proper result, so break the loop here.
-      if (strcmp(entry.ql_name(), "cast") == 0) {
+      if (strcmp(entry.ql_name(), "cast") == 0 ||
+          strcmp(entry.ql_name(), "cql_cast") == 0) {
         break;
       }
     }

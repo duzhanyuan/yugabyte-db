@@ -15,15 +15,20 @@
 
 #include "yb/rpc/rpc_with_queue.h"
 
+#include "yb/rpc/connection.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc_introspection.pb.h"
 
+#include "yb/util/string_util.h"
+
 namespace yb {
 namespace rpc {
 
-ConnectionContextWithQueue::ConnectionContextWithQueue(size_t max_concurrent_calls)
-    : max_concurrent_calls_(max_concurrent_calls) {
+ConnectionContextWithQueue::ConnectionContextWithQueue(
+    size_t max_concurrent_calls,
+    size_t max_queued_bytes)
+    : max_concurrent_calls_(max_concurrent_calls), max_queued_bytes_(max_queued_bytes) {
 }
 
 ConnectionContextWithQueue::~ConnectionContextWithQueue() {
@@ -36,8 +41,16 @@ void ConnectionContextWithQueue::DumpPB(const DumpRunningRpcsRequestPB& req,
   }
 }
 
-bool ConnectionContextWithQueue::Idle() {
-  return calls_queue_.empty();
+bool ConnectionContextWithQueue::Idle(std::string* reason_not_idle) {
+  if (calls_queue_.empty()) {
+    return true;
+  }
+
+  if (reason_not_idle) {
+    AppendWithSeparator(Format("$0 calls", calls_queue_.size()), reason_not_idle);
+  }
+
+  return false;
 }
 
 void ConnectionContextWithQueue::Enqueue(std::shared_ptr<QueueableInboundCall> call) {
@@ -45,12 +58,25 @@ void ConnectionContextWithQueue::Enqueue(std::shared_ptr<QueueableInboundCall> c
   DCHECK(reactor->IsCurrentThread());
 
   calls_queue_.push_back(call);
+  queued_bytes_ += call->weight_in_bytes();
+
   size_t size = calls_queue_.size();
   if (size == replies_being_sent_ + 1) {
     first_without_reply_.store(call.get(), std::memory_order_release);
   }
   if (size <= max_concurrent_calls_) {
     reactor->messenger()->QueueInboundCall(call);
+  }
+}
+
+void ConnectionContextWithQueue::Shutdown(const Status& status) {
+  // Could erase calls, that we did not start to process yet.
+  if (calls_queue_.size() > max_concurrent_calls_) {
+    calls_queue_.erase(calls_queue_.begin() + max_concurrent_calls_, calls_queue_.end());
+  }
+
+  for (auto& call : calls_queue_) {
+    call->Abort(status);
   }
 }
 
@@ -63,11 +89,22 @@ void ConnectionContextWithQueue::CallProcessed(InboundCall* call) {
   DCHECK_EQ(calls_queue_.front().get(), call);
   DCHECK_GT(replies_being_sent_, 0);
 
+  bool could_enqueue = can_enqueue();
+  auto call_weight_in_bytes = down_cast<QueueableInboundCall*>(call)->weight_in_bytes();
+  queued_bytes_ -= call_weight_in_bytes;
+
   calls_queue_.pop_front();
   --replies_being_sent_;
   if (calls_queue_.size() >= max_concurrent_calls_) {
     auto call_ptr = calls_queue_[max_concurrent_calls_ - 1];
     reactor->messenger()->QueueInboundCall(call_ptr);
+  }
+  if (Idle() && idle_listener_) {
+    idle_listener_();
+  }
+
+  if (!could_enqueue && can_enqueue()) {
+    call->connection()->ParseReceived();
   }
 }
 
@@ -76,7 +113,8 @@ void ConnectionContextWithQueue::QueueResponse(const ConnectionPtr& conn,
   QueueableInboundCall* queueable_call = down_cast<QueueableInboundCall*>(call.get());
   queueable_call->SetHasReply();
   if (queueable_call == first_without_reply_.load(std::memory_order_acquire)) {
-    conn->reactor()->ScheduleReactorTask(flush_outbound_queue_task_);
+    auto scheduled = conn->reactor()->ScheduleReactorTask(flush_outbound_queue_task_);
+    LOG_IF(WARNING, !scheduled) << "Failed to schedule flush outbound queue";
   }
 }
 
@@ -113,7 +151,8 @@ void ConnectionContextWithQueue::FlushOutboundQueue(Connection* conn) {
 
 void ConnectionContextWithQueue::AssignConnection(const ConnectionPtr& conn) {
   flush_outbound_queue_task_ = MakeFunctorReactorTask(
-      std::bind(&ConnectionContextWithQueue::FlushOutboundQueue, this, conn.get()), conn);
+      std::bind(&ConnectionContextWithQueue::FlushOutboundQueue, this, conn.get()), conn,
+      SOURCE_LOCATION());
 }
 
 } // namespace rpc

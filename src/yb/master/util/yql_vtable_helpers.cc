@@ -11,8 +11,12 @@
 // under the License.
 //
 
-#include "yb/util/yb_partition.h"
 #include "yb/master/util/yql_vtable_helpers.h"
+
+#include "yb/common/ql_value.h"
+
+#include "yb/util/yb_partition.h"
+#include "yb/util/net/dns_resolver.h"
 
 namespace yb {
 namespace master {
@@ -26,15 +30,14 @@ namespace util {
 QLValuePB GetTokensValue(size_t index, size_t node_count) {
   CHECK_GT(node_count, 0);
   QLValuePB value_pb;
-  QLValue::set_set_value(&value_pb);
-  QLValuePB *token = QLValue::add_set_elem(&value_pb);
+  QLValuePB *token = value_pb.mutable_set_value()->add_elems();
   token->set_string_value(YBPartition::CqlTokenSplit(node_count, index));
   return value_pb;
 }
 
-bool RemoteEndpointMatchesTServer(const TSInformationPB& ts_info,
-                                  const InetAddress& remote_endpoint) {
-  for (HostPortPB rpc_address : ts_info.registration().common().rpc_addresses()) {
+bool RemoteEndpointMatchesList(const google::protobuf::RepeatedPtrField<HostPortPB>& host_ports,
+                               const InetAddress& remote_endpoint) {
+  for (const HostPortPB& rpc_address : host_ports) {
     // host portion of rpc_address might be a hostname and hence we need to resolve it.
     vector<InetAddress> resolved_addresses;
     if (!InetAddress::Resolve(rpc_address.host(), &resolved_addresses).ok()) {
@@ -46,25 +49,143 @@ bool RemoteEndpointMatchesTServer(const TSInformationPB& ts_info,
       return true;
     }
   }
+
+  return false;
+}
+
+bool RemoteEndpointMatchesTServer(const TSInformationPB& ts_info,
+                                  const InetAddress& remote_endpoint) {
+  const auto& common = ts_info.registration().common();
+  if (RemoteEndpointMatchesList(common.private_rpc_addresses(), remote_endpoint)) {
+    return true;
+  }
+  if (RemoteEndpointMatchesList(common.broadcast_addresses(), remote_endpoint)) {
+    return true;
+  }
   return false;
 }
 
 QLValuePB GetReplicationValue(int replication_factor) {
   QLValuePB value_pb;
-  QLValue::set_map_value(&value_pb);
+  QLMapValuePB *map_value = value_pb.mutable_map_value();
 
   // replication strategy
-  QLValuePB *elem = QLValue::add_map_key(&value_pb);
+  QLValuePB *elem = map_value->add_keys();
   elem->set_string_value("class");
-  elem = QLValue::add_map_value(&value_pb);
+  elem = map_value->add_values();
   elem->set_string_value("org.apache.cassandra.locator.SimpleStrategy");
 
   // replication factor
-  elem = QLValue::add_map_key(&value_pb);
+  elem = map_value->add_keys();
   elem->set_string_value("replication_factor");
-  elem = QLValue::add_map_value(&value_pb);
+  elem = map_value->add_values();
   elem->set_string_value(std::to_string(replication_factor));
 
+  return value_pb;
+}
+
+PublicPrivateIPFutures GetPublicPrivateIPFutures(
+    const TSInformationPB& ts_info, Resolver* resolver) {
+  const auto& common = ts_info.registration().common();
+  PublicPrivateIPFutures result;
+
+  const auto& private_host = common.private_rpc_addresses()[0].host();
+  if (private_host.empty()) {
+    std::promise<Result<InetAddress>> promise;
+    result.private_ip_future = promise.get_future();
+    promise.set_value(STATUS_FORMAT(
+        IllegalState, "Tablet sserver $0 doesn't have any rpc addresses registered",
+        ts_info.tserver_instance().permanent_uuid()));
+    return result;
+  }
+
+  result.private_ip_future = ResolveDnsFuture(private_host, resolver);
+
+  if (!common.broadcast_addresses().empty()) {
+    result.public_ip_future = ResolveDnsFuture(common.broadcast_addresses()[0].host(), resolver);
+  } else {
+    result.public_ip_future = result.private_ip_future;
+  }
+
+  return result;
+}
+
+const QLValuePB& GetValueHelper<QLValuePB>::Apply(
+    const QLValuePB& value_pb, const DataType data_type) {
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<std::string>::Apply(const std::string& strval, const DataType data_type) {
+  QLValuePB value_pb;
+  switch (data_type) {
+    case STRING:
+      value_pb.set_string_value(strval);
+      break;
+    case BINARY:
+      value_pb.set_binary_value(strval);
+      break;
+    default:
+      LOG(ERROR) << "unexpected string type " << data_type;
+      break;
+  }
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<std::string>::Apply(
+    const char* strval, size_t len, const DataType data_type) {
+  QLValuePB value_pb;
+  switch (data_type) {
+    case STRING:
+      value_pb.set_string_value(strval, len);
+      break;
+    case BINARY:
+      value_pb.set_binary_value(strval, len);
+      break;
+    default:
+      LOG(ERROR) << "unexpected string type " << data_type;
+      break;
+  }
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<int32_t>::Apply(const int32_t intval, const DataType data_type) {
+  QLValuePB value_pb;
+  switch (data_type) {
+    case INT64:
+      value_pb.set_int64_value(intval);
+      break;
+    case INT32:
+      value_pb.set_int32_value(intval);
+      break;
+    case INT16:
+      value_pb.set_int16_value(intval);
+      break;
+    case INT8:
+      value_pb.set_int8_value(intval);
+      break;
+    default:
+      LOG(ERROR) << "unexpected int type " << data_type;
+      break;
+  }
+  return value_pb;
+}
+
+QLValuePB GetValueHelper<InetAddress>::Apply(
+    const InetAddress& inet_val, const DataType data_type) {
+  QLValuePB result;
+  QLValue::set_inetaddress_value(inet_val, &result);
+  return result;
+}
+
+QLValuePB GetValueHelper<Uuid>::Apply(const Uuid& uuid_val, const DataType data_type) {
+  QLValuePB result;
+  QLValue::set_uuid_value(uuid_val, &result);
+  return result;
+}
+
+QLValuePB GetValueHelper<bool>::Apply(const bool bool_val, const DataType data_type) {
+  QLValuePB value_pb;
+  value_pb.set_bool_value(bool_val);
   return value_pb;
 }
 

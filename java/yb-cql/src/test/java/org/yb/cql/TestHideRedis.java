@@ -25,19 +25,14 @@ import java.util.List;
 import static junit.framework.TestCase.assertEquals;
 import static junit.framework.TestCase.fail;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestHideRedis extends BaseCQLTest {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestHideRedis.class);
-
-  private void runInvalidQuery(String query) throws Exception {
-    try {
-      session.execute(query);
-      fail("Did not throw exception");
-    } catch (InvalidQueryException e) {
-      // Should receive table not found exception.
-      LOG.info("Expected exception", e);
-    }
-  }
 
   @Test
   public void testHideRedis() throws Exception {
@@ -54,7 +49,7 @@ public class TestHideRedis extends BaseCQLTest {
     session.execute(String.format("DROP TABLE test.\"%s\"", YBClient.REDIS_DEFAULT_TABLE_NAME));
 
     YBClient client = miniCluster.getClient();
-    client.createRedisTable(YBClient.REDIS_DEFAULT_TABLE_NAME, 1);
+    client.createRedisTable(YBClient.REDIS_DEFAULT_TABLE_NAME);
     try {
       // Can't perform SELECT queries on redis table.
       runInvalidQuery(String.format("SELECT * FROM %s.\"%s\"", YBClient.REDIS_KEYSPACE_NAME,
@@ -87,7 +82,7 @@ public class TestHideRedis extends BaseCQLTest {
         "table_name = '%s'", YBClient.REDIS_DEFAULT_TABLE_NAME)).all().size());
 
     } finally {
-      client.deleteTable(YBClient.REDIS_DEFAULT_TABLE_NAME, YBClient.REDIS_KEYSPACE_NAME);
+      client.deleteTable(YBClient.REDIS_KEYSPACE_NAME, YBClient.REDIS_DEFAULT_TABLE_NAME);
       runInvalidQuery(String.format("DROP KEYSPACE %s", YBClient.REDIS_KEYSPACE_NAME));
       runInvalidQuery(String.format("DROP TABLE %s.\"%s\"",
         YBClient.REDIS_KEYSPACE_NAME, YBClient.REDIS_DEFAULT_TABLE_NAME));

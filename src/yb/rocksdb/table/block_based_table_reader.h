@@ -37,6 +37,7 @@
 #include "yb/rocksdb/table/table_properties_internal.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace rocksdb {
 
@@ -50,7 +51,6 @@ class FullFilterBlockReader;
 class Footer;
 class InternalKeyComparator;
 class Iterator;
-class RandomAccessFile;
 class TableCache;
 class TableReader;
 class WritableFile;
@@ -59,6 +59,7 @@ struct EnvOptions;
 struct ReadOptions;
 class GetContext;
 class InternalIterator;
+class IndexReader;
 
 using std::unique_ptr;
 
@@ -78,6 +79,8 @@ enum class PrefetchFilter {
   NO
 };
 
+YB_DEFINE_ENUM(BlockType, (kData)(kIndex));
+
 // BloomFilterAwareFileFilter should only be used when scanning within the same hashed components of
 // the key and it should be used together with DocDbAwareFilterPolicy which only takes into account
 // hashed components of key for filtering.
@@ -91,7 +94,7 @@ class BloomFilterAwareFileFilter : public TableAwareReadFileFilter {
 
  private:
   const ReadOptions read_options_;
-  const Slice user_key_;
+  const std::string user_key_;
 };
 
 // A Table is a sorted map from strings to strings.  Tables are
@@ -102,10 +105,6 @@ class BlockBasedTable : public TableReader {
   // No copying allowed
   explicit BlockBasedTable(const TableReader&) = delete;
   void operator=(const TableReader&) = delete;
-
-  static const char kFilterBlockPrefix[];
-  static const char kFullFilterBlockPrefix[];
-  static const char kFixedSizeFilterBlockPrefix[];
 
   // Attempt to open the table that is stored in bytes [0..base_file_size) of "base_file" (may be
   // only metadata and data will be read from separate file passed via SetDataFileReader), and read
@@ -125,7 +124,7 @@ class BlockBasedTable : public TableReader {
   static Status Open(const ImmutableCFOptions& ioptions,
                      const EnvOptions& env_options,
                      const BlockBasedTableOptions& table_options,
-                     const InternalKeyComparator& internal_key_comparator,
+                     const InternalKeyComparatorPtr& internal_key_comparator,
                      unique_ptr<RandomAccessFileReader>&& base_file,
                      uint64_t base_file_size,
                      unique_ptr<TableReader>* table_reader,
@@ -179,12 +178,17 @@ class BlockBasedTable : public TableReader {
   // convert SST file to a human readable form
   Status DumpTable(WritableFile* out_file) override;
 
+  // input_iter: if it is not null, update this one and return it as Iterator
+  InternalIterator* NewDataBlockIterator(
+      const ReadOptions& ro, const Slice& index_value, BlockType block_type,
+      BlockIter* input_iter = nullptr);
+
+  const ImmutableCFOptions& ioptions();
+
   ~BlockBasedTable();
 
   bool TEST_filter_block_preloaded() const;
   bool TEST_index_reader_loaded() const;
-  // Implementation of IndexReader will be exposed to internal cc file only.
-  class IndexReader;
 
  private:
   template <class TValue>
@@ -196,10 +200,7 @@ class BlockBasedTable : public TableReader {
   Rep* rep_;
 
   class BlockEntryIteratorState;
-  // input_iter: if it is not null, update this one and return it as Iterator
-  static InternalIterator* NewDataBlockIterator(
-      Rep* rep, const ReadOptions& ro, const Slice& index_value,
-      BlockIter* input_iter = nullptr);
+  class IndexIteratorHolder;
 
   // Returns filter block handle for fixed-size bloom filter using filter index and filter key.
   Status GetFixedSizeFilterBlockHandle(const Slice& filter_key,
@@ -223,7 +224,10 @@ class BlockBasedTable : public TableReader {
 
   // Get the iterator from the index reader.
   // If input_iter is not set, return new Iterator
-  // If input_iter is set, update it and return it as Iterator
+  // If input_iter is set, update it and return:
+  //  - newly created data index iterator in case it was created (if we use multi-level data index,
+  //    input_iter is an iterator of the top level index, but not the whole index iterator).
+  //  - nullptr if input_iter is a data index iterator and no new iterators were created.
   //
   // Note: ErrorIterator with Status::Incomplete shall be returned if all the
   // following conditions are met:
@@ -241,8 +245,10 @@ class BlockBasedTable : public TableReader {
   static Status GetDataBlockFromCache(
       const Slice& block_cache_key, const Slice& compressed_block_cache_key,
       Cache* block_cache, Cache* block_cache_compressed, Statistics* statistics,
-      const ReadOptions& read_options,
-      BlockBasedTable::CachableEntry<Block>* block, uint32_t format_version);
+      const ReadOptions& read_options, BlockBasedTable::CachableEntry<Block>* block,
+      uint32_t format_version, BlockType block_type,
+      const std::shared_ptr<yb::MemTracker>& mem_tracker);
+
   // Put a raw block (maybe compressed) to the corresponding block caches.
   // This method will perform decompression against raw_block if needed and then
   // populate the block caches.
@@ -255,7 +261,8 @@ class BlockBasedTable : public TableReader {
       const Slice& block_cache_key, const Slice& compressed_block_cache_key,
       Cache* block_cache, Cache* block_cache_compressed,
       const ReadOptions& read_options, Statistics* statistics,
-      CachableEntry<Block>* block, Block* raw_block, uint32_t format_version);
+      CachableEntry<Block>* block, Block* raw_block, uint32_t format_version,
+      const std::shared_ptr<yb::MemTracker>& mem_tracker);
 
   // Calls (*handle_result)(arg, ...) repeatedly, starting with the entry found
   // after a call to Seek(key), until handle_result returns false.
@@ -291,25 +298,9 @@ class BlockBasedTable : public TableReader {
   // instance. Used for both data and metadata files.
   static void SetupCacheKeyPrefix(Rep* rep, FileReaderWithCachePrefix* reader_with_cache_prefix);
 
-  explicit BlockBasedTable(Rep* rep)
-      : rep_(rep) {
-  }
+  FileReaderWithCachePrefix* GetBlockReader(BlockType block_type);
 
-  // The longest prefix of the cache key used to identify blocks.
-  // For Posix files the unique ID is three varints.
-  static constexpr const size_t kMaxCacheKeyPrefixSize = kMaxVarint64Length*3+1;
-
-  struct CacheKeyBuffer {
-    char data[kMaxCacheKeyPrefixSize];
-    size_t size;
-  };
-
-  // Generate a cache key prefix from the file. Used for both data and metadata files.
-  static void GenerateCachePrefix(Cache* cc, File* file,
-      CacheKeyBuffer* prefix);
-
-  static Slice GetCacheKey(const CacheKeyBuffer& cache_key_prefix, const BlockHandle& handle,
-      char* cache_key);
+  explicit BlockBasedTable(Rep* rep) : rep_(rep) {}
 
   // Helper functions for DumpTable()
   Status DumpIndexBlock(WritableFile* out_file);

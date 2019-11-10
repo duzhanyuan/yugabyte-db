@@ -35,7 +35,6 @@
 #include <string>
 
 #include "yb/gutil/gscoped_ptr.h"
-#include "yb/rpc/local_call.h"
 #include "yb/rpc/rpc_header.pb.h"
 #include "yb/rpc/service_if.h"
 #include "yb/util/ref_cnt_buffer.h"
@@ -173,6 +172,13 @@ class RpcContext {
   // by the RPC response.
   CHECKED_STATUS AddRpcSidecar(RefCntBuffer car, int* idx);
 
+  int RpcSidecarsSize() const;
+
+  const RefCntBuffer& RpcSidecar(int idx) const;
+
+  // Removes all RpcSidecars.
+  void ResetRpcSidecars();
+
   // Return the remote endpoint which sent the current RPC call.
   const Endpoint& remote_address() const;
   // Return the local endpoint which received the current RPC call.
@@ -188,7 +194,7 @@ class RpcContext {
   // Return an upper bound on the client timeout deadline. This does not
   // account for transmission delays between the client and the server.
   // If the client did not specify a deadline, returns MonoTime::Max().
-  MonoTime GetClientDeadline() const;
+  CoarseTimePoint GetClientDeadline() const;
 
   // Panic the server. This logs a fatal error with the given message, and
   // also includes the current RPC request, requestor, trace information, etc,
@@ -203,6 +209,9 @@ class RpcContext {
 
   // Closes connection that received this request.
   void CloseConnection();
+
+  std::string ToString() const;
+
  private:
   std::shared_ptr<YBInboundCall> call_;
   std::shared_ptr<const google::protobuf::Message> request_pb_;

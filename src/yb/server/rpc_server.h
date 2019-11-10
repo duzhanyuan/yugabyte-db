@@ -43,27 +43,31 @@
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status.h"
+#include "yb/util/enums.h"
 
 namespace yb {
+namespace server {
 
 struct RpcServerOptions {
   RpcServerOptions();
 
   std::string rpc_bind_addresses;
-  uint16_t default_port;
-  size_t queue_limit;
-  size_t workers_limit;
+  uint16_t default_port = 0;
+  int32_t connection_keepalive_time_ms;
 };
 
 class RpcServer {
  public:
-  explicit RpcServer(const std::string& name, RpcServerOptions opts);
+  RpcServer(const std::string& name, RpcServerOptions opts,
+            rpc::ConnectionContextFactoryPtr connection_context_factory);
   ~RpcServer();
 
-  CHECKED_STATUS Init(const std::shared_ptr<rpc::Messenger>& messenger);
+  CHECKED_STATUS Init(rpc::Messenger* messenger);
   // Services need to be registered after Init'ing, but before Start'ing.
   // The service's ownership will be given to a ServicePool.
-  CHECKED_STATUS RegisterService(size_t queue_limit, std::unique_ptr<rpc::ServiceIf> service);
+  CHECKED_STATUS RegisterService(
+      size_t queue_limit, rpc::ServiceIfPtr service,
+      rpc::ServicePriority priority = rpc::ServicePriority::kNormal);
   CHECKED_STATUS Bind();
   CHECKED_STATUS Start();
   void Shutdown();
@@ -91,11 +95,14 @@ class RpcServer {
     // State after Start() was called.
     STARTED
   };
+
+  string name_;
+
   ServerState server_state_;
 
   const RpcServerOptions options_;
-  std::unique_ptr<rpc::ThreadPool> thread_pool_;
-  std::shared_ptr<rpc::Messenger> messenger_;
+
+  rpc::Messenger* messenger_ = nullptr;
 
   // Parsed addresses to bind RPC to. Set by Init().
   std::vector<Endpoint> rpc_bind_addresses_;
@@ -104,9 +111,12 @@ class RpcServer {
   // This saves the rpc host port flag's ip and port information (and no dns name lookup is done).
   std::vector<HostPort> rpc_host_port_;
 
+  rpc::ConnectionContextFactoryPtr connection_context_factory_;
+
   DISALLOW_COPY_AND_ASSIGN(RpcServer);
 };
 
+} // namespace server
 } // namespace yb
 
 #endif // YB_SERVER_RPC_SERVER_H

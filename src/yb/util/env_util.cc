@@ -32,20 +32,82 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 
 #include <glog/logging.h>
-#include <string>
+
+#include <boost/container/small_vector.hpp>
 
 #include "yb/gutil/strings/substitute.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
+#include "yb/util/path_util.h"
 #include "yb/util/status.h"
+#include "yb/gutil/strings/util.h"
 
 using strings::Substitute;
 using std::shared_ptr;
+using std::string;
 
 namespace yb {
 namespace env_util {
+
+// We use this suffix in the "external build directory" mode, i.e. the source could be in
+// ~/code/yugabyte the build directories for different configurations will all be in
+// ~/code/yugabyte__build. This will prevent IDEs from trying to parse build artifacts.
+const string kExternalBuildDirSuffix = "__build";
+
+std::string GetRootDir(const string& search_for_dir) {
+  char* yb_home = getenv("YB_HOME");
+  if (yb_home) {
+    return yb_home;
+  }
+
+  // If YB_HOME is not set, we use the path where the binary is located
+  // (e.g., /opt/yugabyte/tserver/bin/yb-tserver) to determine the doc root.
+  // To find "www"'s location, we search whether "www" exists at each directory, starting with
+  // the directory where the current binary (yb-tserver, or yb-master) is located.
+  // During each iteration, we keep going up one directory and do the search again.
+  // If we can't find a directory that contains "www", we return a default value for now.
+  string executable_path;
+  auto status = Env::Default()->GetExecutablePath(&executable_path);
+  if (!status.ok()) {
+    LOG(WARNING) << "Ignoring status error: " << status.ToString();
+    return "";
+  }
+
+  auto path = executable_path;
+  while (path != "/") {
+    path = DirName(path);
+
+    boost::container::small_vector<string, 2> candidates { path };
+    if (HasSuffixString(path, kExternalBuildDirSuffix)) {
+      candidates.push_back(std::string(path.begin(), path.end() - kExternalBuildDirSuffix.size()));
+      if (candidates.back().back() == '/') {
+        // path was of the ".../__build" form instead of ".../<some_name>__build", ignore it.
+        candidates.pop_back();
+      }
+    }
+    for (const auto& candidate_path : candidates) {
+      auto sub_dir = JoinPathSegments(candidate_path, search_for_dir);
+      bool is_dir = false;
+      auto status = Env::Default()->IsDirectory(sub_dir, &is_dir);
+      if (!status.ok()) {
+        continue;
+      }
+      if (is_dir) {
+        return candidate_path;
+      }
+    }
+  }
+
+  LOG(ERROR) << "Unable to find '" << search_for_dir
+             << "' directory by starting the search at path " << DirName(executable_path)
+             << " and walking up the directory structure";
+
+  // Return a path.
+  return DirName(DirName(executable_path));
+}
 
 Status OpenFileForWrite(Env* env, const string& path,
                         shared_ptr<WritableFile>* file) {
@@ -55,7 +117,7 @@ Status OpenFileForWrite(Env* env, const string& path,
 Status OpenFileForWrite(const WritableFileOptions& opts,
                         Env *env, const string &path,
                         shared_ptr<WritableFile> *file) {
-  gscoped_ptr<WritableFile> w;
+  std::unique_ptr<WritableFile> w;
   RETURN_NOT_OK(env->NewWritableFile(opts, path, &w));
   file->reset(w.release());
   return Status::OK();
@@ -63,7 +125,7 @@ Status OpenFileForWrite(const WritableFileOptions& opts,
 
 Status OpenFileForRandom(Env *env, const string &path,
                          shared_ptr<RandomAccessFile> *file) {
-  gscoped_ptr<RandomAccessFile> r;
+  std::unique_ptr<RandomAccessFile> r;
   RETURN_NOT_OK(env->NewRandomAccessFile(path, &r));
   file->reset(r.release());
   return Status::OK();
@@ -71,7 +133,7 @@ Status OpenFileForRandom(Env *env, const string &path,
 
 Status OpenFileForSequential(Env *env, const string &path,
                              shared_ptr<SequentialFile> *file) {
-  gscoped_ptr<SequentialFile> r;
+  std::unique_ptr<SequentialFile> r;
   RETURN_NOT_OK(env->NewSequentialFile(path, &r));
   file->reset(r.release());
   return Status::OK();
@@ -123,17 +185,16 @@ Status CreateDirIfMissing(Env* env, const string& path, bool* created) {
 
 Status CopyFile(Env* env, const string& source_path, const string& dest_path,
                 WritableFileOptions opts) {
-  gscoped_ptr<SequentialFile> source;
+  std::unique_ptr<SequentialFile> source;
   RETURN_NOT_OK(env->NewSequentialFile(source_path, &source));
-  uint64_t size;
-  RETURN_NOT_OK(env->GetFileSize(source_path, &size));
+  uint64_t size = VERIFY_RESULT(env->GetFileSize(source_path));
 
-  gscoped_ptr<WritableFile> dest;
+  std::unique_ptr<WritableFile> dest;
   RETURN_NOT_OK(env->NewWritableFile(opts, dest_path, &dest));
   RETURN_NOT_OK(dest->PreAllocate(size));
 
   const int32_t kBufferSize = 1024 * 1024;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kBufferSize]);
+  std::unique_ptr<uint8_t[]> scratch(new uint8_t[kBufferSize]);
 
   uint64_t bytes_read = 0;
   while (bytes_read < size) {

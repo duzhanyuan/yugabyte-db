@@ -54,6 +54,7 @@
 #include "yb/server/clock.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/server/metadata.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tserver/tserver.pb.h"
 #include "yb/util/env_util.h"
 #include "yb/util/metrics.h"
@@ -61,7 +62,6 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/stopwatch.h"
-#include "yb/tablet/tablet.h"
 #include "yb/docdb/docdb.pb.h"
 #include "yb/docdb/doc_key.h"
 
@@ -73,7 +73,6 @@ namespace yb {
 namespace log {
 
 using consensus::OpId;
-using consensus::CommitMsg;
 using consensus::ReplicateMsg;
 using consensus::WRITE_OP;
 using consensus::NO_OP;
@@ -83,9 +82,6 @@ using server::Clock;
 
 using tserver::WriteRequestPB;
 
-using tablet::TxResultPB;
-using tablet::OperationResultPB;
-using tablet::MemStoreTargetPB;
 using tablet::Tablet;
 
 using docdb::KeyValuePairPB;
@@ -99,9 +95,8 @@ const char* kTestTablet = "test-log-tablet";
 const bool APPEND_SYNC = true;
 const bool APPEND_ASYNC = false;
 
-// Append a single batch of 'count' NoOps to the log.
-// If 'size' is not NULL, increments it by the expected increase in log size.
-// Increments 'op_id''s index once for each operation logged.
+// Append a single batch of 'count' NoOps to the log.  If 'size' is not NULL, increments it by the
+// expected increase in log size.  Increments 'op_id''s index once for each operation logged.
 static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
                                            Log* log,
                                            OpId* op_id,
@@ -120,8 +115,8 @@ static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
     op_id->set_index(op_id->index() + 1);
 
     if (size) {
-      // If we're tracking the sizes we need to account for the fact that the Log wraps the
-      // log entry in an LogEntryBatchPB, and each actual entry will have a one-byte tag.
+      // If we're tracking the sizes we need to account for the fact that the Log wraps the log
+      // entry in an LogEntryBatchPB, and each actual entry will have a one-byte tag.
       *size += repl->ByteSize() + 1;
     }
     replicates.push_back(replicate);
@@ -129,12 +124,13 @@ static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
 
   // Account for the entry batch header and wrapper PB.
   if (size) {
-    *size += log::kEntryHeaderSize + 5;
+    *size += log::kEntryHeaderSize + 7;
   }
 
   Synchronizer s;
-  RETURN_NOT_OK(log->AsyncAppendReplicates(replicates,
-                                           s.AsStatusCallback()));
+  RETURN_NOT_OK(log->AsyncAppendReplicates(
+      replicates, yb::OpId() /* committed_op_id */, RestartSafeCoarseTimePoint::FromUInt64(1),
+      s.AsStatusCallback()));
   RETURN_NOT_OK(s.Wait());
   return Status::OK();
 }
@@ -142,7 +138,7 @@ static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
 static CHECKED_STATUS AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
                                           Log* log,
                                           OpId* op_id,
-                                          int* size = NULL) {
+                                          int* size = nullptr) {
   return AppendNoOpsToLogSync(clock, log, op_id, 1, size);
 }
 
@@ -154,8 +150,11 @@ class LogTestBase : public YBTest {
   typedef std::tuple<int, int, string> TupleForAppend;
 
   LogTestBase()
-    : schema_(GetSimpleTestSchema()),
-      log_anchor_registry_(new LogAnchorRegistry()) {
+      : schema_({ ColumnSchema("key", INT32, false, true),
+                  ColumnSchema("int_val", INT32),
+                  ColumnSchema("string_val", STRING, true) },
+                1),
+        log_anchor_registry_(new LogAnchorRegistry()) {
   }
 
   virtual void SetUp() override {
@@ -169,25 +168,28 @@ class LogTestBase : public YBTest {
     tablet_wal_path_ = fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet);
     clock_.reset(new server::HybridClock());
     ASSERT_OK(clock_->Init());
-
     FLAGS_log_min_seconds_to_retain = 0;
+    ASSERT_OK(ThreadPoolBuilder("append")
+                 .unlimited_threads()
+                 .Build(&append_pool_));
   }
 
   void BuildLog() {
     Schema schema_with_ids = SchemaBuilder(schema_).Build();
-    CHECK_OK(Log::Open(options_,
-                       fs_manager_.get(),
+    ASSERT_OK(Log::Open(options_,
                        kTestTablet,
                        tablet_wal_path_,
+                       fs_manager_->uuid(),
                        schema_with_ids,
                        0, // schema_version
                        metric_entity_.get(),
+                       append_pool_.get(),
                        &log_));
   }
 
   void CheckRightNumberOfSegmentFiles(int expected) {
-    // Test that we actually have the expected number of files in the fs.
-    // We should have n segments plus '.' and '..'
+    // Test that we actually have the expected number of files in the fs.  We should have n segments
+    // plus '.' and '..'
     vector<string> files;
     ASSERT_OK(env_->GetChildren(tablet_wal_path_, &files));
     int count = 0;
@@ -199,17 +201,8 @@ class LogTestBase : public YBTest {
     ASSERT_EQ(expected, count);
   }
 
-  void EntriesToIdList(vector<uint32_t>* ids) {
-    for (const auto& entry : entries_) {
-      VLOG(2) << "Entry contents: " << entry->DebugString();
-      if (entry->type() == REPLICATE) {
-        ids->push_back(entry->replicate().id().index());
-      }
-    }
-  }
-
   static void CheckReplicateResult(const consensus::ReplicateMsgPtr& msg, const Status& s) {
-    CHECK_OK(s);
+    ASSERT_OK(s);
   }
 
   // Appends a batch with size 2, or the given set of writes.
@@ -224,28 +217,21 @@ class LogTestBase : public YBTest {
     replicate->mutable_committed_op_id()->CopyFrom(committed_opid);
     replicate->set_hybrid_time(clock_->Now().ToUint64());
     WriteRequestPB *batch_request = replicate->mutable_write_request();
-    ASSERT_OK(SchemaToPB(schema_, batch_request->mutable_schema()));
-    if (table_type == TableType::KUDU_COLUMNAR_TABLE_TYPE) {
-      AddTestRowToPB(RowOperationsPB::INSERT, schema_,
-                     opid.index(),
-                     0,
-                     "this is a test insert",
-                     batch_request->mutable_row_operations());
-      AddTestRowToPB(RowOperationsPB::UPDATE, schema_,
-                     opid.index() + 1,
-                     0,
-                     "this is a test mutate",
-                     batch_request->mutable_row_operations());
-    } else {
-      if (writes.empty()) {
-        const int opid_index_as_int = static_cast<int>(opid.index());
-        writes.emplace_back(opid_index_as_int, 0, "this is a test insert");
-        writes.emplace_back(opid_index_as_int + 1, 0, "this is a test mutate");
-      }
-      auto write_batch = batch_request->mutable_write_batch();
-      for (const auto &w : writes) {
-        AddKVToPB(std::get<0>(w), std::get<1>(w), std::get<2>(w), write_batch);
-      }
+    if (writes.empty()) {
+      const int opid_index_as_int = static_cast<int>(opid.index());
+      // Since OpIds deal with int64 index and term, we are downcasting here. In order to be able
+      // to test with values > INT_MAX, we need to make sure we do not overflow, while still
+      // wanting to add 2 different values here.
+      //
+      // Picking x and x / 2 + 1 as the 2 values.
+      // For small numbers, special casing x <= 2.
+      const int other_int = opid_index_as_int <= 2 ? 3 : opid_index_as_int / 2 + 1;
+      writes.emplace_back(opid_index_as_int, 0, "this is a test insert");
+      writes.emplace_back(other_int, 0, "this is a test mutate");
+    }
+    auto write_batch = batch_request->mutable_write_batch();
+    for (const auto &w : writes) {
+      AddKVToPB(std::get<0>(w), std::get<1>(w), std::get<2>(w), write_batch);
     }
 
     batch_request->set_tablet_id(kTestTablet);
@@ -257,84 +243,36 @@ class LogTestBase : public YBTest {
                             bool sync = APPEND_SYNC) {
     if (sync) {
       Synchronizer s;
-      ASSERT_OK(log_->AsyncAppendReplicates({ replicate }, s.AsStatusCallback()));
+      ASSERT_OK(log_->AsyncAppendReplicates(
+          { replicate }, yb::OpId() /* committed_op_id */, restart_safe_coarse_mono_clock_.Now(),
+          s.AsStatusCallback()));
       ASSERT_OK(s.Wait());
     } else {
       // AsyncAppendReplicates does not free the ReplicateMsg on completion, so we
       // need to pass it through to our callback.
-      ASSERT_OK(log_->AsyncAppendReplicates({ replicate },
-                                            Bind(&LogTestBase::CheckReplicateResult, replicate)));
+      ASSERT_OK(log_->AsyncAppendReplicates(
+          { replicate }, yb::OpId() /* committed_op_id */, restart_safe_coarse_mono_clock_.Now(),
+          Bind(&LogTestBase::CheckReplicateResult, replicate)));
     }
   }
 
-  static void CheckCommitResult(const Status& s) {
-    CHECK_OK(s);
-  }
-
-  // Append a commit log entry containing one entry for the insert and one
-  // for the mutate.
-  void AppendCommit(const OpId& original_opid,
-                    bool sync = APPEND_SYNC) {
-    // The mrs id for the insert.
-    const int kTargetMrsId = 1;
-
-    // The rs and delta ids for the mutate.
-    const int kTargetRsId = 0;
-    const int kTargetDeltaId = 0;
-
-    AppendCommit(original_opid, kTargetMrsId, kTargetRsId, kTargetDeltaId, sync);
-  }
-
-  void AppendCommit(const OpId& original_opid,
-                    int mrs_id, int rs_id, int dms_id,
-                    bool sync = APPEND_SYNC) {
-    gscoped_ptr<CommitMsg> commit(new CommitMsg);
-    commit->set_op_type(WRITE_OP);
-
-    commit->mutable_commited_op_id()->CopyFrom(original_opid);
-
-    TxResultPB* result = commit->mutable_result();
-
-    OperationResultPB* insert = result->add_ops();
-    insert->add_mutated_stores()->set_mrs_id(mrs_id);
-
-    OperationResultPB* mutate = result->add_ops();
-    MemStoreTargetPB* target = mutate->add_mutated_stores();
-    target->set_dms_id(dms_id);
-    target->set_rs_id(rs_id);
-    AppendCommit(commit.Pass(), sync);
-  }
-
-  void AppendCommit(gscoped_ptr<CommitMsg> commit, bool sync = APPEND_SYNC) {
-    if (sync) {
-      Synchronizer s;
-      ASSERT_OK(log_->AsyncAppendCommit(commit.Pass(), s.AsStatusCallback()));
-      ASSERT_OK(s.Wait());
-    } else {
-      ASSERT_OK(log_->AsyncAppendCommit(commit.Pass(), Bind(&LogTestBase::CheckCommitResult)));
-    }
-  }
-
-  // Appends 'count' ReplicateMsgs and the corresponding CommitMsgs to the log
-  void AppendReplicateBatchToLog(int count, TableType table_type, bool sync = true) {
+  // Appends 'count' ReplicateMsgs to the log as committed entries.
+  void AppendReplicateBatchToLog(int count, bool sync = true) {
     for (int i = 0; i < count; i++) {
-      OpId opid = consensus::MakeOpId(1, current_index_);
-      AppendReplicateBatch(opid);
+      consensus::OpId opid = consensus::MakeOpId(1, current_index_);
+      AppendReplicateBatch(opid, opid);
       current_index_ += 1;
     }
   }
 
-  // Append a single NO_OP entry. Increments op_id by one.
-  // If non-NULL, and if the write is successful, 'size' is incremented
-  // by the size of the written operation.
+  // Append a single NO_OP entry. Increments op_id by one.  If non-NULL, and if the write is
+  // successful, 'size' is incremented by the size of the written operation.
   CHECKED_STATUS AppendNoOp(OpId* op_id, int* size = NULL) {
     return AppendNoOpToLogSync(clock_, log_.get(), op_id, size);
   }
 
-  // Append a number of no-op entries to the log.
-  // Increments op_id's index by the number of records written.
-  // If non-NULL, 'size' keeps track of the size of the operations
-  // successfully written.
+  // Append a number of no-op entries to the log.  Increments op_id's index by the number of records
+  // written.  If non-NULL, 'size' keeps track of the size of the operations successfully written.
   CHECKED_STATUS AppendNoOps(OpId* op_id, int num, int* size = NULL) {
     for (int i = 0; i < num; i++) {
       RETURN_NOT_OK(AppendNoOp(op_id, size));
@@ -369,14 +307,15 @@ class LogTestBase : public YBTest {
   gscoped_ptr<FsManager> fs_manager_;
   gscoped_ptr<MetricRegistry> metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
+  std::unique_ptr<ThreadPool> append_pool_;
   scoped_refptr<Log> log_;
-  int32_t current_index_;
+  int64_t current_index_;
   LogOptions options_;
   // Reusable entries vector that deletes the entries on destruction.
-  LogEntries entries_;
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
   scoped_refptr<Clock> clock_;
   string tablet_wal_path_;
+  RestartSafeCoarseMonoClock restart_safe_coarse_mono_clock_;
 };
 
 // Corrupts the last segment of the provided log by either truncating it

@@ -15,6 +15,9 @@
 
 #include "yb/tablet/operations/update_txn_operation.h"
 
+#include "yb/consensus/consensus.h"
+
+#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_coordinator.h"
 
@@ -24,6 +27,7 @@ namespace yb {
 namespace tablet {
 
 void UpdateTxnOperationState::UpdateRequestFromConsensusRound() {
+  VLOG_WITH_PREFIX(2) << "UpdateRequestFromConsensusRound";
   request_.store(consensus_round()->replicate_msg()->mutable_transaction_state(),
                  std::memory_order_release);
 }
@@ -41,43 +45,61 @@ consensus::ReplicateMsgPtr UpdateTxnOperation::NewReplicateMsg() {
 }
 
 Status UpdateTxnOperation::Prepare() {
+  VLOG_WITH_PREFIX(2) << "Prepare";
   return Status::OK();
 }
 
-void UpdateTxnOperation::Start() {
-  if (!state()->has_hybrid_time()) {
-    state()->set_hybrid_time(state()->tablet_peer()->clock().Now());
-  }
+void UpdateTxnOperation::DoStart() {
+  VLOG_WITH_PREFIX(2) << "DoStart";
+  state()->TrySetHybridTimeFromClock();
 }
 
 TransactionCoordinator& UpdateTxnOperation::transaction_coordinator() const {
-  return *state()->tablet_peer()->tablet()->transaction_coordinator();
+  return *state()->tablet()->transaction_coordinator();
 }
 
-ProcessingMode UpdateTxnOperation::mode() const {
-  return type() == consensus::LEADER ? ProcessingMode::LEADER : ProcessingMode::NON_LEADER;
-}
+Status UpdateTxnOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
+  VLOG_WITH_PREFIX(2) << "Replicated";
 
-Status UpdateTxnOperation::Apply(gscoped_ptr<consensus::CommitMsg>* commit_msg) {
   auto* state = this->state();
-  TransactionCoordinator::ReplicatedData data = {
-      mode(),
-      state->tablet_peer()->tablet(),
-      *state->request(),
-      state->op_id(),
-      state->hybrid_time()
-  };
-  return transaction_coordinator().ProcessReplicated(data);
+  // APPLYING is handled separately, because it is received for transactions not managed by
+  // this tablet as a transaction status tablet, but tablets that are involved in the data
+  // path (receive write intents) for this transaction.
+  if (state->request()->status() == TransactionStatus::APPLYING) {
+    TransactionParticipant::ReplicatedData data = {
+        leader_term,
+        *state->request(),
+        state->op_id(),
+        state->hybrid_time(),
+        false /* already_applied */
+    };
+    return state->tablet()->transaction_participant()->ProcessReplicated(data);
+  } else {
+    TransactionCoordinator::ReplicatedData data = {
+        leader_term,
+        *state->request(),
+        state->op_id(),
+        state->hybrid_time()
+    };
+    return transaction_coordinator().ProcessReplicated(data);
+  }
 }
 
 string UpdateTxnOperation::ToString() const {
-  return Format("UpdateTxnOperation [state=$0]", state()->ToString());
+  return Format("UpdateTxnOperation { state: $0 }", *state());
 }
 
-void UpdateTxnOperation::Finish(OperationResult result) {
-  if (result == OperationResult::ABORTED) {
-    LOG(INFO) << "Aborted: " << state()->request()->ShortDebugString();
+Status UpdateTxnOperation::DoAborted(const Status& status) {
+  if (state()->tablet()->transaction_coordinator()) {
+    LOG_WITH_PREFIX(INFO) << "Aborted";
+    TransactionCoordinator::AbortedData data = {
+      *state()->request(),
+      state()->op_id(),
+    };
+    transaction_coordinator().ProcessAborted(data);
   }
+
+  return status;
 }
 
 } // namespace tablet

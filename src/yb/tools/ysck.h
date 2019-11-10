@@ -56,25 +56,13 @@ struct ChecksumOptions {
 
   ChecksumOptions();
 
-  ChecksumOptions(MonoDelta timeout,
-                  int scan_concurrency,
-                  bool use_snapshot,
-                  uint64_t snapshot_hybrid_time);
+  ChecksumOptions(MonoDelta timeout, int scan_concurrency);
 
   // The maximum total time to wait for results to come back from all replicas.
   MonoDelta timeout;
 
   // The maximum number of concurrent checksum scans to run per tablet server.
   int scan_concurrency;
-
-  // Whether to use a snapshot checksum scanner.
-  bool use_snapshot;
-
-  // The snapshot hybrid_time to use for snapshot checksum scans.
-  uint64_t snapshot_hybrid_time;
-
-  // A hybrid_time indicicating that the current time should be used for a checksum snapshot.
-  static const uint64_t kCurrentHybridTime;
 };
 
 // Representation of a tablet replica on a tablet server.
@@ -96,6 +84,11 @@ class YsckTabletReplica {
 
   const std::string& ts_uuid() const {
     return ts_uuid_;
+  }
+
+  std::string ToString() const {
+    return Format("{ is_leader: $0 is_follower: $1 ts_uuid: $2 }",
+                  is_leader_, is_follower_, ts_uuid_);
   }
 
  private:
@@ -131,9 +124,21 @@ class YsckTablet {
 // Representation of a table. Composed of tablets.
 class YsckTable {
  public:
-  YsckTable(client::YBTableName name, const Schema& schema, int num_replicas, TableType table_type)
-      : name_(std::move(name)), schema_(schema), num_replicas_(num_replicas),
-      table_type_(table_type) {}
+  YsckTable(
+      const TableId& id,
+      client::YBTableName name,
+      const Schema& schema,
+      int num_replicas,
+      TableType table_type)
+      : id_(id),
+        name_(std::move(name)),
+        schema_(schema),
+        num_replicas_(num_replicas),
+        table_type_(table_type) {}
+
+  const TableId& id() const {
+    return id_;
+  }
 
   const client::YBTableName& name() const {
     return name_;
@@ -160,6 +165,7 @@ class YsckTable {
   }
 
  private:
+  TableId id_;
   const client::YBTableName name_;
   const Schema schema_;
   const int num_replicas_;

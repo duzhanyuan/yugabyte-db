@@ -35,8 +35,11 @@
 
 #include <string>
 
+#include "yb/common/wire_protocol.h"
+#include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/util/status.h"
+#include "yb/util/net/net_util.h"
 
 namespace yb {
 class Status;
@@ -58,6 +61,12 @@ CHECKED_STATUS GetRaftConfigMember(const RaftConfigPB& config,
                                    const std::string& uuid,
                                    RaftPeerPB* peer_pb);
 
+// Return an host/port for the uuid in the given config. Error out if not found.
+CHECKED_STATUS GetHostPortFromConfig(const RaftConfigPB& config,
+                                     const std::string& uuid,
+                                     const CloudInfoPB& from,
+                                     HostPort* hp);
+
 CHECKED_STATUS GetMutableRaftConfigMember(RaftConfigPB* config,
                                           const std::string& uuid,
                                           RaftPeerPB** peer_pb);
@@ -67,10 +76,11 @@ CHECKED_STATUS GetMutableRaftConfigMember(RaftConfigPB* config,
 // the config, or if there is no leader defined.
 CHECKED_STATUS GetRaftConfigLeader(const ConsensusStatePB& cstate, RaftPeerPB* peer_pb);
 
-// Modifies 'configuration' remove the peer with the specified 'uuid'.
-// Returns false if the server with 'uuid' is not found in the configuration.
+// Modifies 'config' to remove the peer with the specified 'uuid', unless use_host is set
+// within the request, when it uses req.server.host.
+// Returns false if the server with 'uuid' or req.server.host is not found in the configuration.
 // Returns true on success.
-bool RemoveFromRaftConfig(RaftConfigPB* config, const std::string& uuid);
+bool RemoveFromRaftConfig(RaftConfigPB* config, const ChangeConfigRequestPB& req);
 
 // Helper function to count number of peers of type member_type whose uuid doesn't match
 // ignore_uuid. We assume that peer's uuids are never empty strings.
@@ -95,6 +105,13 @@ int MajoritySize(int num_voters);
 // NON_PARTICIPANT, regardless of whether it is listed as leader in cstate.
 RaftPeerPB::Role GetConsensusRole(const std::string& uuid,
                                   const ConsensusStatePB& cstate);
+
+// Determines the member type that the peer with uuid 'uuid' plays in the cluster.
+// If the peer uuid is not a voter in the configuration, this function will return
+// UNKNOWN_MEMBER_TYPE.
+RaftPeerPB::MemberType GetConsensusMemberType(const std::string& uuid,
+                                              const ConsensusStatePB& cstate);
+
 
 // Verifies that the provided configuration is well formed.
 // If type == COMMITTED_QUORUM, we enforce that opid_index is set.

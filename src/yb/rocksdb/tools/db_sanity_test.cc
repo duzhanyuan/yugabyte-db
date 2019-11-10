@@ -33,7 +33,7 @@
 #include "yb/rocksdb/slice_transform.h"
 #include "yb/rocksdb/filter_policy.h"
 #include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 
 namespace rocksdb {
 
@@ -157,9 +157,7 @@ class SanityTestZlibCompressionVersion2 : public SanityTest {
       : SanityTest(path) {
     options_.compression = kZlibCompression;
     BlockBasedTableOptions table_options;
-#if ROCKSDB_MAJOR > 3 || (ROCKSDB_MAJOR == 3 && ROCKSDB_MINOR >= 10)
     table_options.format_version = 2;
-#endif
     options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
   }
   Options GetOptions() const override { return options_; }

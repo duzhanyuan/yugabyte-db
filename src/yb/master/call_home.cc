@@ -12,12 +12,12 @@
 
 #include "yb/master/call_home.h"
 
+#include <sstream>
+#include <thread>
+
 #include <rapidjson/reader.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
-
-#include <sstream>
-#include <thread>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/optional.hpp>
@@ -25,6 +25,10 @@
 
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master.pb.h"
+
+#include "yb/tserver/ts_tablet_manager.h"
+
+#include "yb/util/version_info.h"
 
 static const char* kLowLevel = "low";
 static const char* kMediumLevel = "medium";
@@ -137,12 +141,25 @@ class BasicCollector : public CollectorBase {
         }
         AppendPairToJson("node_uuid", master()->fs_manager()->uuid(), &json_);
         AppendPairToJson("server_type", "master", &json_);
+
+        // Only collect hostname and username if collection level is medium or high.
+        if (collection_level != CollectionLevel::LOW) {
+          AppendPairToJson("hostname", master()->get_hostname(), &json_);
+          AppendPairToJson("current_user", master()->get_current_user(), &json_);
+        }
+        json_ += ",\"version_info\":" + VersionInfo::GetAllVersionInfoJson();
         break;
       }
       case ServerType::TSERVER: {
         AppendPairToJson("cluster_uuid", tserver()->cluster_uuid(), &json_);
         AppendPairToJson("node_uuid", tserver()->permanent_uuid(), &json_);
         AppendPairToJson("server_type", "tserver", &json_);
+
+        // Only collect hostname and username if collection level is medium or high.
+        if (collection_level != CollectionLevel::LOW) {
+          AppendPairToJson("hostname", tserver()->get_hostname(), &json_);
+          AppendPairToJson("current_user", tserver()->get_current_user(), &json_);
+        }
         break;
       }
     }
@@ -236,8 +253,13 @@ class TablesCollector : public CollectorBase {
 
   void Collect(CollectionLevel collection_level) {
     ListTablesRequestPB req;
+    req.set_exclude_system_tables(true);
     ListTablesResponsePB resp;
     auto status = master()->catalog_manager()->ListTables(&req, &resp);
+    if (!status.ok()) {
+      LOG(INFO) << "Error getting number of tables";
+      return;
+    }
     if (collection_level == CollectionLevel::LOW) {
       json_ = Substitute("\"tables\":$0", resp.tables_size());
     } else {
@@ -333,7 +355,7 @@ class GFlagsCollector : public CollectorBase {
 };
 
 CallHome::CallHome(server::RpcAndWebServerBase* server, ServerType server_type) :
-    server_(server), pool_(1), server_type_(server_type) {
+    server_(server), pool_("call_home", 1), server_type_(server_type) {
 
   scheduler_ = std::make_unique<yb::rpc::Scheduler>(&pool_.io_service());
 
@@ -381,7 +403,7 @@ std::string CallHome::BuildJson() {
   rapidjson::Reader reader;
   rapidjson::StringStream ss(str.c_str());
   if (!reader.Parse<rapidjson::kParseDefaultFlags>(ss, writer)) {
-    LOG(ERROR) << "Unable to parse json. Error: " << reader.GetParseError()
+    LOG(ERROR) << "Unable to parse json. Error: " << reader.GetParseErrorCode()
         << " at offset " << reader.GetErrorOffset() << " in string " <<
         str.substr(reader.GetErrorOffset(), 10);
     return str;
@@ -398,7 +420,7 @@ void CallHome::BuildJsonAndSend() {
 void CallHome::DoCallHome() {
   if (server_type_ == ServerType::MASTER &&
       !master()->catalog_manager()->CheckIsLeaderAndReady().ok()) {
-    LOG(INFO) << "This master instance is not a leader. Skipping call home";
+    VLOG(3) << "This master instance is not a leader. Skipping call home";
   } else {
     BuildJsonAndSend();
   }
@@ -417,7 +439,7 @@ void CallHome::SendData(const string& payload) {
 }
 
 void CallHome::ScheduleCallHome(int delay_seconds) {
-  scheduler_->Schedule(std::bind(&CallHome::DoCallHome, this),
+  scheduler_->Schedule([this](const Status& status) { DoCallHome(); },
                        std::chrono::seconds(delay_seconds));
 }
 

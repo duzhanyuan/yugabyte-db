@@ -18,8 +18,6 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
-
 #include "yb/rocksdb/util/options_parser.h"
 
 #include <cmath>
@@ -31,10 +29,10 @@
 #include "yb/rocksdb/convenience.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/util/options_helper.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/sync_point.h"
-
 #include "yb/rocksdb/port/port.h"
+#include "yb/util/version_info.h"
 
 namespace rocksdb {
 
@@ -66,9 +64,7 @@ Status PersistRocksDBOptions(const DBOptions& db_opt,
   writable->Append(option_file_header + "[" +
                    opt_section_titles[kOptionSectionVersion] +
                    "]\n"
-                   "  rocksdb_version=" +
-                   ToString(ROCKSDB_MAJOR) + "." + ToString(ROCKSDB_MINOR) +
-                   "." + ToString(ROCKSDB_PATCH) + "\n");
+                   "  yugabyte_version=" + yb::VersionInfo::GetShortVersionString() + "\n");
   writable->Append("  options_file_version=" +
                    ToString(ROCKSDB_OPTION_FILE_MAJOR) + "." +
                    ToString(ROCKSDB_OPTION_FILE_MINOR) + "\n");
@@ -215,7 +211,7 @@ namespace {
 bool ReadOneLine(std::istringstream* iss, SequentialFile* seq_file,
                  std::string* output, bool* has_data, Status* result) {
   const int kBufferSize = 4096;
-  char buffer[kBufferSize + 1];
+  uint8_t buffer[kBufferSize + 1];
   Slice input_slice;
 
   std::string line;
@@ -571,9 +567,8 @@ bool AreEqualOptions(
               *reinterpret_cast<const ChecksumType*>(offset2));
     case OptionType::kBlockBasedTableIndexType:
       return (
-          *reinterpret_cast<const BlockBasedTableOptions::IndexType*>(
-              offset1) ==
-          *reinterpret_cast<const BlockBasedTableOptions::IndexType*>(offset2));
+          *reinterpret_cast<const IndexType*>(offset1) ==
+          *reinterpret_cast<const IndexType*>(offset2));
     case OptionType::kWALRecoveryMode:
       return (*reinterpret_cast<const WALRecoveryMode*>(offset1) ==
               *reinterpret_cast<const WALRecoveryMode*>(offset2));
@@ -821,5 +816,3 @@ Status RocksDBOptionsParser::VerifyTableFactory(
   return Status::OK();
 }
 }  // namespace rocksdb
-
-#endif  // !ROCKSDB_LITE

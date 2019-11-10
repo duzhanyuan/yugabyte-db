@@ -32,11 +32,16 @@
 #include "yb/rocksutil/yb_rocksdb.h"
 #include "yb/util/bytes_formatter.h"
 #include "yb/util/path_util.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
 #include "yb/util/string_trim.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tostring.h"
+#include "yb/util/algorithm_util.h"
+#include "yb/util/string_util.h"
 #include "yb/tablet/tablet_options.h"
+#include "yb/rocksdb/db/filename.h"
 
 using std::endl;
 using std::make_shared;
@@ -48,7 +53,10 @@ using std::stringstream;
 using strings::Substitute;
 
 using yb::util::ApplyEagerLineContinuation;
-using yb::util::FormatBytesAsStr;
+using yb::FormatBytesAsStr;
+using yb::util::TrimStr;
+using yb::util::LeftShiftTextBlock;
+using yb::util::TrimCppComments;
 
 namespace yb {
 namespace docdb {
@@ -59,21 +67,37 @@ class NonTransactionalStatusProvider: public TransactionStatusManager {
  public:
   HybridTime LocalCommitTime(const TransactionId &id) override {
     Fail();
-    return HybridTime::kInvalidHybridTime;
+    return HybridTime::kInvalid;
   }
 
-  void RequestStatusAt(const TransactionId &id,
-      HybridTime time,
-      TransactionStatusCallback callback) override {
+  void RequestStatusAt(const StatusRequest& request) override {
     Fail();
   }
 
-  boost::optional<TransactionMetadata> Metadata(const TransactionId& id) override {
+  Result<TransactionMetadata> PrepareMetadata(const TransactionMetadataPB& pb) override {
     Fail();
-    return boost::none;
+    return STATUS(Expired, "");
+  }
+
+  int64_t RegisterRequest() override {
+    Fail();
+    return 0;
+  }
+
+  void UnregisterRequest(int64_t) override {
+    Fail();
   }
 
   void Abort(const TransactionId& id, TransactionStatusCallback callback) override {
+    Fail();
+  }
+
+  void Cleanup(TransactionIdSet&& set) override {
+    Fail();
+  }
+
+  void FillPriorities(
+      boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) override {
     Fail();
   }
 
@@ -194,7 +218,7 @@ PrimitiveValue GenRandomPrimitiveValue(RandomNumberGenerator* rng) {
       }
       return PrimitiveValue(s);
     }
-    case 2: return PrimitiveValue(ValueType::kNull);
+    case 2: return PrimitiveValue(ValueType::kNullLow);
     case 3: return PrimitiveValue(ValueType::kTrue);
     case 4: return PrimitiveValue(ValueType::kFalse);
     case 5: return PrimitiveValue(kFruit[(*rng)() % kFruit.size()]);
@@ -259,8 +283,7 @@ void LogicalRocksDBDebugSnapshot::Capture(rocksdb::DB* rocksdb) {
   auto iter = unique_ptr<rocksdb::Iterator>(rocksdb->NewIterator(read_options));
   iter->SeekToFirst();
   while (iter->Valid()) {
-    kvs.emplace_back(iter->key().ToString(/* hex = */ false),
-                     iter->value().ToString(/* hex = */ false));
+    kvs.emplace_back(iter->key().ToBuffer(), iter->value().ToBuffer());
     iter->Next();
   }
   // Save the DocDB debug dump as a string so we can check that we've properly restored the snapshot
@@ -286,7 +309,7 @@ void LogicalRocksDBDebugSnapshot::RestoreTo(rocksdb::DB *rocksdb) const {
 
 // ------------------------------------------------------------------------------------------------
 
-DocDBLoadGenerator::DocDBLoadGenerator(DocDBRocksDBFixtureTest* fixture,
+DocDBLoadGenerator::DocDBLoadGenerator(DocDBRocksDBFixture* fixture,
                                        const int num_doc_keys,
                                        const int num_unique_subkeys,
                                        const UseHash use_hash,
@@ -318,7 +341,7 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
   ++iteration_;
 
   DOCDB_DEBUG_LOG("Starting iteration i=$0", current_iteration);
-  DocWriteBatch dwb(fixture_->rocksdb(), &fixture_->monotonic_counter());
+  auto dwb = fixture_->MakeDocWriteBatch();
   const auto& doc_key = RandomElementOf(doc_keys_, &random_);
   const KeyBytes encoded_doc_key(doc_key.Encode());
 
@@ -361,7 +384,7 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
 
   if (is_deletion) {
     DOCDB_DEBUG_LOG("Iteration $0: deleting doc path $1", current_iteration, doc_path.ToString());
-    ASSERT_OK(dwb.DeleteSubDoc(doc_path));
+    ASSERT_OK(dwb.DeleteSubDoc(doc_path, ReadHybridTime::Max()));
     ASSERT_OK(in_mem_docdb_.DeleteSubDoc(doc_path));
   } else {
     DOCDB_DEBUG_LOG("Iteration $0: setting value at doc path $1 to $2",
@@ -369,7 +392,7 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
     ASSERT_OK(in_mem_docdb_.SetPrimitive(doc_path, value));
     const auto set_primitive_status = dwb.SetPrimitive(doc_path, value);
     if (!set_primitive_status.ok()) {
-      DocDBDebugDump(rocksdb(), std::cerr);
+      DocDBDebugDump(rocksdb(), std::cerr, StorageDbType::kRegular);
       LOG(INFO) << "doc_path=" << doc_path.ToString();
     }
     ASSERT_OK(set_primitive_status);
@@ -389,14 +412,15 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
     if (do_compaction_now) {
       // This will happen between the two iterations of the loop. If compact_history is false,
       // there is only one iteration and the compaction does not happen.
-      fixture_->CompactHistoryBefore(hybrid_time);
+      fixture_->FullyCompactHistoryBefore(hybrid_time);
     }
+    SubDocKey sub_doc_key(doc_key);
     SubDocument doc_from_rocksdb;
     bool doc_found_in_rocksdb = false;
-    ASSERT_OK(
-        GetSubDocument(
-            rocksdb(), SubDocKey(doc_key), rocksdb::kDefaultQueryId, txn_op_context,
-            &doc_from_rocksdb, &doc_found_in_rocksdb));
+    auto encoded_sub_doc_key = sub_doc_key.EncodeWithoutHt();
+    GetSubDocumentData data = { encoded_sub_doc_key, &doc_from_rocksdb, &doc_found_in_rocksdb };
+    ASSERT_OK(GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
+                             txn_op_context, CoarseTimePoint::max() /* deadline */));
     if (is_deletion && (
             doc_path.num_subkeys() == 0 ||  // Deleted the entire sub-document,
             !doc_already_exists_in_mem)) {  // or the document did not exist in the first place.
@@ -426,19 +450,19 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
 }
 
 HybridTime DocDBLoadGenerator::last_operation_ht() const {
-  CHECK_NE(last_operation_ht_, HybridTime::kInvalidHybridTime);
+  CHECK(last_operation_ht_.is_valid());
   return last_operation_ht_;
 }
 
 void DocDBLoadGenerator::FlushRocksDB() {
   LOG(INFO) << "Forcing a RocksDB flush after hybrid_time " << last_operation_ht().value();
-  ASSERT_OK(fixture_->FlushRocksDB());
+  ASSERT_OK(fixture_->FlushRocksDbAndWait());
 }
 
 void DocDBLoadGenerator::CaptureDocDbSnapshot() {
   // Capture snapshots from time to time.
   docdb_snapshots_.emplace_back();
-  docdb_snapshots_.back().CaptureAt(rocksdb(), HybridTime::kMax);
+  docdb_snapshots_.back().CaptureAt(doc_db(), HybridTime::kMax);
   docdb_snapshots_.back().SetCaptureHybridTime(last_operation_ht_);
 }
 
@@ -523,7 +547,7 @@ void DocDBLoadGenerator::VerifySnapshot(const InMemDocDbState& snapshot) {
   }
   LOG(INFO) << details_msg;
 
-  flashback_state.CaptureAt(rocksdb(), snap_ht);
+  flashback_state.CaptureAt(doc_db(), snap_ht);
   const bool is_match = flashback_state.EqualsAndLogDiff(snapshot);
   if (!is_match) {
     LOG(ERROR) << details_msg << "\nDOCDB SNAPSHOT VERIFICATION FAILED, DOCDB STATE:";
@@ -536,7 +560,7 @@ void DocDBLoadGenerator::RecordSnapshotDivergence(const InMemDocDbState &snapsho
                                                   const HybridTime cleanup_ht) {
   InMemDocDbState flashback_state;
   const auto snap_ht = snapshot.captured_at();
-  flashback_state.CaptureAt(rocksdb(), snap_ht);
+  flashback_state.CaptureAt(doc_db(), snap_ht);
   if (!flashback_state.EqualsAndLogDiff(snapshot, /* log_diff = */ false)) {
     // Implicitly converting hybrid_times to ints. That's OK, because we're using small enough
     // integer values for hybrid_times.
@@ -554,19 +578,136 @@ TransactionOperationContextOpt DocDBLoadGenerator::GetReadOperationTransactionCo
 
 // ------------------------------------------------------------------------------------------------
 
-void DocDBRocksDBFixtureTest::AssertDocDbDebugDumpStrEq(const string &expected) {
-  ASSERT_STR_EQ_VERBOSE_TRIMMED(ApplyEagerLineContinuation(expected), DocDBDebugDumpToStr());
+void DocDBRocksDBFixture::AssertDocDbDebugDumpStrEq(const string &expected) {
+  const string debug_dump_str = TrimDocDbDebugDumpStr(DocDBDebugDumpToStr());
+  const string expected_str = TrimDocDbDebugDumpStr(expected);
+  if (expected_str != debug_dump_str) {
+    auto expected_lines = StringSplit(expected_str, '\n');
+    auto actual_lines = StringSplit(debug_dump_str, '\n');
+    vector<int> mismatch_line_numbers;
+    for (int i = 0; i < std::min(expected_lines.size(), actual_lines.size()); ++i) {
+      if (expected_lines[i] != actual_lines[i]) {
+        mismatch_line_numbers.push_back(i + 1);
+      }
+    }
+    LOG(ERROR) << "Assertion failure"
+               << "\nExpected DocDB contents:\n\n" << expected_str << "\n"
+               << "\nActual DocDB contents:\n\n" << debug_dump_str << "\n"
+               << "\nExpected # of lines: " << expected_lines.size()
+               << ", actual # of lines: " << actual_lines.size()
+               << "\nLines not matching: " << yb::ToString(mismatch_line_numbers)
+               << "\nPlease check if source files have trailing whitespace and remove it.";
+
+    FAIL();
+  }
 }
 
-void DocDBRocksDBFixtureTest::CompactHistoryBefore(HybridTime history_cutoff) {
-  LOG(INFO) << "Compacting history before hybrid_time " << history_cutoff.ToDebugString();
+void DocDBRocksDBFixture::FullyCompactHistoryBefore(HybridTime history_cutoff) {
+  LOG(INFO) << "Major-compacting history before hybrid_time " << history_cutoff;
   SetHistoryCutoffHybridTime(history_cutoff);
-  ASSERT_OK(FlushRocksDB());
+  auto se = ScopeExit([this] {
+    SetHistoryCutoffHybridTime(HybridTime::kMin);
+  });
+
+  ASSERT_OK(FlushRocksDbAndWait());
   ASSERT_OK(FullyCompactDB(rocksdb_.get()));
-  SetHistoryCutoffHybridTime(HybridTime::kMin);
 }
 
-Status DocDBRocksDBFixtureTest::FormatDocWriteBatch(const DocWriteBatch &dwb, string* dwb_str) {
+void DocDBRocksDBFixture::MinorCompaction(
+    HybridTime history_cutoff,
+    int num_files_to_compact,
+    int start_index) {
+
+  ASSERT_OK(FlushRocksDbAndWait());
+  SetHistoryCutoffHybridTime(history_cutoff);
+  auto se = ScopeExit([this] {
+    SetHistoryCutoffHybridTime(HybridTime::kMin);
+  });
+
+  rocksdb::ColumnFamilyMetaData cf_meta;
+  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+
+  vector<string> compaction_input_file_names;
+  vector<string> remaining_file_names;
+
+  size_t initial_num_files = 0;
+  {
+    const auto& files = cf_meta.levels[0].files;
+    initial_num_files = files.size();
+    ASSERT_LE(num_files_to_compact, files.size());
+    vector<string> file_names;
+    for (const auto& sst_meta : files) {
+      file_names.push_back(sst_meta.name);
+    }
+    SortByKey(file_names.begin(), file_names.end(), rocksdb::TableFileNameToNumber);
+
+    if (start_index < 0) {
+      start_index = file_names.size() - num_files_to_compact;
+    }
+
+    for (int i = 0; i < file_names.size(); ++i) {
+      if (start_index <= i && compaction_input_file_names.size() < num_files_to_compact) {
+        compaction_input_file_names.push_back(file_names[i]);
+      } else {
+        remaining_file_names.push_back(file_names[i]);
+      }
+    }
+    ASSERT_EQ(num_files_to_compact, compaction_input_file_names.size())
+        << "Tried to add " << num_files_to_compact << " files starting with index " << start_index
+        << ", ended up adding " << yb::ToString(compaction_input_file_names)
+        << " and leaving " << yb::ToString(remaining_file_names) << " out. All files: "
+        << yb::ToString(file_names);
+
+    LOG(INFO) << "Minor-compacting history before hybrid_time " << history_cutoff << ":\n"
+              << "  files being compacted: " << yb::ToString(compaction_input_file_names) << "\n"
+              << "  other files: " << yb::ToString(remaining_file_names);
+
+    ASSERT_OK(rocksdb_->CompactFiles(
+        rocksdb::CompactionOptions(),
+        compaction_input_file_names,
+        /* output_level */ 0));
+    const auto sstables_after_compaction = SSTableFileNames();
+    LOG(INFO) << "SSTable files after compaction: " << sstables_after_compaction.size()
+              << " (" << yb::ToString(sstables_after_compaction) << ")";
+    for (const auto& remaining_file : remaining_file_names) {
+      ASSERT_TRUE(
+          std::find(sstables_after_compaction.begin(), sstables_after_compaction.end(),
+                    remaining_file) != sstables_after_compaction.end()
+      ) << "File " << remaining_file << " not found in file list after compaction: "
+        << yb::ToString(sstables_after_compaction) << ", even though none of these files were "
+        << "supposed to be compacted: " << yb::ToString(remaining_file_names);
+    }
+  }
+
+  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  vector<string> files_after_compaction;
+  for (const auto& sst_meta : cf_meta.levels[0].files) {
+    files_after_compaction.push_back(sst_meta.name);
+  }
+  const int64_t expected_resulting_num_files = initial_num_files - num_files_to_compact + 1;
+  ASSERT_EQ(expected_resulting_num_files,
+            static_cast<int64_t>(cf_meta.levels[0].files.size()))
+      << "Files after compaction: " << yb::ToString(files_after_compaction);
+}
+
+int DocDBRocksDBFixture::NumSSTableFiles() {
+  rocksdb::ColumnFamilyMetaData cf_meta;
+  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  return cf_meta.levels[0].files.size();
+}
+
+StringVector DocDBRocksDBFixture::SSTableFileNames() {
+  rocksdb::ColumnFamilyMetaData cf_meta;
+  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  StringVector files;
+  for (const auto& sstable_meta : cf_meta.levels[0].files) {
+    files.push_back(sstable_meta.name);
+  }
+  SortByKey(files.begin(), files.end(), rocksdb::TableFileNameToNumber);
+  return files;
+}
+
+Status DocDBRocksDBFixture::FormatDocWriteBatch(const DocWriteBatch &dwb, string* dwb_str) {
   WriteBatchFormatter formatter;
   rocksdb::WriteBatch rocksdb_write_batch;
   RETURN_NOT_OK(PopulateRocksDBWriteBatch(dwb, &rocksdb_write_batch));
@@ -580,22 +721,28 @@ Status FullyCompactDB(rocksdb::DB* rocksdb) {
   return rocksdb->CompactRange(compact_range_options, nullptr, nullptr);
 }
 
-Status DocDBRocksDBFixtureTest::InitRocksDBDir() {
+Status DocDBRocksDBFixture::InitRocksDBDir() {
   string test_dir;
   RETURN_NOT_OK(Env::Default()->GetTestDirectory(&test_dir));
   rocksdb_dir_ = JoinPathSegments(test_dir, StringPrintf("mytestdb-%d", rand()));
   CHECK(!rocksdb_dir_.empty());  // Check twice before we recursively delete anything.
   CHECK_NE(rocksdb_dir_, "/");
   RETURN_NOT_OK(Env::Default()->DeleteRecursively(rocksdb_dir_));
+  RETURN_NOT_OK(Env::Default()->DeleteRecursively(IntentsDBDir()));
   return Status::OK();
 }
 
-string DocDBRocksDBFixtureTest::tablet_id() {
+string DocDBRocksDBFixture::tablet_id() {
   return "mytablet";
 }
 
-Status DocDBRocksDBFixtureTest::InitRocksDBOptions() {
-  return InitCommonRocksDBOptions();
+Status DocDBRocksDBFixture::InitRocksDBOptions() {
+  RETURN_NOT_OK(InitCommonRocksDBOptions());
+  return Status::OK();
+}
+
+string TrimDocDbDebugDumpStr(const string& debug_dump_str) {
+  return TrimStr(ApplyEagerLineContinuation(LeftShiftTextBlock(TrimCppComments(debug_dump_str))));
 }
 
 }  // namespace docdb

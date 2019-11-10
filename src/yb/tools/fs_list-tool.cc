@@ -58,7 +58,6 @@ enum CommandType {
   FS_TREE = 1,
   LIST_LOGS = 2,
   LIST_TABLETS = 3,
-  LIST_BLOCKS = 4
 };
 
 // TODO: extract and generalized the "verb" handling code with other
@@ -77,9 +76,7 @@ const vector<CommandHandler> kCommandHandlers = {
     CommandHandler(FS_TREE, "tree", "Print out a file system tree." ),
     CommandHandler(LIST_LOGS, "list_logs",
                    "List file system logs (optionally accepts a tablet id)."),
-    CommandHandler(LIST_TABLETS, "list_tablets", "List tablets." ),
-    CommandHandler(LIST_BLOCKS, "list_blocks",
-                   "List block for tablet (optionally accepts a tablet id).") };
+    CommandHandler(LIST_TABLETS, "list_tablets", "List tablets." ) };
 
 void PrintUsageToStream(const string& prog_name, std::ostream* out) {
   *out << "Usage: " << prog_name << " [-verbose] "
@@ -146,13 +143,6 @@ static int FsListToolMain(int argc, char** argv) {
     case LIST_TABLETS: {
       CHECK_OK(fs_tool.ListAllTablets());
       break;
-    }
-    case LIST_BLOCKS: {
-      if (argc > 2) {
-        CHECK_OK(fs_tool.ListBlocksForTablet(argv[2]));
-      } else {
-         CHECK_OK(fs_tool.ListBlocksForAllTablets());
-      }
     }
   }
 

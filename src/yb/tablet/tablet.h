@@ -44,18 +44,16 @@
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/write_batch.h"
 
-#include "yb/tserver/tserver.pb.h"
+#include "yb/client/client.h"
+#include "yb/client/meta_data_cache.h"
+#include "yb/client/transaction_manager.h"
 
-#include "yb/client/client_fwd.h"
-
-#include "yb/common/iterator.h"
-#include "yb/common/predicate_encoder.h"
 #include "yb/common/schema.h"
-#include "yb/common/row_operations.h"
 #include "yb/common/transaction.h"
 #include "yb/common/ql_storage_interface.h"
 
 #include "yb/docdb/docdb.pb.h"
+#include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_compaction_filter.h"
 #include "yb/docdb/doc_operation.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
@@ -65,12 +63,11 @@
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 
+#include "yb/rpc/rpc_fwd.h"
+
 #include "yb/tablet/abstract_tablet.h"
-#include "yb/tablet/lock_manager.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/tablet/mvcc.h"
-#include "yb/tablet/rowset.h"
-#include "yb/tablet/rowset_metadata.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/transaction_participant.h"
 
@@ -81,6 +78,11 @@
 #include "yb/util/slice.h"
 #include "yb/util/status.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/enums.h"
+
+#include "yb/gutil/thread_annotations.h"
+
+#include "yb/tablet/operations/snapshot_operation.h"
 
 namespace rocksdb {
 class DB;
@@ -91,7 +93,10 @@ namespace yb {
 class MemTracker;
 class MetricEntity;
 class RowChangeList;
-class UnionIterator;
+
+namespace docdb {
+class ConsensusFrontier;
+}
 
 namespace log {
 class LogAnchorRegistry;
@@ -107,84 +112,83 @@ class MaintenanceOpStats;
 
 namespace tablet {
 
-class AlterSchemaOperationState;
-class CompactionPolicy;
-class MemRowSet;
-class MvccSnapshot;
-struct RowOp;
-class RowSetsInCompaction;
-class RowSetTree;
+class ChangeMetadataOperationState;
 class ScopedReadOperation;
-struct TabletComponents;
 struct TabletMetrics;
 struct TransactionApplyData;
 class TransactionCoordinator;
 class TransactionCoordinatorContext;
 class TransactionParticipant;
+class TruncateOperationState;
 class WriteOperationState;
 
 using docdb::LockBatch;
 
-class TabletFlushStats : public rocksdb::EventListener {
- public:
+YB_STRONGLY_TYPED_BOOL(IncludeIntents);
 
-  void OnFlushScheduled(rocksdb::DB* db) override {
-    oldest_write_in_memstore_.store(std::numeric_limits<uint64_t>::max(),
-                                    std::memory_order_release);
-    num_flushes_++;
-  }
+YB_DEFINE_ENUM(FlushMode, (kSync)(kAsync));
 
-  void AboutToWriteToDb(HybridTime hybrid_time) {
-    // Atomically do oldest_write_in_memstore_ = min(oldest_write_in_memstore_, hybrid_time)
-    uint64_t curr_val = hybrid_time.ToUint64();
-    uint64_t prev_val = oldest_write_in_memstore_.load(std::memory_order_acquire);
-    while (curr_val < prev_val &&
-           !oldest_write_in_memstore_.compare_exchange_weak(prev_val, curr_val)) {}
-  }
+enum class FlushFlags {
+  kNone = 0,
 
-  // Return the hybrid time of the oldest write in the memstore, or HybridTime::kMax if empty
-  HybridTime oldest_write_in_memstore() const {
-    return HybridTime(oldest_write_in_memstore_.load(std::memory_order_acquire));
-  }
+  kRegular = 1,
+  kIntents = 2,
 
-  // Number of flushes scheduled. Updated atomically before scheduling.
-  size_t num_flushes() {
-    return num_flushes_.load(std::memory_order_acquire);
-  }
-
- private:
-  std::atomic<size_t> num_flushes_{0};
-  std::atomic<uint64_t> oldest_write_in_memstore_{std::numeric_limits<uint64_t>::max()};
+  kAll = kRegular | kIntents
 };
 
-enum class FlushMode {
-  kSync,
-  kAsync,
+inline FlushFlags operator|(FlushFlags lhs, FlushFlags rhs) {
+  return static_cast<FlushFlags>(to_underlying(lhs) | to_underlying(rhs));
+}
+
+inline FlushFlags operator&(FlushFlags lhs, FlushFlags rhs) {
+  return static_cast<FlushFlags>(to_underlying(lhs) & to_underlying(rhs));
+}
+
+inline bool HasFlags(FlushFlags lhs, FlushFlags rhs) {
+  return (lhs & rhs) != FlushFlags::kNone;
+}
+
+class WriteOperation;
+
+struct DocDbOpIds {
+  OpId regular;
+  OpId intents;
+
+  std::string ToString() const;
 };
+
+typedef std::function<Status(const TableInfo&)> AddTableListener;
 
 class Tablet : public AbstractTablet, public TransactionIntentApplier {
  public:
-  typedef std::map<int64_t, int64_t> MaxIdxToSegmentMap;
-  friend class CompactRowSetsOp;
-  friend class FlushMRSOp;
-
   class CompactionFaultHooks;
   class FlushCompactCommonHooks;
   class FlushFaultHooks;
-  class Iterator;
+
+  // A function that returns the current majority-replicated hybrid time leader lease, or waits
+  // until a hybrid time leader lease with at least the given microsecond component is acquired
+  // (first argument), or a timeout occurs (second argument). HybridTime::kInvalid is returned
+  // in case of a timeout.
+  using HybridTimeLeaseProvider = std::function<HybridTime(MicrosTime, CoarseTimePoint)>;
+  using TransactionIdSet = std::unordered_set<TransactionId, TransactionIdHash>;
 
   // Create a new tablet.
   //
   // If 'metric_registry' is non-NULL, then this tablet will create a 'tablet' entity
   // within the provided registry. Otherwise, no metrics are collected.
   Tablet(
-      const scoped_refptr<TabletMetadata>& metadata,
+      const RaftGroupMetadataPtr& metadata,
+      const std::shared_future<client::YBClient*> &client_future,
       const scoped_refptr<server::Clock>& clock,
       const std::shared_ptr<MemTracker>& parent_mem_tracker,
+      std::shared_ptr<MemTracker> block_based_table_mem_tracker,
       MetricRegistry* metric_registry,
       const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry,
       const TabletOptions& tablet_options,
+      std::string log_prefix_suffix,
       TransactionParticipantContext* transaction_participant_context,
+      client::LocalTabletFilter local_tablet_filter,
       TransactionCoordinatorContext* transaction_coordinator_context);
 
   ~Tablet();
@@ -192,6 +196,8 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   // Open the tablet.
   // Upon completion, the tablet enters the kBootstrapping state.
   CHECKED_STATUS Open();
+
+  CHECKED_STATUS EnableCompactions();
 
   // Mark that the tablet has finished bootstrapping.
   // This transitions from kBootstrapping to kOpen state.
@@ -204,28 +210,18 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
     return shutdown_requested_.load(std::memory_order::memory_order_acquire);
   }
 
-  void Shutdown();
+  void Shutdown(IsDropTable is_drop_table = IsDropTable::kFalse);
 
   CHECKED_STATUS ImportData(const std::string& source_dir);
 
   CHECKED_STATUS ApplyIntents(const TransactionApplyData& data) override;
 
-  // Decode the Write (insert/mutate) operations from within a user's request.
-  // Either fills in operation_state->row_ops or tx_state->kv_write_batch depending on TableType.
-  CHECKED_STATUS DecodeWriteOperations(
-      const Schema* client_schema,
-      WriteOperationState* operation_state);
+  CHECKED_STATUS RemoveIntents(const RemoveIntentsData& data, const TransactionId& id) override;
 
-  // Kudu-specific. To be removed with the rest of Kudu storage engine. This is a no-op for YB
-  // tables.
-  //
-  // Acquire locks for each of the operations in the given txn.
-  //
-  // Note that, if this fails, it's still possible that the transaction
-  // state holds _some_ of the locks. In that case, we expect that
-  // the transaction will still clean them up when it is aborted (or
-  // otherwise destructed).
-  CHECKED_STATUS AcquireKuduRowLocks(WriteOperationState *operation_state);
+  CHECKED_STATUS RemoveIntents(
+      const RemoveIntentsData& data, const TransactionIdSet& transactions) override;
+
+  HybridTime ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) override;
 
   // Finish the Prepare phase of a write transaction.
   //
@@ -255,42 +251,23 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   // it's not the first thing in a transaction!
   void StartOperation(WriteOperationState* operation_state);
 
-  // Insert a new row into the tablet.
-  //
-  // The provided 'data' slice should have length equivalent to this
-  // tablet's Schema.byte_size().
-  //
-  // After insert, the row and any referred-to memory (eg for strings)
-  // have been copied into internal memory, and thus the provided memory
-  // buffer may safely be re-used or freed.
-  //
-  // Returns Status::AlreadyPresent() if an entry with the same key is already
-  // present in the tablet.
-  // Returns Status::OK unless allocation fails.
-  //
-  // Acquires the row lock for the given operation, setting it in the
-  // RowOp struct. This also sets the row op's RowSetKeyProbe.
-  CHECKED_STATUS AcquireLockForOp(WriteOperationState* operation_state,
-      RowOp* op);
-
-  // Signal that the given transaction is about to Apply.
-  void StartApplying(WriteOperationState* operation_state);
-
   // Apply all of the row operations associated with this transaction.
-  void ApplyRowOperations(WriteOperationState* operation_state);
-
-  // Apply a single row operation, which must already be prepared.
-  // The result is set back into row_op->result
-  void ApplyKuduRowOperation(WriteOperationState* operation_state,
-      RowOp* row_op);
+  CHECKED_STATUS ApplyRowOperations(WriteOperationState* operation_state);
 
   // Apply a set of RocksDB row operations.
-  void ApplyKeyValueRowOperations(
+  // If rocksdb_write_batch is specified it could contain preencoded RocksDB operations.
+  CHECKED_STATUS ApplyKeyValueRowOperations(
       const docdb::KeyValueWriteBatchPB& put_batch,
-      const consensus::OpId& op_id,
-      HybridTime hybrid_time,
-      rocksdb::WriteBatch* rocksdb_write_batch = nullptr);
+      const rocksdb::UserFrontiers* frontiers,
+      HybridTime hybrid_time);
 
+  void WriteToRocksDB(
+      const rocksdb::UserFrontiers* frontiers,
+      rocksdb::WriteBatch* write_batch,
+      docdb::StorageDbType storage_db_type);
+
+  //------------------------------------------------------------------------------------------------
+  // Redis Request Processing.
   // Takes a Redis WriteRequestPB as input with its redis_write_batch.
   // Constructs a WriteRequestPB containing a serialized WriteBatch that will be
   // replicated by Raft. (Makes a copy, it is caller's responsibility to deallocate
@@ -299,167 +276,85 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   // operations to same/conflicting part of the key/sub-key space. The locks acquired are returned
   // via the 'keys_locked' vector, so that they may be unlocked later when the operation has been
   // committed.
-  CHECKED_STATUS KeyValueBatchFromRedisWriteBatch(
-      tserver::WriteRequestPB* redis_write_request,
-      LockBatch *keys_locked, vector<RedisResponsePB>* responses);
+  CHECKED_STATUS KeyValueBatchFromRedisWriteBatch(WriteOperation* operation);
 
   CHECKED_STATUS HandleRedisReadRequest(
-      HybridTime timestamp, const RedisReadRequestPB& redis_read_request,
+      CoarseTimePoint deadline,
+      const ReadHybridTime& read_time,
+      const RedisReadRequestPB& redis_read_request,
       RedisResponsePB* response) override;
 
+  //------------------------------------------------------------------------------------------------
+  // CQL Request Processing.
   CHECKED_STATUS HandleQLReadRequest(
-      HybridTime timestamp, const QLReadRequestPB& ql_read_request,
-      const TransactionMetadataPB& transaction_metadata, QLResponsePB* response,
-      gscoped_ptr<faststring>* rows_data) override;
+      CoarseTimePoint deadline,
+      const ReadHybridTime& read_time,
+      const QLReadRequestPB& ql_read_request,
+      const TransactionMetadataPB& transaction_metadata,
+      QLReadRequestResult* result) override;
 
   CHECKED_STATUS CreatePagingStateForRead(
       const QLReadRequestPB& ql_read_request, const size_t row_count,
       QLResponsePB* response) const override;
 
   // The QL equivalent of KeyValueBatchFromRedisWriteBatch, works similarly.
-  CHECKED_STATUS KeyValueBatchFromQLWriteBatch(
-      tserver::WriteRequestPB* write_request,
-      LockBatch *keys_locked, tserver::WriteResponsePB* write_response,
-      WriteOperationState* operation_state);
+  void KeyValueBatchFromQLWriteBatch(std::unique_ptr<WriteOperation> operation);
 
-  // The Kudu equivalent of KeyValueBatchFromRedisWriteBatch, works similarly.
-  CHECKED_STATUS KeyValueBatchFromKuduRowOps(
-      tserver::WriteRequestPB* kudu_write_request,
-      LockBatch *keys_locked);
+  //------------------------------------------------------------------------------------------------
+  // Postgres Request Processing.
+  CHECKED_STATUS HandlePgsqlReadRequest(
+      CoarseTimePoint deadline,
+      const ReadHybridTime& read_time,
+      const PgsqlReadRequestPB& pgsql_read_request,
+      const TransactionMetadataPB& transaction_metadata,
+      PgsqlReadRequestResult* result) override;
 
-  // Uses primary_key:column_name for key encoding.
-  CHECKED_STATUS CreateWriteBatchFromKuduRowOps(const vector<DecodedRowOperation> &row_ops,
-                                        yb::docdb::KeyValueWriteBatchPB* write_batch,
-                                        LockBatch* keys_locked);
+  CHECKED_STATUS CreatePagingStateForRead(
+      const PgsqlReadRequestPB& pgsql_read_request, const size_t row_count,
+      PgsqlResponsePB* response) const override;
 
+  CHECKED_STATUS KeyValueBatchFromPgsqlWriteBatch(WriteOperation* operation);
+
+  //------------------------------------------------------------------------------------------------
   // Create a RocksDB checkpoint in the provided directory. Only used when table_type_ ==
   // YQL_TABLE_TYPE.
-  CHECKED_STATUS CreateCheckpoint(const std::string& dir,
-      google::protobuf::RepeatedPtrField<RocksDBFilePB>* rocksdb_files = nullptr);
+  CHECKED_STATUS CreateCheckpoint(const std::string& dir);
 
   // Create a new row iterator which yields the rows as of the current MVCC
   // state of this tablet.
   // The returned iterator is not initialized.
-  CHECKED_STATUS NewRowIterator(
-      const Schema &projection,
-      const boost::optional<TransactionId>& transaction_id,
-      gscoped_ptr<RowwiseIterator> *iter) const;
+  Result<std::unique_ptr<common::YQLRowwiseIteratorIf>> NewRowIterator(
+      const Schema &projection, const boost::optional<TransactionId>& transaction_id,
+      const TableId& table_id = "") const;
+  Result<std::unique_ptr<common::YQLRowwiseIteratorIf>> NewRowIterator(
+      const TableId& table_id) const;
 
-  // Whether the iterator should return results in order.
-  enum OrderMode {
-    UNORDERED = 0,
-    ORDERED = 1
-  };
+  //------------------------------------------------------------------------------------------------
+  // Makes RocksDB Flush.
+  CHECKED_STATUS Flush(FlushMode mode,
+                       FlushFlags flags = FlushFlags::kAll,
+                       int64_t ignore_if_flushed_after_tick = rocksdb::FlushOptions::kNeverIgnore);
 
-  // Create a new row iterator for some historical snapshot.
-  CHECKED_STATUS NewRowIterator(
-      const Schema &projection,
-      const MvccSnapshot &snap,
-      const OrderMode order,
-      const boost::optional<TransactionId>& transaction_id,
-      gscoped_ptr<RowwiseIterator> *iter) const;
-
-  // Flush the current MemRowSet for this tablet to disk. This swaps
-  // in a new (initially empty) MemRowSet in its place.
-  //
-  // This doesn't flush any DeltaMemStores for any existing RowSets.
-  // To do that, call FlushBiggestDMS() for example.
-  //
-  // For RocksDB backed tables it makes RocksDB Flush.
-  CHECKED_STATUS Flush(FlushMode mode);
+  CHECKED_STATUS WaitForFlush();
 
   // Prepares the transaction context for the alter schema operation.
   // An error will be returned if the specified schema is invalid (e.g.
   // key mismatch, or missing IDs)
-  CHECKED_STATUS CreatePreparedAlterSchema(AlterSchemaOperationState *operation_state,
+  CHECKED_STATUS CreatePreparedChangeMetadata(
+      ChangeMetadataOperationState *operation_state,
       const Schema* schema);
 
-  // Apply the Schema of the specified transaction.
-  // This operation will trigger a flush on the current MemRowSet.
-  CHECKED_STATUS AlterSchema(AlterSchemaOperationState* operation_state);
+  // Apply the Schema of the specified operation.
+  CHECKED_STATUS AlterSchema(ChangeMetadataOperationState* operation_state);
 
-  // Rewind the schema to an earlier version than is written in the on-disk
-  // metadata. This is done during bootstrap to roll the schema back to the
-  // point in time where the logs-to-be-replayed begin, so we can then decode
-  // the operations in the log with the correct schema.
-  //
-  // REQUIRES: state_ == kBootstrapping
-  CHECKED_STATUS RewindSchemaForBootstrap(const Schema& schema,
-      int64_t schema_version);
+  // Change wal_retention_secs in the metadata.
+  CHECKED_STATUS AlterWalRetentionSecs(ChangeMetadataOperationState* operation_state);
 
-  // Prints current RowSet layout, taking a snapshot of the current RowSet interval
-  // tree. Also prints the log of the compaction algorithm as evaluated
-  // on the current layout.
-  void PrintRSLayout(std::ostream* o);
+  // Apply replicated add table operation.
+  CHECKED_STATUS AddTable(const TableInfoPB& table_info);
 
-  // Flags to change the behavior of compaction.
-  enum CompactFlag {
-    COMPACT_NO_FLAGS = 0,
-
-    // Force the compaction to include all rowsets, regardless of the
-    // configured compaction policy. This is currently only used in
-    // tests.
-        FORCE_COMPACT_ALL = 1 << 0
-  };
-  typedef int CompactFlags;
-
-  CHECKED_STATUS Compact(CompactFlags flags);
-
-  // Update the statistics for performing a compaction.
-  void UpdateCompactionStats(MaintenanceOpStats* stats);
-
-  // Returns the exact current size of the MRS, in bytes. A value greater than 0 doesn't imply
-  // that the MRS has data, only that it has allocated that amount of memory.
-  // This method takes a read lock on component_lock_ and is thread-safe.
-  size_t MemRowSetSize() const;
-
-  // Returns true if the MRS is empty, else false. Doesn't rely on size and
-  // actually verifies that the MRS has no elements.
-  // This method takes a read lock on component_lock_ and is thread-safe.
-  bool MemRowSetEmpty() const;
-
-  // Returns the size in bytes for the MRS's log retention.
-  size_t MemRowSetLogRetentionSize(const MaxIdxToSegmentMap& max_idx_to_segment_size) const;
-
-  // Estimate the total on-disk size of this tablet, in bytes.
-  size_t EstimateOnDiskSize() const;
-
-  // Get the total size of all the DMS
-  size_t DeltaMemStoresSize() const;
-
-  // Same as MemRowSetEmpty(), but for the DMS.
-  bool DeltaMemRowSetEmpty() const;
-
-  // Fills in the in-memory size and retention size in bytes for the DMS with the
-  // highest retention.
-  void GetInfoForBestDMSToFlush(const MaxIdxToSegmentMap& max_idx_to_segment_size,
-      int64_t* mem_size, int64_t* retention_size) const;
-
-  // Flushes the DMS with the highest retention.
-  CHECKED_STATUS FlushDMSWithHighestRetention(
-      const MaxIdxToSegmentMap& max_idx_to_segment_size) const;
-
-  // Flush only the biggest DMS
-  CHECKED_STATUS FlushBiggestDMS();
-
-  // Finds the RowSet which has the most separate delta files and
-  // issues a minor delta compaction.
-  CHECKED_STATUS CompactWorstDeltas(RowSet::DeltaCompactionType type);
-
-  // Get the highest performance improvement that would come from compacting the delta stores
-  // of one of the rowsets. If the returned performance improvement is 0, or if 'rs' is NULL,
-  // then 'rs' isn't set. Callers who already own compact_select_lock_
-  // can call GetPerfImprovementForBestDeltaCompactUnlocked().
-  double GetPerfImprovementForBestDeltaCompact(RowSet::DeltaCompactionType type,
-      std::shared_ptr<RowSet>* rs) const;
-
-  // Same as GetPerfImprovementForBestDeltaCompact(), but doesn't take a lock on
-  // compact_select_lock_.
-  double GetPerfImprovementForBestDeltaCompactUnlocked(RowSet::DeltaCompactionType type,
-      std::shared_ptr<RowSet>* rs) const;
-
-  // Return the current number of rowsets in the tablet.
-  size_t num_rowsets() const;
+  // Truncate this tablet by resetting the content of RocksDB.
+  CHECKED_STATUS Truncate(TruncateOperationState* state);
 
   // Verbosely dump this entire tablet to the logs. This is only
   // really useful when debugging unit tests failures where the tablet
@@ -484,39 +379,10 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   // Set the conter to at least 'value'.
   void UpdateMonotonicCounter(int64_t value);
 
-  const TabletMetadata *metadata() const { return metadata_.get(); }
-  TabletMetadata *metadata() { return metadata_.get(); }
+  const RaftGroupMetadata *metadata() const { return metadata_.get(); }
+  RaftGroupMetadata *metadata() { return metadata_.get(); }
 
-  void SetCompactionHooksForTests(const std::shared_ptr<CompactionFaultHooks> &hooks);
-  void SetFlushHooksForTests(const std::shared_ptr<FlushFaultHooks> &hooks);
-  void SetFlushCompactCommonHooksForTests(
-      const std::shared_ptr<FlushCompactCommonHooks> &hooks);
-
-  // Returns the current MemRowSet id, for tests.
-  // This method takes a read lock on component_lock_ and is thread-safe.
-  int32_t CurrentMrsIdForTests() const;
-
-  // Runs a major delta major compaction on columns with specified IDs.
-  // NOTE: RowSet must presently be a DiskRowSet. (Perhaps the API should be
-  // a shared_ptr API for now?)
-  //
-  // TODO: Handle MVCC to support MemRowSet and handle deltas in DeltaMemStore
-  CHECKED_STATUS DoMajorDeltaCompaction(const std::vector<ColumnId>& column_ids,
-      std::shared_ptr<RowSet> input_rowset);
-
-  // Method used by tests to retrieve all rowsets of this table. This
-  // will be removed once code for selecting the appropriate RowSet is
-  // finished and delta files is finished is part of Tablet class.
-  void GetRowSetsForTests(vector<std::shared_ptr<RowSet> >* out);
-
-  // Register the maintenance ops associated with this tablet
-  void RegisterMaintenanceOps(MaintenanceManager* maintenance_manager);
-
-  // Unregister the maintenance ops associated with this tablet.
-  // This method is not thread safe.
-  void UnregisterMaintenanceOps();
-
-  const std::string& tablet_id() const override { return metadata_->tablet_id(); }
+  const std::string& tablet_id() const override { return metadata_->raft_group_id(); }
 
   // Return the metrics for this tablet.
   // May be NULL in unit tests, etc.
@@ -531,37 +397,46 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   TableType table_type() const override { return table_type_; }
 
   // Returns true if a RocksDB-backed tablet has any SSTables.
-  bool HasSSTables() const;
+  Result<bool> HasSSTables() const;
 
   // Returns the maximum persistent op id from all SSTables in RocksDB.
-  yb::OpId MaxPersistentOpId() const;
+  // First for regular records and second for intents.
+  // When invalid_if_no_new_data is true then function would return invalid op id when no new
+  // data is present in corresponding db.
+  Result<DocDbOpIds> MaxPersistentOpId(bool invalid_if_no_new_data = false) const;
+
+  // Returns the maximum persistent hybrid_time across all SSTables in RocksDB.
+  Result<HybridTime> MaxPersistentHybridTime() const;
+
+  // Returns oldest mutable memtable write hybrid time in RocksDB or HybridTime::kMax if memtable
+  // is empty.
+  Result<HybridTime> OldestMutableMemtableWriteHybridTime() const;
 
   // Returns the location of the last rocksdb checkpoint. Used for tests only.
-  std::string GetLastRocksDBCheckpointDirForTest() { return last_rocksdb_checkpoint_dir_; }
+  std::string TEST_LastRocksDBCheckpointDir() { return last_rocksdb_checkpoint_dir_; }
 
   // For non-kudu table type fills key-value batch in transaction state request and updates
   // request in state. Due to acquiring locks it can block the thread.
-  CHECKED_STATUS AcquireLocksAndPerformDocOperations(WriteOperationState *state);
+  void AcquireLocksAndPerformDocOperations(std::unique_ptr<WriteOperation> operation);
 
-  static const char* kDMSMemTrackerId;
-
-  // Returns the timestamp corresponding to the oldest active reader. If none exists returns
-  // the latest timestamp that is safe to read.
-  // This is used to figure out what can be garbage collected during a compaction.
-  HybridTime OldestReadPoint() const;
-
-  // The HybridTime of the oldest write that is still not scheduled to be flushed in RocksDB.
-  TabletFlushStats* flush_stats() const { return flush_stats_.get(); }
+  // Given a propopsed "history cutoff" timestamp, returns either that value, if possible, or a
+  // smaller value corresponding to the oldest active reader, whichever is smaller. This ensures
+  // that data needed by active read operations is not compacted away.
+  //
+  // Also updates the "earliest allowed read time" of the tablet to be equal to the returned value,
+  // (if it is still lower than the value about to be returned), so that new readers with timestamps
+  // earlier than that will be rejected.
+  HybridTime UpdateHistoryCutoff(HybridTime proposed_cutoff);
 
   const scoped_refptr<server::Clock> &clock() const {
     return clock_;
   }
 
-  const Schema& SchemaRef() const override {
-    return metadata_->schema();
+  const Schema& SchemaRef(const std::string& table_id = "") const override {
+    return CHECK_RESULT(metadata_->GetTableInfo(table_id))->schema;
   }
 
-  const common::QLStorageIf& QLStorage() const override {
+  const common::YQLStorageIf& QLStorage() const override {
     return *ql_storage_;
   }
 
@@ -580,151 +455,114 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   void ForceRocksDBCompactInTest();
 
-  std::string DocDBDumpStrInTest();
+  docdb::DocDB doc_db() const { return { regular_db_.get(), intents_db_.get(), &key_bounds_ }; }
 
-  // Returns last committed write index.
-  // The main purpose of this method is to make correct log cleanup when tablet does not have
-  // writes.
-  int64_t last_committed_write_index() const {
-    return last_committed_write_index_.load(std::memory_order_acquire);
+  std::string TEST_DocDBDumpStr(IncludeIntents include_intents = IncludeIntents::kFalse);
+
+  template<class T> void TEST_DocDBDumpToContainer(IncludeIntents include_intents, T* out);
+
+  size_t TEST_CountRegularDBRecords();
+
+  CHECKED_STATUS CreateReadIntents(
+      const TransactionMetadataPB& transaction_metadata,
+      const google::protobuf::RepeatedPtrField<QLReadRequestPB>& ql_batch,
+      const google::protobuf::RepeatedPtrField<PgsqlReadRequestPB>& pgsql_batch,
+      docdb::KeyValueWriteBatchPB* out);
+
+  uint64_t GetCurrentVersionSstFilesSize() const;
+  uint64_t GetCurrentVersionSstFilesUncompressedSize() const;
+  uint64_t GetCurrentVersionNumSSTFiles() const;
+
+  void SetHybridTimeLeaseProvider(HybridTimeLeaseProvider provider) {
+    ht_lease_provider_ = std::move(provider);
   }
 
-  void LostLeadership();
+  void SetMemTableFlushFilterFactory(std::function<rocksdb::MemTableFilter()> factory) {
+    mem_table_flush_filter_factory_ = std::move(factory);
+  }
 
-  uint64_t GetTotalSSTFileSizes() const;
+  // When a compaction starts with a particular "history cutoff" timestamp, it calls this function
+  // to disallow reads at a time lower than that history cutoff timestamp, to avoid reading
+  // invalid/incomplete data.
+  //
+  // Returns true if the new history cutoff timestamp was successfully registered, or false if
+  // it can't be used because there are pending reads at lower timestamps.
+  HybridTime Get(HybridTime lower_bound);
 
+  bool ShouldApplyWrite();
+
+  rocksdb::DB* TEST_db() const {
+    return regular_db_.get();
+  }
+
+  rocksdb::DB* TEST_intents_db() const {
+    return intents_db_.get();
+  }
+
+  CHECKED_STATUS TEST_SwitchMemtable();
+
+  // Initialize RocksDB's max persistent op id and hybrid time to that of the operation state.
+  // Necessary for cases like truncate or restore snapshot when RocksDB is reset.
+  CHECKED_STATUS ModifyFlushedFrontier(
+      const docdb::ConsensusFrontier& value,
+      rocksdb::FrontierModificationMode mode);
+
+  // Prepares the operation context for a snapshot operation.
+  CHECKED_STATUS PrepareForSnapshotOp(SnapshotOperationState* tx_state);
+
+  // Restore the RocksDB checkpoint from the provided directory.
+  // Only used when table_type_ == YQL_TABLE_TYPE.
+  CHECKED_STATUS RestoreCheckpoint(
+      const std::string& dir, const docdb::ConsensusFrontier& frontier);
+
+  // Create snapshot for this tablet.
+  virtual CHECKED_STATUS CreateSnapshot(SnapshotOperationState* tx_state);
+
+  // Delete snapshot for this tablet.
+  virtual CHECKED_STATUS DeleteSnapshot(SnapshotOperationState* tx_state);
+
+  // Restore snapshot for this tablet. In addition to backup/restore, this is used for initial
+  // syscatalog RocksDB creation without the initdb overhead.
+  CHECKED_STATUS RestoreSnapshot(SnapshotOperationState* tx_state);
+
+  static std::string SnapshotsDirName(const std::string& rocksdb_dir);
+
+  // Get the isolation level of the given transaction from the metadata stored in the provisional
+  // records RocksDB.
+  Result<IsolationLevel> GetIsolationLevel(const TransactionMetadataPB& transaction) override;
+
+  // Create an on-disk sub tablet of this tablet with specified ID, partition and key bounds.
+  CHECKED_STATUS CreateSubtablet(
+      const TabletId& tablet_id, const Partition& partition,
+      const docdb::KeyBounds& key_bounds);
+
+  // Scans the intent db. Potentially takes a long time. Used for testing/debugging.
+  Result<int64_t> CountIntents();
+
+  // Flushed intents db if necessary.
+  void FlushIntentsDbIfNecessary(const yb::OpId& lastest_log_entry_op_id);
+
+  // ==============================================================================================
  protected:
+
   friend class Iterator;
   friend class TabletPeerTest;
   friend class ScopedReadOperation;
   FRIEND_TEST(TestTablet, TestGetLogRetentionSizeForIndex);
 
-  CHECKED_STATUS FlushUnlocked(FlushMode mode);
-
-  // A version of Insert that does not acquire locks and instead assumes that
-  // they were already acquired. Requires that handles for the relevant locks
-  // and MVCC transaction are present in the transaction state.
-  CHECKED_STATUS InsertUnlocked(
-      WriteOperationState *operation_state,
-      RowOp* insert);
-
-  CHECKED_STATUS KuduColumnarInsertUnlocked(
-      WriteOperationState *operation_state,
-      RowOp* insert,
-      const TabletComponents* comps,
-      ProbeStats* stats);
-
-  // A version of MutateRow that does not acquire locks and instead assumes
-  // they were already acquired. Requires that handles for the relevant locks
-  // and MVCC transaction are present in the transaction state.
-  CHECKED_STATUS MutateRowUnlocked(
-      WriteOperationState *operation_state,
-      RowOp* mutate);
-
-  // Capture a set of iterators which, together, reflect all of the data in the tablet.
-  //
-  // These iterators are not true snapshot iterators, but they are safe against
-  // concurrent modification. They will include all data that was present at the time
-  // of creation, and potentially newer data.
-  //
-  // The returned iterators are not Init()ed.
-  // 'projection' must remain valid and unchanged for the lifetime of the returned iterators.
-  CHECKED_STATUS CaptureConsistentIterators(const Schema *projection,
-      const MvccSnapshot &snap,
-      const ScanSpec *spec,
-      const boost::optional<TransactionId>& transaction_id,
-      vector<std::shared_ptr<RowwiseIterator> > *iters) const;
-
-  CHECKED_STATUS KuduColumnarCaptureConsistentIterators(
-      const Schema *projection,
-      const MvccSnapshot &snap,
-      const ScanSpec *spec,
-      vector<std::shared_ptr<RowwiseIterator> > *iters) const;
-
-  CHECKED_STATUS QLCaptureConsistentIterators(
-      const Schema *projection,
-      const MvccSnapshot &snap,
-      const ScanSpec *spec,
-      const boost::optional<TransactionId>& transaction_id,
-      vector<std::shared_ptr<RowwiseIterator> > *iters) const;
-
-  CHECKED_STATUS StartDocWriteOperation(
-      const docdb::DocOperations &doc_ops,
-      LockBatch *keys_locked,
-      docdb::KeyValueWriteBatchPB* write_batch);
-
-  CHECKED_STATUS PickRowSetsToCompact(RowSetsInCompaction *picked,
-      CompactFlags flags) const;
-
-  CHECKED_STATUS DoCompactionOrFlush(const RowSetsInCompaction &input,
-      int64_t mrs_being_flushed);
-
-  CHECKED_STATUS FlushMetadata(const RowSetVector& to_remove,
-      const RowSetMetadataVector& to_add,
-      int64_t mrs_being_flushed);
-
-  static void ModifyRowSetTree(const RowSetTree& old_tree,
-      const RowSetVector& rowsets_to_remove,
-      const RowSetVector& rowsets_to_add,
-      RowSetTree* new_tree);
-
-  // Swap out a set of rowsets, atomically replacing them with the new rowset
-  // under the lock.
-  void AtomicSwapRowSets(const RowSetVector &to_remove,
-      const RowSetVector &to_add);
-
-  // Same as the above, but without taking the lock. This should only be used
-  // in cases where the lock is already held.
-  void AtomicSwapRowSetsUnlocked(const RowSetVector &to_remove,
-      const RowSetVector &to_add);
-
-  void GetComponents(scoped_refptr<TabletComponents>* comps) const {
-    shared_lock<rw_spinlock> lock(component_lock_);
-    *comps = components_;
-  }
-
-  // Create a new MemRowSet, replacing the current one.
-  // The 'old_ms' pointer will be set to the current MemRowSet set before the replacement.
-  // If the MemRowSet is not empty it will be added to the 'compaction' input
-  // and the MemRowSet compaction lock will be taken to prevent the inclusion
-  // in any concurrent compactions.
-  CHECKED_STATUS ReplaceMemRowSetUnlocked(RowSetsInCompaction *compaction,
-      std::shared_ptr<MemRowSet> *old_ms);
-
-  // TODO: Document me.
-  CHECKED_STATUS FlushInternal(const RowSetsInCompaction& input,
-      const std::shared_ptr<MemRowSet>& old_ms);
-
-  BloomFilterSizing bloom_sizing() const;
-
-  // Convert the specified read client schema (without IDs) to a server schema (with IDs)
-  // This method is used by NewRowIterator().
-  CHECKED_STATUS GetMappedReadProjection(const Schema& projection,
-      Schema *mapped_projection) const;
-
-  CHECKED_STATUS CheckRowInTablet(const ConstContiguousRow& probe) const;
+  CHECKED_STATUS StartDocWriteOperation(WriteOperation* operation);
 
   CHECKED_STATUS OpenKeyValueTablet();
-  CHECKED_STATUS OpenKuduColumnarTablet();
+  virtual CHECKED_STATUS CreateTabletDirectories(const string& db_dir, FsManager* fs);
 
-  CHECKED_STATUS KuduDebugDump(vector<std::string> *lines);
-  void DocDBDebugDump(vector<std::string> *lines);
-
-  // Helper method to find the rowset that has the DMS with the highest retention.
-  std::shared_ptr<RowSet> FindBestDMSToFlush(
-      const MaxIdxToSegmentMap& max_idx_to_segment_size) const;
-
-  // Helper method to find how many bytes this index retains.
-  static int64_t GetLogRetentionSizeForIndex(int64_t min_log_index,
-      const MaxIdxToSegmentMap& max_idx_to_segment_size);
+  void DocDBDebugDump(std::vector<std::string> *lines);
 
   // Register/Unregister a read operation, with an associated timestamp, for the purpose of
   // tracking the oldest read point.
-  void RegisterReaderTimestamp(HybridTime read_point) override;
+  CHECKED_STATUS RegisterReaderTimestamp(HybridTime read_point) override;
   void UnregisterReader(HybridTime read_point) override;
-  HybridTime SafeTimestampToRead() const override;
 
-  void PrepareTransactionWriteBatch(
+  CHECKED_STATUS PrepareTransactionWriteBatch(
       const docdb::KeyValueWriteBatchPB& put_batch,
       HybridTime hybrid_time,
       rocksdb::WriteBatch* rocksdb_write_batch);
@@ -734,6 +572,13 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   TransactionOperationContextOpt CreateTransactionOperationContext(
       const boost::optional<TransactionId>& transaction_id) const;
+
+  // Pause any new read/write operations and wait for all pending read/write operations to finish.
+  util::ScopedPendingOperationPause PauseReadWriteOperations();
+
+  std::string LogPrefix() const;
+
+  std::string LogPrefix(docdb::StorageDbType db_type) const;
 
   // Lock protecting schema_ and key_schema_.
   //
@@ -750,7 +595,7 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   const Schema key_schema_;
 
-  scoped_refptr<TabletMetadata> metadata_;
+  RaftGroupMetadataPtr metadata_;
   TableType table_type_;
 
   // Used for tests only.
@@ -766,8 +611,7 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   //   they see a consistent view when racing against flush/compact.
   //
   // Exclusive mode:
-  // - Flushes/compactions take this lock in order to lock out concurrent updates when
-  //   swapping in a new memrowset.
+  // - Flushes/compactions take this lock in order to lock out concurrent updates.
   //
   // NOTE: callers should avoid taking this lock for a long time, even in shared mode.
   // This is because the lock has some concept of fairness -- if, while a long reader
@@ -775,19 +619,13 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   // TODO: now that this is single-threaded again, we should change it to rw_spinlock
   mutable rw_spinlock component_lock_;
 
-  // The current components of the tablet. These should always be read
-  // or swapped under the component_lock.
-  scoped_refptr<TabletComponents> components_;
-
   scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
   std::shared_ptr<MemTracker> mem_tracker_;
-  std::shared_ptr<MemTracker> dms_mem_tracker_;
+  std::shared_ptr<MemTracker> block_based_table_mem_tracker_;
 
   MetricEntityPtr metric_entity_;
   gscoped_ptr<TabletMetrics> metrics_;
   FunctionGaugeDetacher metric_detacher_;
-
-  int64_t next_mrs_id_ = 0;
 
   // A pointer to the server's clock.
   scoped_refptr<server::Clock> clock_;
@@ -796,24 +634,9 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   // Maps a timestamp to the number active readers with that timestamp.
   // TODO(ENG-961): Check if this is a point of contention. If so, shard it as suggested in D1219.
-  std::map<HybridTime, int64_t> active_readers_cnt_;
+  std::map<HybridTime, int64_t> active_readers_cnt_ GUARDED_BY(active_readers_mutex_);
+  HybridTime earliest_read_time_allowed_ GUARDED_BY(active_readers_mutex_) {HybridTime::kMin};
   mutable std::mutex active_readers_mutex_;
-
-  // This is used for Kudu tables only. Docdb uses shared_lock_manager_. lock_manager_ may be
-  // deprecated in future.
-  LockManager lock_manager_;
-
-  gscoped_ptr<CompactionPolicy> compaction_policy_;
-
-  // Lock protecting the selection of rowsets for compaction.
-  // Only one thread may run the compaction selection algorithm at a time
-  // so that they don't both try to select the same rowset.
-  mutable std::mutex compact_select_lock_;
-
-  // We take this lock when flushing the tablet's rowsets in Tablet::Flush.  We
-  // don't want to have two flushes in progress at once, in case the one which
-  // started earlier completes after the one started later.
-  mutable Semaphore rowsets_flush_sem_{1};
 
   // Lock used to serialize the creation of RocksDB checkpoints.
   mutable std::mutex create_checkpoint_lock_;
@@ -831,15 +654,18 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
   std::shared_ptr<FlushFaultHooks> flush_hooks_;
   std::shared_ptr<FlushCompactCommonHooks> common_hooks_;
 
-  std::vector<MaintenanceOp*> maintenance_ops_;
-
   // Statistics for the RocksDB database.
   std::shared_ptr<rocksdb::Statistics> rocksdb_statistics_;
 
   // RocksDB database for key-value tables.
-  std::unique_ptr<rocksdb::DB> rocksdb_;
+  std::unique_ptr<rocksdb::DB> regular_db_;
 
-  std::unique_ptr<common::QLStorageIf> ql_storage_;
+  std::unique_ptr<rocksdb::DB> intents_db_;
+
+  // Optional key bounds (see docdb::KeyBounds) served by this tablet.
+  docdb::KeyBounds key_bounds_;
+
+  std::unique_ptr<common::YQLStorageIf> ql_storage_;
 
   // This is for docdb fine-grained locking.
   docdb::SharedLockManager shared_lock_manager_;
@@ -872,107 +698,74 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
 
   std::unique_ptr<TransactionParticipant> transaction_participant_;
 
+  std::shared_future<client::YBClient*> client_future_;
+
+  // Created only when secondary indexes are present.
+  boost::optional<client::TransactionManager> transaction_manager_;
+  boost::optional<client::YBMetaDataCache> metadata_cache_;
+
+  // Created only if it is a unique index tablet.
+  boost::optional<Schema> unique_index_key_schema_;
+
   std::atomic<int64_t> last_committed_write_index_{0};
 
-  // Remembers he HybridTime of the oldest write that is still not scheduled to
-  // be flushed in RocksDB.
-  std::shared_ptr<TabletFlushStats> flush_stats_;
+  HybridTimeLeaseProvider ht_lease_provider_;
+
+  // (end of protected section)
+  // ==============================================================================================
 
  private:
+  HybridTime DoGetSafeTime(
+      RequireLease require_lease, HybridTime min_allowed, CoarseTimePoint deadline) const override;
+
+  void UpdateQLIndexes(std::unique_ptr<WriteOperation> operation);
+  void CompleteQLWriteBatch(std::unique_ptr<WriteOperation> operation, const Status& status);
+
+  Result<bool> IntentsDbFlushFilter(const rocksdb::MemTable& memtable);
+
+  template <class Ids>
+  CHECKED_STATUS RemoveIntentsImpl(const RemoveIntentsData& data, const Ids& ids);
+
+  std::function<rocksdb::MemTableFilter()> mem_table_flush_filter_factory_;
+
+  client::LocalTabletFilter local_tablet_filter_;
+
+  std::string log_prefix_suffix_;
+
   DISALLOW_COPY_AND_ASSIGN(Tablet);
 };
-
-typedef std::shared_ptr<Tablet> TabletPtr;
 
 // A helper class to manage read transactions. Grabs and registers a read point with the tablet
 // when created, and deregisters the read point when this object is destructed.
 class ScopedReadOperation {
  public:
-  explicit ScopedReadOperation(AbstractTablet* tablet);
+  ScopedReadOperation() : tablet_(nullptr) {}
+  ScopedReadOperation(ScopedReadOperation&& rhs)
+      : tablet_(rhs.tablet_), read_time_(rhs.read_time_) {
+    rhs.tablet_ = nullptr;
+  }
+
+  static Result<ScopedReadOperation> Create(
+      AbstractTablet* tablet,
+      RequireLease require_lease,
+      ReadHybridTime read_time);
+
+  ScopedReadOperation(const ScopedReadOperation&) = delete;
+  void operator=(const ScopedReadOperation&) = delete;
 
   ~ScopedReadOperation();
 
-  HybridTime GetReadTimestamp();
+  const ReadHybridTime& read_time() const { return read_time_; }
+
+  Status status() const { return status_; }
 
  private:
+  explicit ScopedReadOperation(
+      AbstractTablet* tablet, RequireLease require_lease, const ReadHybridTime& read_time);
+
   AbstractTablet* tablet_;
-  HybridTime timestamp_;
-};
-
-// Hooks used in test code to inject faults or other code into interesting
-// parts of the compaction code.
-class Tablet::CompactionFaultHooks {
- public:
-  virtual CHECKED_STATUS PostSelectIterators() { return Status::OK(); }
-  virtual ~CompactionFaultHooks() {}
-};
-
-class Tablet::FlushCompactCommonHooks {
- public:
-  virtual CHECKED_STATUS PostTakeMvccSnapshot() { return Status::OK(); }
-  virtual CHECKED_STATUS PostWriteSnapshot() { return Status::OK(); }
-  virtual CHECKED_STATUS PostSwapInDuplicatingRowSet() { return Status::OK(); }
-  virtual CHECKED_STATUS PostReupdateMissedDeltas() { return Status::OK(); }
-  virtual CHECKED_STATUS PostSwapNewRowSet() { return Status::OK(); }
-  virtual ~FlushCompactCommonHooks() {}
-};
-
-// Hooks used in test code to inject faults or other code into interesting
-// parts of the Flush() code.
-class Tablet::FlushFaultHooks {
- public:
-  virtual CHECKED_STATUS PostSwapNewMemRowSet() { return Status::OK(); }
-  virtual ~FlushFaultHooks() {}
-};
-
-class Tablet::Iterator : public RowwiseIterator {
- public:
-  virtual ~Iterator();
-
-  CHECKED_STATUS Init(ScanSpec *spec) override;
-
-  bool HasNext() const override;
-
-  CHECKED_STATUS NextBlock(RowBlock *dst) override;
-
-  std::string ToString() const override;
-
-  const Schema &schema() const override {
-    return projection_;
-  }
-
-  void GetIteratorStats(std::vector<IteratorStats>* stats) const override;
-
- private:
-  friend class Tablet;
-
-  DISALLOW_COPY_AND_ASSIGN(Iterator);
-
-  Iterator(
-      const Tablet* tablet, const Schema& projection, MvccSnapshot snap,
-      const OrderMode order, const boost::optional<TransactionId>& transaction_id);
-
-  const Tablet *tablet_;
-  Schema projection_;
-  const MvccSnapshot snap_;
-  const OrderMode order_;
-  const boost::optional<TransactionId> transaction_id_;
-  gscoped_ptr<RowwiseIterator> iter_;
-
-  // TODO: we could probably share an arena with the Scanner object inside the
-  // tserver, but piping it in would require changing a lot of call-sites.
-  Arena arena_;
-  RangePredicateEncoder encoder_;
-};
-
-// Structure which represents the components of the tablet's storage.
-// This structure is immutable -- a transaction can grab it and be sure
-// that it won't change.
-struct TabletComponents : public RefCountedThreadSafe<TabletComponents> {
-  TabletComponents(std::shared_ptr<MemRowSet> mrs,
-      std::shared_ptr<RowSetTree> rs_tree);
-  const std::shared_ptr<MemRowSet> memrowset;
-  const std::shared_ptr<RowSetTree> rowsets;
+  ReadHybridTime read_time_;
+  Status status_;
 };
 
 }  // namespace tablet

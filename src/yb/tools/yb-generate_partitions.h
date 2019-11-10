@@ -39,9 +39,16 @@ class YBPartitionGenerator {
   // separated values. The format of the comma separated values should be similar to the Schema
   // object where we first have the hash keys, then the range keys and finally the regular
   // columns of the table.
-  CHECKED_STATUS LookupTabletId(const std::string &row, std::string *tablet_id,
+  CHECKED_STATUS LookupTabletId(const std::string &row,
+                                std::string *tablet_id,
                                 std::string* partition_key);
-  CHECKED_STATUS LookupTabletIdWithTokenizer(const CsvTokenizer& tokenizer, std::string *tablet_id,
+  CHECKED_STATUS LookupTabletId(const std::string &row,
+                                const std::set<int>& skipped_cols,
+                                std::string *tablet_id,
+                                std::string* partition_key);
+  CHECKED_STATUS LookupTabletIdWithTokenizer(const CsvTokenizer& tokenizer,
+                                             const std::set<int>& skipped_cols,
+                                             std::string *tablet_id,
                                              std::string* partition_key);
 
  private:
@@ -51,7 +58,7 @@ class YBPartitionGenerator {
   TabletMap tablet_map_;
   client::YBTableName table_name_;
   std::vector<std::string> master_addresses_;
-  std::shared_ptr<client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
   std::shared_ptr<client::YBTable> table_;
 };
 

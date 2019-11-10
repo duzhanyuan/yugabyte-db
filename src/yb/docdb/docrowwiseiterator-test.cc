@@ -14,6 +14,9 @@
 #include <memory>
 #include <string>
 
+#include "yb/common/ql_value.h"
+#include "yb/common/transaction-test-util.h"
+
 #include "yb/docdb/doc_rowwise_iterator.h"
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_test_base.h"
@@ -26,10 +29,12 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
+DECLARE_bool(docdb_sort_weak_intents_in_tests);
+
 namespace yb {
 namespace docdb {
 
-class DocRowwiseIteratorTest: public DocDBTestBase {
+class DocRowwiseIteratorTest : public DocDBTestBase {
  protected:
   DocRowwiseIteratorTest() {
     SeedRandom();
@@ -42,6 +47,11 @@ class DocRowwiseIteratorTest: public DocDBTestBase {
   static const Schema kSchemaForIteratorTests;
   static Schema kProjectionForIteratorTests;
 
+  void SetUp() override {
+    FLAGS_docdb_sort_weak_intents_in_tests = true;
+    DocDBTestBase::SetUp();
+  }
+
   static void SetUpTestCase() {
     ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"c", "d", "e"},
         &kProjectionForIteratorTests));
@@ -50,52 +60,45 @@ class DocRowwiseIteratorTest: public DocDBTestBase {
 
 const KeyBytes DocRowwiseIteratorTest::kEncodedDocKey1(
     DocKey(PrimitiveValues("row1", 11111)).Encode());
+
 const KeyBytes DocRowwiseIteratorTest::kEncodedDocKey2(
     DocKey(PrimitiveValues("row2", 22222)).Encode());
+
 const Schema DocRowwiseIteratorTest::kSchemaForIteratorTests({
-    ColumnSchema("a", DataType::STRING, /* is_nullable = */ false),
-    ColumnSchema("b", DataType::INT64, false),
-    // Non-key columns
-    ColumnSchema("c", DataType::STRING, true),
-    ColumnSchema("d", DataType::INT64, true),
-    ColumnSchema("e", DataType::STRING, true)
-}, {
-    10_ColId,
-    20_ColId,
-    30_ColId,
-    40_ColId,
-    50_ColId
-}, 2);
+        ColumnSchema("a", DataType::STRING, /* is_nullable = */ false),
+        ColumnSchema("b", DataType::INT64, false),
+        // Non-key columns
+        ColumnSchema("c", DataType::STRING, true),
+        ColumnSchema("d", DataType::INT64, true),
+        ColumnSchema("e", DataType::STRING, true)
+    }, {
+        10_ColId,
+        20_ColId,
+        30_ColId,
+        40_ColId,
+        50_ColId
+    }, 2);
+
 Schema DocRowwiseIteratorTest::kProjectionForIteratorTests;
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorTest) {
-  DocWriteBatch dwb(rocksdb());
-
   // Row 1
   // We don't need any seeks for writes, where column values are primitives.
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
-  // TODO `DocWriteBatch dwb` is empty and doesn't get populated at all, so these asserts are not
-  // checking anything. Should probably be moved into `SetPrimitive` with passing number of seeks
-  // expected optionally in order to check local_doc_write_batch there. `dwb` should be removed.
-  // This is applicable for all other tests below and in DocDBTest.
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      PrimitiveValue(10000), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      PrimitiveValue("row1_e"), HybridTime::FromMicros(1000)));
 
   // Row 2: one null column, one column that gets deleted and overwritten, another that just gets
   // overwritten. No seeks needed for writes.
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000), HybridTime::FromMicros(2000), InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      PrimitiveValue(20000), HybridTime::FromMicros(2000)));
 
   // Deletions normally perform a lookup of the key to see whether it's already there. We will use
   // that to provide the expected result (the number of rows deleted in SQL or whether a key was
@@ -103,702 +106,666 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorTest) {
   // perform any reads for this deletion.
   ASSERT_OK(DeleteSubDoc(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      HybridTime::FromMicros(2500), InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      HybridTime::FromMicros(2500)));
 
   // The entire subdocument under DocPath(encoded_doc_key2, 40) just got deleted, and that fact
   // should still be in the write batch's cache, so we should not perform a seek to overwrite it.
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(30000), HybridTime::FromMicros(3000), InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      PrimitiveValue(30000), HybridTime::FromMicros(3000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e"), HybridTime::FromMicros(2000), InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
+      PrimitiveValue("row2_e"), HybridTime::FromMicros(2000)));
 
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e_prime"), HybridTime::FromMicros(4000),
-      InitMarkerBehavior::OPTIONAL));
-  ASSERT_EQ(0, dwb.GetAndResetNumRocksDBSeeks());
-
-  string dwb_str;
-  ASSERT_OK(FormatDocWriteBatch(dwb, &dwb_str));
-  SCOPED_TRACE("\nWrite batch:\n" + dwb_str);
-  ASSERT_OK(WriteToRocksDB(dwb, HybridTime::FromMicros(1000)));
+      PrimitiveValue("row2_e_prime"), HybridTime::FromMicros(4000)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT(p=1000)]) -> "row1_c"
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=1000)]) -> "row1_e"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=3000)]) -> 30000
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2500)]) -> DEL
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2000)]) -> 20000
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT(p=4000)]) -> "row2_e_prime"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT(p=2000)]) -> "row2_e"
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT{ physical: 1000 }]) -> "row1_c"
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 1000 }]) -> "row1_e"
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 3000 }]) -> 30000
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2500 }]) -> DEL
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2000 }]) -> 20000
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 4000 }]) -> "row2_e_prime"
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 2000 }]) -> "row2_e"
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   const Schema &projection = kProjectionForIteratorTests;
-
-  ScanSpec scan_spec;
-
-  Arena arena(32_KB, 1_MB);
+  QLTableRow row;
+  QLValue value;
 
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2000));
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2000));
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_c", value.string_value());
 
-    const auto &row1 = row_block.row(0);
-    ASSERT_FALSE(row_block.row(0).is_null(0));
-    ASSERT_EQ("row1_c", row1.get_field<DataType::STRING>(0));
-    ASSERT_FALSE(row_block.row(0).is_null(1));
-    ASSERT_EQ(10000, row1.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row_block.row(0).is_null(2));
-    ASSERT_EQ("row1_e", row1.get_field<DataType::STRING>(2));
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(10000, value.int64_value());
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    const auto &row2 = row_block.row(0);
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_e", value.string_value());
 
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
-    ASSERT_TRUE(row_block.row(0).is_null(0));
-    ASSERT_FALSE(row_block.row(0).is_null(1));
-    ASSERT_EQ(20000, row1.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row_block.row(0).is_null(2));
-    ASSERT_EQ("row2_e", row2.get_field<DataType::STRING>(2));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(20000, value.int64_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_e", value.string_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 
   // Scan at a later hybrid_time.
 
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(5000));
-    ASSERT_OK(iter.Init(&scan_spec));
-    RowBlock row_block(projection, 10, &arena);
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(5000));
+    ASSERT_OK(iter.Init());
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
     // This row is exactly the same as in the previous case. TODO: deduplicate.
-    const auto &row1 = row_block.row(0);
-    ASSERT_FALSE(row_block.row(0).is_null(0));
-    ASSERT_EQ("row1_c", row1.get_field<DataType::STRING>(0));
-    ASSERT_FALSE(row_block.row(0).is_null(1));
-    ASSERT_EQ(10000, row1.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row_block.row(0).is_null(2));
-    ASSERT_EQ("row1_e", row1.get_field<DataType::STRING>(2));
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    const auto &row2 = row_block.row(0);
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_c", value.string_value());
 
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
-    ASSERT_TRUE(row_block.row(0).is_null(0));
-    ASSERT_FALSE(row_block.row(0).is_null(1));
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(10000, value.int64_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_e", value.string_value());
+
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
+
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
 
     // These two rows have different values compared to the previous case.
-    ASSERT_EQ(30000, row1.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row_block.row(0).is_null(2));
-    ASSERT_EQ("row2_e_prime", row2.get_field<DataType::STRING>(2));
+    ASSERT_EQ(30000, value.int64_value());
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_e_prime", value.string_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorDeletedDocumentTest) {
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e"), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000), HybridTime::FromMicros(2000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(20000), HybridTime::FromMicros(2000)));
 
   // Delete entire row1 document to test that iterator can successfully jump to next document
   // when it finds deleted document.
   ASSERT_OK(DeleteSubDoc(
-      DocPath(kEncodedDocKey1), HybridTime::FromMicros(2500), InitMarkerBehavior::OPTIONAL));
+      DocPath(kEncodedDocKey1), HybridTime::FromMicros(2500)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-      SubDocKey(DocKey([], ["row1", 11111]), [HT(p=2500)]) -> DEL
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT(p=1000)]) -> "row1_c"
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=1000)]) -> "row1_e"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2000)]) -> 20000
+      SubDocKey(DocKey([], ["row1", 11111]), [HT{ physical: 2500 }]) -> DEL
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT{ physical: 1000 }]) -> "row1_c"
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 1000 }]) -> "row1_e"
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2000 }]) -> 20000
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   const Schema &projection = kProjectionForIteratorTests;
 
-  ScanSpec scan_spec;
-
-  Arena arena(32_KB, 1_MB);
-
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2500));
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2500));
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows. Anyway in this specific test we only have one row matching criteria.
-    ASSERT_EQ(1, row_block.nrows());
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    const auto &row2 = row_block.row(0);
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
 
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ(20000, row2.get_field<DataType::INT64>(1));
-    ASSERT_TRUE(row2.is_null(2));
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(20000, value.int64_value());
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorTestRowDeletes) {
-  DocWriteBatch dwb(rocksdb());
+  auto dwb = MakeDocWriteBatch();
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row1_c"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_c")));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000)));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(1000)));
 
-  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey1), InitMarkerBehavior::OPTIONAL));
+  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey1)));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2500)));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e")));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(20000)));
   ASSERT_OK(WriteToRocksDB(dwb, HybridTime::FromMicros(2800)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-SubDocKey(DocKey([], ["row1", 11111]), [HT(p=2500)]) -> DEL
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT(p=1000)]) -> "row1_c"
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000, w=1)]) -> 10000
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=2800)]) -> "row1_e"
-SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2800, w=1)]) -> 20000
+SubDocKey(DocKey([], ["row1", 11111]), [HT{ physical: 2500 }]) -> DEL
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT{ physical: 1000 }]) -> "row1_c"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 w: 1 }]) -> 10000
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 2800 }]) -> "row1_e"
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2800 w: 1 }]) -> 20000
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   const Schema &projection = kProjectionForIteratorTests;
 
-  ScanSpec scan_spec;
-
-  Arena arena(32_KB, 1_MB);
-
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_TRUE(iter.HasNext());
-
-    ASSERT_OK(iter.NextBlock(&row_block));
-    ASSERT_EQ(1, row_block.nrows());
-
-    const auto &row1 = row_block.row(0);
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
     // ColumnId 30, 40 should be hidden whereas ColumnId 50 should be visible.
-    ASSERT_TRUE(row1.is_null(0));
-    ASSERT_TRUE(row1.is_null(1));
-    ASSERT_FALSE(row1.is_null(2));
-    ASSERT_EQ("row1_e", row1.get_field<DataType::STRING>(2));
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    const auto &row2 = row_block.row(0);
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_TRUE(row2.is_null(2));
-    ASSERT_EQ(20000, row2.get_field<DataType::INT64>(1));
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_e", value.string_value());
+
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
+
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(20000, value.int64_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_TRUE(value.IsNull());
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorHasNextIdempotence) {
-  DocWriteBatch dwb(rocksdb());
-
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000), HybridTime::FromMicros(1000)));
+
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"), HybridTime::FromMicros(2800), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e"), HybridTime::FromMicros(2800)));
 
-  ASSERT_OK(DeleteSubDoc(DocPath(kEncodedDocKey1), HybridTime::FromMicros(2500),
-      InitMarkerBehavior::OPTIONAL));
-
-  ASSERT_OK(WriteToRocksDB(dwb, HybridTime::FromMicros(1000)));
+  ASSERT_OK(DeleteSubDoc(DocPath(kEncodedDocKey1), HybridTime::FromMicros(2500)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-SubDocKey(DocKey([], ["row1", 11111]), [HT(p=2500)]) -> DEL
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=2800)]) -> "row1_e"
+SubDocKey(DocKey([], ["row1", 11111]), [HT{ physical: 2500 }]) -> DEL
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 2800 }]) -> "row1_e"
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   const Schema &projection = kProjectionForIteratorTests;
 
-  ScanSpec scan_spec;
-
-  Arena arena(32_KB, 1_MB);
-
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_TRUE(iter.HasNext());
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
     // Ensure calling HasNext() again doesn't mess up anything.
-    ASSERT_TRUE(iter.HasNext());
-
-    ASSERT_OK(iter.NextBlock(&row_block));
-    ASSERT_EQ(1, row_block.nrows());
-
-    const auto &row1 = row_block.row(0);
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
     // ColumnId 40 should be deleted whereas ColumnId 50 should be visible.
-    ASSERT_TRUE(row1.is_null(0));
-    ASSERT_TRUE(row1.is_null(1));
-    ASSERT_FALSE(row1.is_null(2));
-    ASSERT_EQ("row1_e", row1.get_field<DataType::STRING>(2));
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_e", value.string_value());
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorIncompleteProjection) {
-  DocWriteBatch dwb(rocksdb());
-
+  auto dwb = MakeDocWriteBatch();
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000)));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e")));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(20000)));
 
   ASSERT_OK(WriteToRocksDB(dwb, HybridTime::FromMicros(1000)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=1000, w=1)]) -> "row1_e"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=1000, w=2)]) -> 20000
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 1000 w: 1 }]) -> "row1_e"
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 1000 w: 2 }]) -> 20000
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   Schema projection;
   ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"c", "d"},
       &projection));
-  ScanSpec scan_spec;
-  Arena arena(32_KB, 1_MB);
+
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    const auto &row1 = row_block.row(0);
-    ASSERT_TRUE(row1.is_null(0));
-    ASSERT_FALSE(row1.is_null(1));
-    ASSERT_EQ(10000, row1.get_field<DataType::INT64>(1));
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(10000, value.int64_value());
 
     // Now find next row.
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    const auto &row2 = row_block.row(0);
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ(20000, row2.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(20000, value.int64_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorMultipleDeletes) {
-  DocWriteBatch dwb(rocksdb());
+  auto dwb = MakeDocWriteBatch();
 
   MonoDelta ttl = MonoDelta::FromMilliseconds(1);
   MonoDelta ttl_expiry = MonoDelta::FromMilliseconds(2);
-  HybridTime read_time = server::HybridClock::AddPhysicalTimeToHybridTime(
-      HybridTime::FromMicros(2800), ttl_expiry);
+  auto read_time = ReadHybridTime::SingleTime(server::HybridClock::AddPhysicalTimeToHybridTime(
+      HybridTime::FromMicros(2800), ttl_expiry));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row1_c"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_c")));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000)));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(1000)));
 
   // Deletes.
-  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey1), InitMarkerBehavior::OPTIONAL));
-  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey2), InitMarkerBehavior::OPTIONAL));
+  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey1)));
+  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey2)));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2500)));
   dwb.Clear();
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      Value(PrimitiveValue("row1_e"), ttl),
-      InitMarkerBehavior::OPTIONAL));
+      Value(PrimitiveValue("row1_e"), ttl)));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(30_ColId)),
-      PrimitiveValue(ValueType::kTombstone),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue::kTombstone));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(20000)));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      Value(PrimitiveValue("row2_e"), MonoDelta::FromMilliseconds(3)),
-      InitMarkerBehavior::OPTIONAL));
+      Value(PrimitiveValue("row2_e"), MonoDelta::FromMilliseconds(3))));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2800)));
 
   ASSERT_OK(WriteToRocksDB(dwb, HybridTime::FromMicros(1000)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-SubDocKey(DocKey([], ["row1", 11111]), [HT(p=2500)]) -> DEL
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT(p=1000)]) -> "row1_c"
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000, w=1)]) -> 10000
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=2800)]) -> "row1_e"; ttl: 0.001s
-SubDocKey(DocKey([], ["row2", 22222]), [HT(p=2500, w=1)]) -> DEL
-SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(30); HT(p=2800, w=1)]) -> DEL
-SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2800, w=2)]) -> 20000
-SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT(p=2800, w=3)]) -> "row2_e"; ttl: 0.003s
+SubDocKey(DocKey([], ["row1", 11111]), [HT{ physical: 2500 }]) -> DEL
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT{ physical: 1000 }]) -> "row1_c"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 w: 1 }]) -> 10000
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 2800 }]) -> \
+    "row1_e"; ttl: 0.001s
+SubDocKey(DocKey([], ["row2", 22222]), [HT{ physical: 2500 w: 1 }]) -> DEL
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(30); HT{ physical: 2800 w: 1 }]) -> DEL
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2800 w: 2 }]) -> 20000
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 2800 w: 3 }]) -> \
+    "row2_e"; ttl: 0.003s
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   Schema projection;
-  ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"c", "e"},
-      &projection));
+  ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"c", "e"}, &projection));
 
-  ScanSpec scan_spec;
-  Arena arena(32_KB, 1_MB);
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(), read_time);
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, read_time);
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_TRUE(iter.HasNext());
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
     // Ensure Idempotency.
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    const auto &row2 = row_block.row(0);
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ("row2_e", row2.get_field<DataType::STRING>(1));
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_e", value.string_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorValidColumnNotInProjection) {
-  DocWriteBatch dwb(rocksdb());
+  auto dwb = MakeDocWriteBatch();
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000)));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(20000)));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(1000)));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row2_e")));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey2, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row2_c"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row2_c")));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2000)));
 
-  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey1), InitMarkerBehavior::OPTIONAL));
+  ASSERT_OK(dwb.DeleteSubDoc(DocPath(kEncodedDocKey1)));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2500)));
 
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e")));
   ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2800)));
 
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-      SubDocKey(DocKey([], ["row1", 11111]), [HT(p=2500)]) -> DEL
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=2800)]) -> "row1_e"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(30); HT(p=2000, w=1)]) -> "row2_c"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=1000, w=1)]) -> 20000
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT(p=2000)]) -> "row2_e"
+      SubDocKey(DocKey([], ["row1", 11111]), [HT{ physical: 2500 }]) -> DEL
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 2800 }]) -> "row1_e"
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(30); HT{ physical: 2000 w: 1 }]) -> "row2_c"
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 1000 w: 1 }]) -> 20000
+      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 2000 }]) -> "row2_e"
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   Schema projection;
-  ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"c", "d"},
-      &projection));
-  ScanSpec scan_spec;
-  Arena arena(32_KB, 1_MB);
+  ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"c", "d"}, &projection));
+
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init(&scan_spec));
-    RowBlock row_block(projection, 10, &arena);
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
+    ASSERT_OK(iter.Init());
 
-    ASSERT_TRUE(iter.HasNext());
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_OK(iter.NextBlock(&row_block));
-    const auto &row1 = row_block.row(0);
-    ASSERT_TRUE(row1.is_null(0));
-    ASSERT_TRUE(row1.is_null(1));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    ASSERT_TRUE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
 
-    ASSERT_OK(iter.NextBlock(&row_block));
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_TRUE(value.IsNull());
 
-    const auto &row2 = row_block.row(0);
-    ASSERT_FALSE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ("row2_c", row2.get_field<DataType::STRING>(0));
-    ASSERT_EQ(20000, row2.get_field<DataType::INT64>(1));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_c", value.string_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(20000, value.int64_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorKeyProjection) {
-  DocWriteBatch dwb(rocksdb());
+  auto dwb = MakeDocWriteBatch();
 
   // Row 1
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000)));
   ASSERT_OK(dwb.SetPrimitive(DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"),
-      InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e")));
 
   ASSERT_OK(WriteToRocksDB(dwb, HybridTime::FromMicros(1000)));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=1000, w=1)]) -> "row1_e"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 1000 w: 1 }]) -> "row1_e"
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
   Schema projection;
   ASSERT_OK(kSchemaForIteratorTests.CreateProjectionByNames({"a", "b"},
       &projection, 2));
-  ScanSpec scan_spec;
-  Arena arena(32_KB, 1_MB);
+
   {
     DocRowwiseIterator iter(
-        projection, schema, kNonTransactionalOperationContext, rocksdb(),
-        HybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init(&scan_spec));
-    RowBlock row_block(projection, 10, &arena);
+        projection, schema, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
+    ASSERT_OK(iter.Init());
 
-    ASSERT_TRUE(iter.HasNext());
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_OK(iter.NextBlock(&row_block));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    const auto &row1 = row_block.row(0);
-    ASSERT_EQ("row1", row1.get_field_no_nullcheck<DataType::STRING>(0));
-    ASSERT_EQ(11111, row1.get_field_no_nullcheck<DataType::INT64>(1));
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_EQ("row1", value.string_value());
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_EQ(11111, value.int64_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
-
-namespace {
-
-class TransactionStatusManagerMock : public TransactionStatusManager {
- public:
-  HybridTime LocalCommitTime(const TransactionId &id) override {
-    return HybridTime::kInvalidHybridTime;
-  }
-
-  void RequestStatusAt(
-      const TransactionId &id,
-      HybridTime time,
-      TransactionStatusCallback callback) override {
-    auto it = txn_commit_time_.find(id);
-    if (it == txn_commit_time_.end()) {
-      callback(STATUS_FORMAT(TryAgain, "Unknown transaction id: $0", id));
-    } else {
-      if (time >= it->second) {
-        callback(TransactionStatusResult{TransactionStatus::COMMITTED, it->second});
-      } else {
-        callback(TransactionStatusResult{TransactionStatus::PENDING, HybridTime::kMin});
-      }
-    }
-  }
-
-  void Commit(const TransactionId& txn_id, HybridTime commit_time) {
-    txn_commit_time_.emplace(txn_id, commit_time);
-  }
-
-  boost::optional<TransactionMetadata> Metadata(const TransactionId& id) override {
-    return boost::none;
-  }
-
-  void Abort(const TransactionId& id, TransactionStatusCallback callback) override {
-  }
-
- private:
-  std::unordered_map<TransactionId, HybridTime, TransactionIdHash> txn_commit_time_;
-};
-
-} // namespace
 
 TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorResolveWriteIntents) {
   SetTransactionIsolationLevel(IsolationLevel::SNAPSHOT_ISOLATION);
 
   TransactionStatusManagerMock txn_status_manager;
 
-  Result<TransactionId> txn1 = FullyDecodeTransactionId("0000000000000001");
-  ASSERT_OK(txn1);
-  Result<TransactionId> txn2 = FullyDecodeTransactionId("0000000000000002");
-  ASSERT_OK(txn2);
+  auto txn1 = ASSERT_RESULT(FullyDecodeTransactionId("0000000000000001"));
+  auto txn2 = ASSERT_RESULT(FullyDecodeTransactionId("0000000000000002"));
 
-  SetCurrentTransactionId(*txn1);
+  SetCurrentTransactionId(txn1);
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row1_c_t1"), HybridTime::FromMicros(500), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_c_t1"), HybridTime::FromMicros(500)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(40000), HybridTime::FromMicros(500), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(40000), HybridTime::FromMicros(500)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e_t1"), HybridTime::FromMicros(500), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e_t1"), HybridTime::FromMicros(500)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(42000), HybridTime::FromMicros(500), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(42000), HybridTime::FromMicros(500)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e_t1"), HybridTime::FromMicros(500), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row2_e_t1"), HybridTime::FromMicros(500)));
   ResetCurrentTransactionId();
 
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
-      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
-      PrimitiveValue(10000), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(10000), HybridTime::FromMicros(1000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey1, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row1_e"), HybridTime::FromMicros(1000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row1_e"), HybridTime::FromMicros(1000)));
 
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(20000), HybridTime::FromMicros(2000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(20000), HybridTime::FromMicros(2000)));
 
   ASSERT_OK(DeleteSubDoc(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      HybridTime::FromMicros(2500), InitMarkerBehavior::OPTIONAL));
+      HybridTime::FromMicros(2500)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
-      PrimitiveValue(30000), HybridTime::FromMicros(3000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue(30000), HybridTime::FromMicros(3000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e"), HybridTime::FromMicros(2000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row2_e"), HybridTime::FromMicros(2000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e_prime"), HybridTime::FromMicros(4000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row2_e_prime"), HybridTime::FromMicros(4000)));
 
-  txn_status_manager.Commit(*txn1, HybridTime::FromMicros(3500));
+  txn_status_manager.Commit(txn1, HybridTime::FromMicros(3500));
 
-  SetCurrentTransactionId(*txn2);
+  SetCurrentTransactionId(txn2);
   ASSERT_OK(DeleteSubDoc(
       DocPath(kEncodedDocKey1),
-      HybridTime::FromMicros(4000), InitMarkerBehavior::OPTIONAL));
+      HybridTime::FromMicros(4000)));
   ASSERT_OK(SetPrimitive(
       DocPath(kEncodedDocKey2, PrimitiveValue(50_ColId)),
-      PrimitiveValue("row2_e_t2"), HybridTime::FromMicros(4000), InitMarkerBehavior::OPTIONAL));
+      PrimitiveValue("row2_e_t2"), HybridTime::FromMicros(4000)));
   ResetCurrentTransactionId();
-  txn_status_manager.Commit(*txn2, HybridTime::FromMicros(6000));
+  txn_status_manager.Commit(txn2, HybridTime::FromMicros(6000));
 
   ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
-      SubDocKey(DocKey([], ["row1", 11111]), []) kWeakSnapshotWrite HT(p=500, w=1) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) none
-      SubDocKey(DocKey([], ["row1", 11111]), []) kStrongSnapshotWrite HT(p=4000) -> \
-TransactionId(30303030-3030-3030-3030-303030303032) DEL
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]) kStrongSnapshotWrite HT(p=500) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) "row1_c_t1"
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40)]) kStrongSnapshotWrite HT(p=500) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) 40000
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50)]) kStrongSnapshotWrite HT(p=500) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) "row1_e_t1"
-      SubDocKey(DocKey([], ["row2", 22222]), []) kWeakSnapshotWrite HT(p=4000, w=1) -> \
-TransactionId(30303030-3030-3030-3030-303030303032) none
-      SubDocKey(DocKey([], ["row2", 22222]), []) kWeakSnapshotWrite HT(p=500, w=1) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) none
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40)]) kStrongSnapshotWrite HT(p=500) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) 42000
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) kStrongSnapshotWrite HT(p=4000) -> \
-TransactionId(30303030-3030-3030-3030-303030303032) "row2_e_t2"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) kStrongSnapshotWrite HT(p=500) -> \
-TransactionId(30303030-3030-3030-3030-303030303031) "row2_e_t1"
-      TXN REV 30303030-3030-3030-3030-303030303031 -> \
-SubDocKey(DocKey([], ["row2", 22222]), []) kWeakSnapshotWrite HT(p=500, w=1)
-      TXN REV 30303030-3030-3030-3030-303030303031 -> \
-SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) kStrongSnapshotWrite HT(p=500)
-      TXN REV 30303030-3030-3030-3030-303030303032 -> \
-SubDocKey(DocKey([], ["row2", 22222]), []) kWeakSnapshotWrite HT(p=4000, w=1)
-      TXN REV 30303030-3030-3030-3030-303030303032 -> \
-SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) kStrongSnapshotWrite HT(p=4000)
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT(p=1000)]) -> "row1_c"
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT(p=1000)]) -> 10000
-      SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT(p=1000)]) -> "row1_e"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=3000)]) -> 30000
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2500)]) -> DEL
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT(p=2000)]) -> 20000
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT(p=4000)]) -> "row2_e_prime"
-      SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT(p=2000)]) -> "row2_e"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT{ physical: 1000 }]) -> "row1_c"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 1000 }]) -> "row1_e"
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 3000 }]) -> 30000
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2500 }]) -> DEL
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2000 }]) -> 20000
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 4000 }]) -> "row2_e_prime"
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 2000 }]) -> "row2_e"
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1"]), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], ["row1"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1", 11111]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1", 11111]), []) [kStrongRead, kStrongWrite] HT{ physical: 4000 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) WriteId(5) DEL
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(0) "row1_c_t1"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(1) 40000
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(2) "row1_e_t1"
+SubDocKey(DocKey([], ["row2"]), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], ["row2"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row2", 22222]), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 3 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303032) none
+SubDocKey(DocKey([], ["row2", 22222]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(3) 42000
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 4000 } \
+    -> TransactionId(30303030-3030-3030-3030-303030303032) WriteId(6) "row2_e_t2"
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(4) "row2_e_t1"
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 } -> \
+    SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 1 } -> \
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 2 } -> \
+    SubDocKey(DocKey([], ["row2"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 3 } -> \
+    SubDocKey(DocKey([], ["row2", 22222]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 } -> \
+    SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 4000 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 w: 1 } -> \
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 w: 2 } -> \
+    SubDocKey(DocKey([], ["row2"]), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 w: 3 } -> \
+    SubDocKey(DocKey([], ["row2", 22222]), []) [kWeakRead, kWeakWrite] HT{ physical: 4000 w: 3 }
       )#");
 
   const Schema &schema = kSchemaForIteratorTests;
@@ -806,107 +773,290 @@ SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50)]) kStrongSnapshotWrite HT(p
   const auto txn_context = TransactionOperationContext(
       GenerateTransactionId(), &txn_status_manager);
 
-  ScanSpec scan_spec;
-  Arena arena(32_KB, 1_MB);
-
   {
     DocRowwiseIterator iter(
-        projection, schema, txn_context, rocksdb(), HybridTime::FromMicros(2000));
-    ASSERT_OK(iter.Init(&scan_spec));
+        projection, schema, txn_context, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2000));
+    ASSERT_OK(iter.Init());
 
-    RowBlock row_block(projection, 10, &arena);
+    QLTableRow row;
+    QLValue value;
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    const auto& row1 = row_block.row(0);
-    ASSERT_FALSE(row1.is_null(0));
-    ASSERT_EQ("row1_c", row1.get_field<DataType::STRING>(0));
-    ASSERT_FALSE(row1.is_null(1));
-    ASSERT_EQ(10000, row1.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row1.is_null(2));
-    ASSERT_EQ("row1_e", row1.get_field<DataType::STRING>(2));
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_c", value.string_value());
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    const auto &row2 = row_block.row(0);
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(10000, value.int64_value());
 
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ(20000, row2.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row2.is_null(2));
-    ASSERT_EQ("row2_e", row2.get_field<DataType::STRING>(2));
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_e", value.string_value());
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
+
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(20000, value.int64_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_e", value.string_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
+  }
+
+  // Scan at a later hybrid_time.
+
+  LOG(INFO) << "===============================================";
+  {
+    DocRowwiseIterator iter(
+        projection, schema, txn_context, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(5000));
+    ASSERT_OK(iter.Init());
+    QLTableRow row;
+    QLValue value;
+
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
+
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_c_t1", value.string_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(40000, value.int64_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row1_e_t1", value.string_value());
+
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
+
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
+
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(42000, value.int64_value());
+
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_e_prime", value.string_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 
   // Scan at a later hybrid_time.
 
   {
     DocRowwiseIterator iter(
-        projection, schema, txn_context, rocksdb(), HybridTime::FromMicros(5000));
-    ASSERT_OK(iter.Init(&scan_spec));
-    RowBlock row_block(projection, 10, &arena);
+        projection, schema, txn_context, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(6000));
+    ASSERT_OK(iter.Init());
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
+    QLTableRow row;
+    QLValue value;
 
-    const auto &row1 = row_block.row(0);
-    ASSERT_FALSE(row1.is_null(0));
-    ASSERT_EQ("row1_c_t1", row1.get_field<DataType::STRING>(0));
-    ASSERT_FALSE(row1.is_null(1));
-    ASSERT_EQ(40000, row1.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row1.is_null(2));
-    ASSERT_EQ("row1_e_t1", row1.get_field<DataType::STRING>(2));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+    ASSERT_OK(iter.NextRow(&row));
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    const auto &row2 = row_block.row(0);
+    ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+    ASSERT_TRUE(value.IsNull());
 
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ(42000, row2.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row2.is_null(2));
-    ASSERT_EQ("row2_e_prime", row2.get_field<DataType::STRING>(2));
+    ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ(42000, value.int64_value());
 
-    ASSERT_FALSE(iter.HasNext());
+    ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+    ASSERT_FALSE(value.IsNull());
+    ASSERT_EQ("row2_e_t2", value.string_value());
+
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
+}
 
-  // Scan at a later hybrid_time.
+TEST_F(DocRowwiseIteratorTest, IntentAwareIteratorSeek) {
+  SetTransactionIsolationLevel(IsolationLevel::SNAPSHOT_ISOLATION);
 
-  {
-    DocRowwiseIterator iter(
-        projection, schema, txn_context, rocksdb(), HybridTime::FromMicros(6000));
-    ASSERT_OK(iter.Init(&scan_spec));
-    RowBlock row_block(projection, 10, &arena);
+  TransactionStatusManagerMock txn_status_manager;
 
-    ASSERT_TRUE(iter.HasNext());
-    ASSERT_OK(iter.NextBlock(&row_block));
-    // Current implementation of DocRowwiseIterator::NextBlock always returns 1 row if there are
-    // next rows.
-    ASSERT_EQ(1, row_block.nrows());
+  Result<TransactionId> txn = FullyDecodeTransactionId("0000000000000001");
+  ASSERT_OK(txn);
 
-    const auto &row2 = row_block.row(0);
-    ASSERT_TRUE(row2.is_null(0));
-    ASSERT_FALSE(row2.is_null(1));
-    ASSERT_EQ(42000, row2.get_field<DataType::INT64>(1));
-    ASSERT_FALSE(row2.is_null(2));
-    ASSERT_EQ("row2_e_t2", row2.get_field<DataType::STRING>(2));
+  // Have a mix of transactional / non-transaction writes.
+  SetCurrentTransactionId(*txn);
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
+      PrimitiveValue("row1_c_txn"), HybridTime::FromMicros(500)));
 
-    ASSERT_FALSE(iter.HasNext());
+  txn_status_manager.Commit(*txn, HybridTime::FromMicros(600));
+
+  ResetCurrentTransactionId();
+
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
+      PrimitiveValue("row1_c"), HybridTime::FromMicros(1000)));
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, PrimitiveValue(40_ColId)),
+      PrimitiveValue(10000), HybridTime::FromMicros(1000)));
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey2, PrimitiveValue(30_ColId)),
+      PrimitiveValue("row2_c"), HybridTime::FromMicros(1000)));
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey2, PrimitiveValue(40_ColId)),
+      PrimitiveValue(20000), HybridTime::FromMicros(1000)));
+
+  // Verify the content of RocksDB.
+  ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30); HT{ physical: 1000 }]) -> "row1_c"
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(40); HT{ physical: 1000 }]) -> 10000
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(30); HT{ physical: 1000 }]) -> "row2_c"
+SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 1000 }]) -> 20000
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1", 11111]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(0) "row1_c_txn"
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 } -> \
+    SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 1 } -> \
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 2 } -> \
+    SubDocKey(DocKey([], ["row1"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 3 } -> \
+    SubDocKey(DocKey([], ["row1", 11111]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 }
+    )#");
+
+  // Create a new IntentAwareIterator and seek to an empty DocKey. Verify that it returns the
+  // first non-intent key.
+  IntentAwareIterator iter(
+      doc_db(), rocksdb::ReadOptions(), CoarseTimePoint::max() /* deadline */,
+      ReadHybridTime::FromMicros(1000), boost::none);
+  iter.Seek(DocKey());
+  ASSERT_TRUE(iter.valid());
+  auto key_data = ASSERT_RESULT(iter.FetchKey());
+  SubDocKey subdoc_key;
+  ASSERT_OK(subdoc_key.FullyDecodeFrom(key_data.key, HybridTimeRequired::kFalse));
+  ASSERT_EQ(subdoc_key.ToString(), R"#(SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]))#");
+  ASSERT_EQ(key_data.write_time.ToString(), "HT{ physical: 1000 }");
+}
+
+TEST_F(DocRowwiseIteratorTest, SeekTwiceWithinTheSameTxn) {
+  SetTransactionIsolationLevel(IsolationLevel::SNAPSHOT_ISOLATION);
+
+  TransactionStatusManagerMock txn_status_manager;
+
+  Result<TransactionId> txn = FullyDecodeTransactionId("0000000000000001");
+  ASSERT_OK(txn);
+
+  SetCurrentTransactionId(*txn);
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
+      PrimitiveValue("row1_c_t1"), HybridTime::FromMicros(500)));
+
+  // Verify the content of RocksDB.
+  ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 1 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1", 11111]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) none
+SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 } -> \
+    TransactionId(30303030-3030-3030-3030-303030303031) WriteId(0) "row1_c_t1"
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 } -> \
+    SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(30)]) [kStrongRead, kStrongWrite] \
+    HT{ physical: 500 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 1 } -> \
+    SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 1 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 2 } -> \
+    SubDocKey(DocKey([], ["row1"]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 2 }
+TXN REV 30303030-3030-3030-3030-303030303031 HT{ physical: 500 w: 3 } -> \
+    SubDocKey(DocKey([], ["row1", 11111]), []) [kWeakRead, kWeakWrite] HT{ physical: 500 w: 3 }
+      )#");
+
+  IntentAwareIterator iter(
+      doc_db(), rocksdb::ReadOptions(), CoarseTimePoint::max() /* deadline */,
+      ReadHybridTime::FromMicros(1000), TransactionOperationContext(*txn, &txn_status_manager));
+  for (int i = 1; i <= 2; ++i) {
+    iter.Seek(DocKey());
+    ASSERT_TRUE(iter.valid()) << "Seek #" << i << " failed";
   }
+}
+
+TEST_F(DocRowwiseIteratorTest, ScanWithinTheSameTxn) {
+  SetTransactionIsolationLevel(IsolationLevel::SNAPSHOT_ISOLATION);
+
+  TransactionStatusManagerMock txn_status_manager;
+
+  Result<TransactionId> txn = FullyDecodeTransactionId("0000000000000001");
+  ASSERT_OK(txn);
+
+  SetCurrentTransactionId(*txn);
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey2, PrimitiveValue(30_ColId)),
+      PrimitiveValue("row2_c_t1"), HybridTime::FromMicros(500)));
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, PrimitiveValue(30_ColId)),
+      PrimitiveValue("row1_c_t1"), HybridTime::FromMicros(600)));
+
+  LOG(INFO) << "Dump:\n" << DocDBDebugDumpToStr();
+
+  const auto txn_context = TransactionOperationContext(*txn, &txn_status_manager);
+  const Schema &projection = kProjectionForIteratorTests;
+
+  DocRowwiseIterator iter(
+      projection, kSchemaForIteratorTests, txn_context, doc_db(),
+      CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(1000));
+  ASSERT_OK(iter.Init());
+
+  QLTableRow row;
+  QLValue value;
+
+  ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+  ASSERT_OK(iter.NextRow(&row));
+
+  ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+  ASSERT_FALSE(value.IsNull());
+  ASSERT_EQ("row1_c_t1", value.string_value());
+
+  ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+  ASSERT_TRUE(value.IsNull());
+
+  ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+  ASSERT_TRUE(value.IsNull());
+
+  ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+  ASSERT_OK(iter.NextRow(&row));
+
+  ASSERT_OK(row.GetValue(projection.column_id(0), &value));
+  ASSERT_FALSE(value.IsNull());
+  ASSERT_EQ("row2_c_t1", value.string_value());
+
+  ASSERT_OK(row.GetValue(projection.column_id(1), &value));
+  ASSERT_TRUE(value.IsNull());
+
+  ASSERT_OK(row.GetValue(projection.column_id(2), &value));
+  ASSERT_TRUE(value.IsNull());
+
+  ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
 }
 
 }  // namespace docdb

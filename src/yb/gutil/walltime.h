@@ -36,9 +36,9 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 
-#include <glog/logging.h>
 #include <string>
-using std::string;
+
+#include <glog/logging.h>
 
 #if defined(__APPLE__)
 #include <mach/clock.h>
@@ -50,14 +50,20 @@ using std::string;
 
 #include "yb/gutil/integral_types.h"
 
+using std::string;
+
 typedef double WallTime;
 
 // Append result to a supplied string.
 // If an error occurs during conversion 'dst' is not modified.
 void StringAppendStrftime(std::string* dst,
-                                 const char* format,
-                                 time_t when,
-                                 bool local);
+                          const char* format,
+                          time_t when,
+                          bool local);
+
+void StringAppendStrftime(string* dst,
+                          const char* format,
+                          const struct tm* tm);
 
 // Return the local time as a string suitable for user display.
 std::string LocalTimeAsString();
@@ -67,10 +73,10 @@ std::string LocalTimeAsString();
 // time. If local is set to true, the same exact result as
 // WallTime_Parse is returned.
 bool WallTime_Parse_Timezone(const char* time_spec,
-                                    const char* format,
-                                    const struct tm* default_time,
-                                    bool local,
-                                    WallTime* result);
+                             const char* format,
+                             const struct tm* default_time,
+                             bool local,
+                             WallTime* result);
 
 // Return current time in seconds as a WallTime.
 WallTime WallTime_Now();

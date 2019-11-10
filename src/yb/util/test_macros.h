@@ -34,8 +34,19 @@
 
 #include <string>
 
+#include <boost/preprocessor/cat.hpp>
+
 #include "yb/util/string_trim.h"
 #include "yb/util/debug-util.h"
+
+// ASSERT_NO_FATAL_FAILURE is just too long to type.
+#define NO_FATALS(expr) \
+  ASSERT_NO_FATAL_FAILURE(expr)
+
+// Detect fatals in the surrounding scope. NO_FATALS() only checks for fatals
+// in the expression passed to it.
+#define NO_PENDING_FATALS() \
+  if (testing::Test::HasFatalFailure()) { return; }
 
 // ASSERT_NO_FATAL_FAILURE is just too long to type.
 #define ASSERT_NO_FATALS ASSERT_NO_FATAL_FAILURE
@@ -189,5 +200,23 @@
 
 #define CURRENT_TEST_CASE_NAME() \
   ::testing::UnitTest::GetInstance()->current_test_info()->test_case_name()
+
+#ifdef __APPLE__
+#define YB_DISABLE_TEST_ON_MACOS(test_name) BOOST_PP_CAT(DISABLED_, test_name)
+#else
+#define YB_DISABLE_TEST_ON_MACOS(test_name) test_name
+#endif
+
+#ifdef THREAD_SANITIZER
+#define YB_DISABLE_TEST_IN_TSAN(test_name) BOOST_PP_CAT(DISABLED_, test_name)
+#else
+#define YB_DISABLE_TEST_IN_TSAN(test_name) test_name
+#endif
+
+#if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
+#define YB_DISABLE_TEST_IN_SANITIZERS(test_name) BOOST_PP_CAT(DISABLED_, test_name)
+#else
+#define YB_DISABLE_TEST_IN_SANITIZERS(test_name) test_name
+#endif
 
 #endif  // YB_UTIL_TEST_MACROS_H

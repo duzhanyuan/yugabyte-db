@@ -17,20 +17,24 @@ import com.yugabyte.sample.apps.CassandraSparkWordCount;
 import com.yugabyte.sample.common.CmdLineOpts;
 import org.junit.Ignore;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.yb.cql.BaseCQLTest;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
 
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import org.yb.YBTestRunner;
+
+@RunWith(value=YBTestRunner.class)
 public class TestCassandraSparkWordCount extends BaseCQLTest {
 
     private CassandraSparkWordCount app = new CassandraSparkWordCount();
 
-    @Ignore
+    @Test
     public void testDefaultRun() throws Exception {
         // Set up config.
         String nodes = miniCluster.getCQLContactPoints().stream()

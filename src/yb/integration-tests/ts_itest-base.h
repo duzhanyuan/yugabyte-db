@@ -40,6 +40,9 @@
 #include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
 #include "yb/client/schema-internal.h"
+#include "yb/client/table.h"
+#include "yb/client/table_handle.h"
+
 #include "yb/consensus/quorum_util.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/integration-tests/cluster_itest_util.h"
@@ -52,6 +55,7 @@
 #include "yb/util/test_util.h"
 
 DECLARE_int32(consensus_rpc_timeout_ms);
+DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 
 DEFINE_string(ts_flags, "", "Flags to pass through to tablet servers");
 DEFINE_string(master_flags, "", "Flags to pass through to masters");
@@ -83,12 +87,7 @@ static const int kMaxRetries = 20;
 // A base for tablet server integration tests.
 class TabletServerIntegrationTestBase : public TabletServerTestBase {
  public:
-
   TabletServerIntegrationTestBase() : random_(SeedRandom()) {}
-
-  void SetUp() override {
-    TabletServerTestBase::SetUp();
-  }
 
   void AddExtraFlags(const std::string& flags_str, std::vector<std::string>* flags) {
     if (flags_str.empty()) {
@@ -101,8 +100,8 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
   void CreateCluster(const std::string& data_root_path,
-                     const std::vector<std::string>& non_default_ts_flags,
-                     const std::vector<std::string>& non_default_master_flags) {
+                     const std::vector<std::string>& non_default_ts_flags = {},
+                     const std::vector<std::string>& non_default_master_flags = {}) {
 
     LOG(INFO) << "Starting cluster with:";
     LOG(INFO) << "--------------";
@@ -146,7 +145,7 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   void CreateTSProxies() {
     CHECK(tablet_servers_.empty());
     CHECK_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
-                                          client_messenger_,
+                                          proxy_cache_.get(),
                                           &tablet_servers_));
   }
 
@@ -277,7 +276,7 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
     return NULL;
   }
 
-  // Gets the the locations of the consensus configuration and waits until all replicas
+  // Gets the locations of the consensus configuration and waits until all replicas
   // are available for all tablets.
   void WaitForTSAndReplicas() {
     int num_retries = 0;
@@ -415,47 +414,36 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
   virtual void TearDown() override {
+    client_.reset();
     if (cluster_) {
       cluster_->Shutdown();
     }
     tablet_servers_.clear();
+    TabletServerTestBase::TearDown();
   }
 
-  void CreateClient(std::shared_ptr<client::YBClient>* client) {
+  Result<std::unique_ptr<client::YBClient>> CreateClient() {
     // Connect to the cluster.
-    ASSERT_OK(client::YBClientBuilder()
-                     .add_master_server_addr(yb::ToString(cluster_->master()->bound_rpc_addr()))
-                     .Build(client));
+    return client::YBClientBuilder()
+               .add_master_server_addr(yb::ToString(cluster_->master()->bound_rpc_addr()))
+               .Build();
   }
 
-  // Create a table with a single tablet, with 'num_replicas'.
-  void CreateTable(TableType type = DEFAULT_TABLE_TYPE) {
+  // Create a table with a single tablet.
+  void CreateTable() {
     ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
-    // The tests here make extensive use of server schemas, but we need
-    // a client schema to create the table.
-    client::YBSchema client_schema(YBSchemaFromSchema(schema_));
-    gscoped_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
-    ASSERT_OK(table_creator->table_name(kTableName)
-             .schema(&client_schema)
-             .num_replicas(FLAGS_num_replicas)
-             // NOTE: this is quite high as a timeout, but the default (5 sec) does not
-             // seem to be high enough in some cases (see KUDU-550). We should remove
-             // this once that ticket is addressed.
-             .timeout(MonoDelta::FromSeconds(20))
-             .table_type(static_cast<YBTableType>(type))
-             .Create());
-    ASSERT_OK(client_->OpenTable(kTableName, &table_));
+
+    ASSERT_OK(table_.Create(kTableName, 1, client::YBSchema(schema_), client_.get()));
   }
 
   // Starts an external cluster with a single tablet and a number of replicas equal
   // to 'FLAGS_num_replicas'. The caller can pass 'ts_flags' to specify non-default
   // flags to pass to the tablet servers.
   void BuildAndStart(const std::vector<std::string>& ts_flags = std::vector<std::string>(),
-                     const std::vector<std::string>& master_flags = std::vector<std::string>(),
-                     TableType type = DEFAULT_TABLE_TYPE) {
+                     const std::vector<std::string>& master_flags = std::vector<std::string>()) {
     CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags);
-    ASSERT_NO_FATALS(CreateClient(&client_));
-    ASSERT_NO_FATALS(CreateTable(type));
+    client_ = ASSERT_RESULT(CreateClient());
+    ASSERT_NO_FATALS(CreateTable());
     WaitForTSAndReplicas();
     CHECK_GT(tablet_replicas_.size(), 0);
     tablet_id_ = (*tablet_replicas_.begin()).first;
@@ -469,11 +457,11 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   }
 
   YBTableType table_type() {
-    return table_->table_type();
+    return YBTableType::YQL_TABLE_TYPE;
   }
 
  protected:
-  gscoped_ptr<ExternalMiniCluster> cluster_;
+  std::unique_ptr<ExternalMiniCluster> cluster_;
   gscoped_ptr<itest::ExternalMiniClusterFsInspector> inspect_;
 
   // Maps server uuid to TServerDetails
@@ -481,8 +469,8 @@ class TabletServerIntegrationTestBase : public TabletServerTestBase {
   // Maps tablet to all replicas.
   TabletReplicaMap tablet_replicas_;
 
-  std::shared_ptr<client::YBClient> client_;
-  std::shared_ptr<client::YBTable> table_;
+  std::unique_ptr<client::YBClient> client_;
+  client::TableHandle table_;
   std::string tablet_id_;
 
   ThreadSafeRandom random_;

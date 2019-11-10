@@ -21,8 +21,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_DB_MEMTABLE_H
-#define ROCKSDB_DB_MEMTABLE_H
+#ifndef YB_ROCKSDB_DB_MEMTABLE_H
+#define YB_ROCKSDB_DB_MEMTABLE_H
 
 #pragma once
 
@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/db/skiplist.h"
+#include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/version_edit.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
@@ -45,6 +45,12 @@
 #include "yb/rocksdb/util/dynamic_bloom.h"
 #include "yb/rocksdb/util/instrumented_mutex.h"
 #include "yb/rocksdb/util/mutable_cf_options.h"
+
+namespace yb {
+
+class MemTracker;
+
+}
 
 namespace rocksdb {
 
@@ -74,7 +80,10 @@ struct MemTableOptions {
   Statistics* statistics;
   MergeOperator* merge_operator;
   Logger* info_log;
+  std::shared_ptr<yb::MemTracker> mem_tracker;
 };
+
+YB_DEFINE_ENUM(FlushState, (kNotRequested)(kRequested)(kScheduled));
 
 // Note:  Many of the methods in this class have comments indicating that
 // external synchromization is required as these methods are not thread-safe.
@@ -128,7 +137,7 @@ class MemTable {
   // operations on the same MemTable.
   MemTable* Unref() {
     --refs_;
-    assert(refs_ >= 0);
+    DCHECK_GE(refs_, 0);
     if (refs_ <= 0) {
       return this;
     }
@@ -145,14 +154,15 @@ class MemTable {
   // This method heuristically determines if the memtable should continue to
   // host more data.
   bool ShouldScheduleFlush() const {
-    return flush_state_.load(std::memory_order_relaxed) == FLUSH_REQUESTED;
+    return flush_state_.load(std::memory_order_relaxed) == FlushState::kRequested;
   }
 
   // Returns true if a flush should be scheduled and the caller should
   // be the one to schedule it
   bool MarkFlushScheduled() {
-    auto before = FLUSH_REQUESTED;
-    return flush_state_.compare_exchange_strong(before, FLUSH_SCHEDULED,
+    auto before = FlushState::kRequested;
+    return flush_state_.compare_exchange_strong(before,
+                                                FlushState::kScheduled,
                                                 std::memory_order_relaxed,
                                                 std::memory_order_relaxed);
   }
@@ -216,6 +226,8 @@ class MemTable {
               const Slice& key,
               const Slice& value);
 
+  bool Erase(const Slice& key);
+
   // If prev_value for key exists, attempts to update it inplace.
   // else returns false
   // Pseudocode
@@ -263,7 +275,7 @@ class MemTable {
   // into the memtable.
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable (unless this Memtable is immutable).
-  SequenceNumber GetFirstSequenceNumber() {
+  SequenceNumber GetFirstSequenceNumber() const {
     return first_seqno_.load(std::memory_order_relaxed);
   }
 
@@ -274,7 +286,7 @@ class MemTable {
   //
   // If the earliest sequence number could not be determined,
   // kMaxSequenceNumber will be returned.
-  SequenceNumber GetEarliestSequenceNumber() {
+  SequenceNumber GetEarliestSequenceNumber() const {
     return earliest_seqno_.load(std::memory_order_relaxed);
   }
 
@@ -282,13 +294,21 @@ class MemTable {
   // be flushed to storage
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable.
-  uint64_t GetNextLogNumber() { return mem_next_logfile_number_; }
+  uint64_t GetNextLogNumber() const { return mem_next_logfile_number_; }
 
   // Sets the next active logfile number when this memtable is about to
   // be flushed to storage
   // REQUIRES: external synchronization to prevent simultaneous
   // operations on the same MemTable.
   void SetNextLogNumber(uint64_t num) { mem_next_logfile_number_ = num; }
+
+  void SetFlushStartTime(std::chrono::steady_clock::time_point value) {
+    flush_start_time_ = value;
+  }
+
+  std::chrono::steady_clock::time_point FlushStartTime() const {
+    return flush_start_time_;
+  }
 
   // Notify the underlying storage that no more items will be added.
   // REQUIRES: external synchronization to prevent simultaneous
@@ -322,11 +342,27 @@ class MemTable {
 
   const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
 
-  void SetLastOpId(const OpId& op_id);
-  OpId LastOpId() const { return last_op_id_.load(std::memory_order_acquire); }
+  void UpdateFrontiers(const UserFrontiers& value) {
+    std::lock_guard<SpinMutex> l(frontiers_mutex_);
+    if (frontiers_) {
+      frontiers_->MergeFrontiers(value);
+    } else {
+      frontiers_ = value.Clone();
+    }
+  }
+
+  UserFrontierPtr GetFrontier(UpdateUserValueType type) const;
+
+  const UserFrontiers* Frontiers() const { return frontiers_.get(); }
+
+  std::string ToString() const;
+
+  bool FullyErased() const {
+    return num_entries_.load(std::memory_order_acquire) ==
+           num_erased_.load(std::memory_order_acquire);
+  }
 
  private:
-  enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
 
   friend class MemTableIterator;
   friend class MemTableBackwardIterator;
@@ -344,11 +380,15 @@ class MemTable {
   std::atomic<uint64_t> data_size_;
   std::atomic<uint64_t> num_entries_;
   std::atomic<uint64_t> num_deletes_;
+  std::atomic<uint64_t> num_erased_{0};
 
   // These are used to manage memtable flushes to storage
-  bool flush_in_progress_; // started the flush
-  bool flush_completed_;   // finished the flush
-  uint64_t file_number_;    // filled up after flush is complete
+  bool flush_in_progress_;        // started the flush
+  bool flush_completed_;          // finished the flush
+  uint64_t file_number_;          // filled up after flush is complete
+  // Filled up after flush is complete to prevent file from being deleted util it is added into the
+  // VersionSet.
+  FileNumbersHolder file_number_holder_;
 
   // The updates to be applied to the transaction log when this
   // memtable is flushed to storage.
@@ -364,23 +404,28 @@ class MemTable {
   // The log files earlier than this number can be deleted.
   uint64_t mem_next_logfile_number_;
 
+  std::chrono::steady_clock::time_point flush_start_time_;
+
   // rw locks for inplace updates
   std::vector<port::RWMutex> locks_;
 
   const SliceTransform* const prefix_extractor_;
   std::unique_ptr<DynamicBloom> prefix_bloom_;
 
-  std::atomic<FlushStateEnum> flush_state_;
+  std::atomic<FlushState> flush_state_;
 
   Env* env_;
 
-  std::atomic<OpId> last_op_id_ = {OpId()};
+  mutable SpinMutex frontiers_mutex_;
+  std::unique_ptr<UserFrontiers> frontiers_;
 
   // Returns a heuristic flush decision
   bool ShouldFlushNow() const;
 
   // Updates flush_state_ using ShouldFlushNow()
   void UpdateFlushState();
+
+  std::vector<char> erase_key_buffer_;
 
   // No copying allowed
   MemTable(const MemTable&) = delete;
@@ -391,4 +436,4 @@ extern const char* EncodeKey(std::string* scratch, const Slice& target);
 
 }  // namespace rocksdb
 
-#endif // ROCKSDB_DB_MEMTABLE_H
+#endif // YB_ROCKSDB_DB_MEMTABLE_H

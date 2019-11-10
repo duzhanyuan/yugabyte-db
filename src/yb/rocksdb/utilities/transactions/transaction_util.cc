@@ -33,7 +33,7 @@
 #include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/status.h"
 #include "yb/rocksdb/utilities/write_batch_with_index.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 
 namespace rocksdb {
 
@@ -86,7 +86,7 @@ Status TransactionUtil::CheckKey(DBImpl* db_impl, SuperVersion* sv,
 
     if (cache_only) {
       result = STATUS(TryAgain,
-                      "Transaction ould not check for conflicts as the MemTable does not "
+                      "Transaction could not check for conflicts as the MemTable does not "
                       "countain a long enough history to check write at SequenceNumber: ",
                       ToString(key_seq));
     }
@@ -96,7 +96,7 @@ Status TransactionUtil::CheckKey(DBImpl* db_impl, SuperVersion* sv,
     if (cache_only) {
       // The age of this memtable is too new to use to check for recent
       // writes.
-      char msg[255];
+      char msg[1024];
       snprintf(msg, sizeof(msg),
                "Transaction could not check for conflicts for operation at "
                "SequenceNumber %" PRIu64

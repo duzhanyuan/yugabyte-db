@@ -26,6 +26,7 @@
 #include <memory>
 #include <algorithm>
 #include <limits>
+#include <sstream>
 
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/merge_context.h"
@@ -47,6 +48,10 @@
 
 #include "yb/gutil/macros.h"
 
+#include "yb/util/mem_tracker.h"
+
+using std::ostringstream;
+
 namespace rocksdb {
 
 MemTableOptions::MemTableOptions(
@@ -66,7 +71,11 @@ MemTableOptions::MemTableOptions(
     filter_deletes(mutable_cf_options.filter_deletes),
     statistics(ioptions.statistics),
     merge_operator(ioptions.merge_operator),
-    info_log(ioptions.info_log) {}
+    info_log(ioptions.info_log) {
+  if (ioptions.mem_tracker) {
+    mem_tracker = yb::MemTracker::FindOrCreateTracker("MemTable", ioptions.mem_tracker);
+  }
+}
 
 MemTable::MemTable(const InternalKeyComparator& cmp,
                    const ImmutableCFOptions& ioptions,
@@ -94,7 +103,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
                  ? moptions_.inplace_update_num_locks
                  : 0),
       prefix_extractor_(ioptions.prefix_extractor),
-      flush_state_(FLUSH_NOT_REQUESTED),
+      flush_state_(FlushState::kNotRequested),
       env_(ioptions.env) {
   UpdateFlushState();
   // something went wrong if we need to flush before inserting anything
@@ -108,9 +117,13 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
         moptions_.memtable_prefix_bloom_huge_page_tlb_size,
         ioptions.info_log));
   }
+
+  if (moptions_.mem_tracker) {
+    arena_.SetMemTracker(moptions_.mem_tracker);
+  }
 }
 
-MemTable::~MemTable() { assert(refs_ == 0); }
+MemTable::~MemTable() { DCHECK_EQ(refs_, 0); }
 
 size_t MemTable::ApproximateMemoryUsage() {
   size_t arena_usage = arena_.ApproximateMemoryUsage();
@@ -185,10 +198,10 @@ bool MemTable::ShouldFlushNow() const {
 
 void MemTable::UpdateFlushState() {
   auto state = flush_state_.load(std::memory_order_relaxed);
-  if (state == FLUSH_NOT_REQUESTED && ShouldFlushNow()) {
+  if (state == FlushState::kNotRequested && ShouldFlushNow()) {
     // ignore CAS failure, because that means somebody else requested
     // a flush
-    flush_state_.compare_exchange_strong(state, FLUSH_REQUESTED,
+    flush_state_.compare_exchange_strong(state, FlushState::kRequested,
                                          std::memory_order_relaxed,
                                          std::memory_order_relaxed);
   }
@@ -340,6 +353,26 @@ port::RWMutex* MemTable::GetLock(const Slice& key) {
   return &locks_[hash(key) % locks_.size()];
 }
 
+std::string MemTable::ToString() const {
+  ostringstream ss;
+  auto* frontiers = Frontiers();
+  ss << "MemTable {"
+     << " num_entries: " << num_entries()
+     << " num_deletes: " << num_deletes()
+     << " IsEmpty: " << IsEmpty()
+     << " flush_state: " << flush_state_
+     << " first_seqno: " << GetFirstSequenceNumber()
+     << " eariest_seqno: " << GetEarliestSequenceNumber()
+     << " frontiers: ";
+  if (frontiers) {
+    ss << frontiers->ToString();
+  } else {
+    ss << "N/A";
+  }
+  ss << " }";
+  return ss.str();
+}
+
 uint64_t MemTable::ApproximateSize(const Slice& start_ikey,
                                    const Slice& end_ikey) {
   uint64_t entry_count = table_->ApproximateNumEntries(start_ikey, end_ikey);
@@ -446,6 +479,60 @@ void MemTable::Add(SequenceNumber s, ValueType type,
   }
 
   UpdateFlushState();
+}
+
+class OnlyUserKeyComparator : public MemTableRep::KeyComparator {
+ public:
+  explicit OnlyUserKeyComparator(const Comparator* user_comparator)
+      : user_comparator_(user_comparator) {}
+
+  int operator()(const char* prefix_len_key1, const char* prefix_len_key2) const override {
+    // Internal keys are encoded as length-prefixed strings.
+    Slice k1 = GetLengthPrefixedSlice(prefix_len_key1);
+    Slice k2 = GetLengthPrefixedSlice(prefix_len_key2);
+    return Compare(k1, k2);
+  }
+
+  int operator()(const char* prefix_len_key, const Slice& key) const override {
+    // Internal keys are encoded as length-prefixed strings.
+    Slice a = GetLengthPrefixedSlice(prefix_len_key);
+    return Compare(a, key);
+  }
+
+  int Compare(const Slice& a, const Slice& b) const {
+    return user_comparator_->Compare(ExtractUserKey(a), ExtractUserKey(b));
+  }
+
+ private:
+  const Comparator* user_comparator_;
+};
+
+bool MemTable::Erase(const Slice& user_key) {
+  uint32_t user_key_size = static_cast<uint32_t>(user_key.size());
+  uint32_t internal_key_size = user_key_size + 8;
+  const uint32_t encoded_len = VarintLength(internal_key_size) + internal_key_size;
+
+  if (erase_key_buffer_.size() < encoded_len) {
+    erase_key_buffer_.resize(encoded_len);
+  }
+  char* buf = erase_key_buffer_.data();
+  char* p = EncodeVarint32(buf, internal_key_size);
+  memcpy(p, user_key.data(), user_key_size);
+  p += user_key_size;
+  // Fill key tail with 0xffffffffffffffff so it we be less than actual user key.
+  // Please note descending order is used for key tail.
+  EncodeFixed64(p, -1LL);
+  OnlyUserKeyComparator only_user_key_comparator(comparator_.comparator.user_comparator());
+  if (table_->Erase(buf, only_user_key_comparator)) {
+    // this is a bit ugly, but is the way to avoid locked instructions
+    // when incrementing an atomic
+    num_erased_.store(num_erased_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+
+    UpdateFlushState();
+    return true;
+  }
+
+  return false;
 }
 
 // Callback from MemTable::Get()
@@ -808,20 +895,20 @@ size_t MemTable::CountSuccessiveMergeEntries(const LookupKey& key) {
   return num_successive_merges;
 }
 
-void MemTable::SetLastOpId(const OpId& op_id) {
-  for (;;) {
-    OpId old_value = last_op_id_.load(std::memory_order_acquire);
-    if (old_value.term > op_id.term || old_value.index >= op_id.index) {
-      LOG(DFATAL) << "Non-increasing last op id: " << old_value << " => " << op_id;
-      return;
-    }
-    if (last_op_id_.compare_exchange_weak(old_value,
-                                          op_id,
-                                          std::memory_order_release,
-                                          std::memory_order_relaxed)) {
-      return;
-    }
+UserFrontierPtr MemTable::GetFrontier(UpdateUserValueType type) const {
+  std::lock_guard<SpinMutex> l(frontiers_mutex_);
+  if (!frontiers_) {
+    return nullptr;
   }
+
+  switch (type) {
+    case UpdateUserValueType::kSmallest:
+      return frontiers_->Smallest().Clone();
+    case UpdateUserValueType::kLargest:
+      return frontiers_->Largest().Clone();
+  }
+
+  FATAL_INVALID_ENUM_VALUE(UpdateUserValueType, type);
 }
 
 void MemTableRep::Get(const LookupKey& k, void* callback_args,

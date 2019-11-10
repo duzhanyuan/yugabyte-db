@@ -43,6 +43,7 @@
 #include "yb/master/master.h"
 #include "yb/server/server_base.h"
 #include "yb/server/webserver_options.h"
+#include "yb/tserver/tserver_shared_mem.h"
 #include "yb/tserver/tablet_server_interface.h"
 #include "yb/tserver/tablet_server_options.h"
 #include "yb/tserver/tserver.pb.h"
@@ -51,15 +52,22 @@
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status.h"
 #include "yb/tserver/tablet_service.h"
+#include "yb/master/master.pb.h"
+
+namespace rocksdb {
+class Env;
+}
 
 namespace yb {
-
+class Env;
 class MaintenanceManager;
 
 namespace tserver {
 
+constexpr const char* const kTcMallocMaxThreadCacheBytes = "tcmalloc.max_total_thread_cache_bytes";
+
 class Heartbeater;
-class ScannerManager;
+class MetricsSnapshotter;
 class TabletServerPathHandlers;
 class TSTabletManager;
 
@@ -69,6 +77,9 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
   // constant as well.
   static const uint16_t kDefaultPort = 9100;
   static const uint16_t kDefaultWebPort = 9000;
+
+  // Default tserver and consensus RPC queue length per service.
+  static constexpr uint32_t kDefaultSvcQueueLength = 5000;
 
   explicit TabletServer(const TabletServerOptions& opts);
   ~TabletServer();
@@ -84,15 +95,16 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
   CHECKED_STATUS WaitInited();
 
   CHECKED_STATUS Start();
-  void Shutdown();
+  virtual void Shutdown();
 
   std::string ToString() const override;
 
   TSTabletManager* tablet_manager() override { return tablet_manager_.get(); }
-
-  ScannerManager* scanner_manager() override { return scanner_manager_.get(); }
+  TabletPeerLookupIf* tablet_peer_lookup() override;
 
   Heartbeater* heartbeater() { return heartbeater_.get(); }
+
+  MetricsSnapshotter* metrics_snapshotter() { return metrics_snapshotter_.get(); }
 
   void set_fail_heartbeats_for_tests(bool fail_heartbeats_for_tests) {
     base::subtle::NoBarrier_Store(&fail_heartbeats_for_tests_, 1);
@@ -111,11 +123,14 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
   void SetCurrentMasterIndex(int index) { master_config_index_ = index; }
 
   // Update in-memory list of master addresses that this tablet server pings to.
-  CHECKED_STATUS UpdateMasterAddresses(const consensus::RaftConfigPB& new_config);
+  // If the update is from master leader, we use that list directly. If not, we
+  // merge the existing in-memory master list with the provided config list.
+  CHECKED_STATUS UpdateMasterAddresses(const consensus::RaftConfigPB& new_config,
+                                       bool is_master_leader);
 
   server::Clock* Clock() override { return clock(); }
 
-  void SetClockForTests(server::Clock* clock) { clock_.reset(clock); }
+  void SetClockForTests(server::ClockPtr clock) { clock_ = std::move(clock); }
 
   const scoped_refptr<MetricEntity>& MetricEnt() const override { return metric_entity(); }
 
@@ -126,6 +141,11 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
     *live_tservers = live_tservers_;
     return Status::OK();
   }
+
+  CHECKED_STATUS GetTabletStatus(const GetTabletStatusRequestPB* req,
+                                 GetTabletStatusResponsePB* resp) const override;
+
+  bool LeaderAndReady(const TabletId& tablet_id) const override;
 
   const std::string& permanent_uuid() const { return fs_manager_->uuid(); }
 
@@ -142,19 +162,46 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
 
   scoped_refptr<Histogram> GetMetricsHistogram(TabletServerServiceIf::RpcMetricIndexes metric);
 
+  void SetPublisher(rpc::Publisher service) {
+    publish_service_ptr_.reset(new rpc::Publisher(std::move(service)));
+  }
+
+  rpc::Publisher* GetPublisher() override {
+    return publish_service_ptr_.get();
+  }
+
+  void SetYSQLCatalogVersion(uint64_t new_version);
+
+  uint64_t ysql_catalog_version() const override {
+    std::lock_guard<simple_spinlock> l(lock_);
+    return ysql_catalog_version_;
+  }
+
+  virtual Env* GetEnv();
+
+  virtual rocksdb::Env* GetRocksDBEnv();
+
+  virtual CHECKED_STATUS SetUniverseKeyRegistry(
+      const yb::UniverseKeyRegistryPB& universe_key_registry);
+
+  // Returns the file descriptor of this tablet server's shared memory segment.
+  int GetSharedMemoryFd();
+
+  // Currently only used by cdc.
+  virtual int32_t cluster_config_version() const {
+    return std::numeric_limits<int32_t>::max();
+  }
+
  protected:
   virtual CHECKED_STATUS RegisterServices();
 
- private:
-  // Auto initialize some of the service flags that are defaulted to -1.
-  void AutoInitServiceFlags();
-
- protected:
   friend class TabletServerTestBase;
+
+  void DisplayRpcIcons(std::stringstream* output) override;
 
   CHECKED_STATUS ValidateMasterAddressResolution() const;
 
-  bool initted_;
+  std::atomic<bool> initted_{false};
 
   // If true, all heartbeats will be seen as failed.
   Atomic32 fail_heartbeats_for_tests_;
@@ -165,13 +212,14 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
   // Manager for tablets which are available on this server.
   gscoped_ptr<TSTabletManager> tablet_manager_;
 
-  // Manager for open scanners from clients.
-  // This is always non-NULL. It is scoped only to minimize header
-  // dependencies.
-  gscoped_ptr<ScannerManager> scanner_manager_;
+  // Used to forward redis pub/sub messages to the redis pub/sub handler
+  yb::AtomicUniquePtr<rpc::Publisher> publish_service_ptr_;
 
   // Thread responsible for heartbeating to the master.
   gscoped_ptr<Heartbeater> heartbeater_;
+
+  // Thread responsible for collecting metrics snapshots for native storage.
+  gscoped_ptr<MetricsSnapshotter> metrics_snapshotter_;
 
   // Webserver path handlers
   gscoped_ptr<TabletServerPathHandlers> path_handlers_;
@@ -191,14 +239,23 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
   // Proxy to call this tablet server locally.
   std::shared_ptr<TabletServerServiceProxy> proxy_;
 
-  // Cluster uuid. This is sent by the master leader during the first hearbeat.
+  // Cluster uuid. This is sent by the master leader during the first heartbeat.
   std::string cluster_uuid_;
+
+  // Latest known version from the YSQL catalog (as reported by last heartbeat response).
+  uint64_t ysql_catalog_version_ = 0;
 
   // An instance to tablet server service. This pointer is no longer valid after RpcAndWebServerBase
   // is shut down.
   TabletServiceImpl* tablet_server_service_;
 
  private:
+  // Auto initialize some of the service flags that are defaulted to -1.
+  void AutoInitServiceFlags();
+
+  // Shared memory owned by the tablet server.
+  TServerSharedMemory shared_memory_;
+
   DISALLOW_COPY_AND_ASSIGN(TabletServer);
 };
 

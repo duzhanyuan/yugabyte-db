@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
+#include "yb/client/table_creator.h"
 #include "yb/consensus/consensus.proxy.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/quorum_util.h"
@@ -84,7 +85,7 @@ using tserver::MiniTabletServer;
 using tserver::TSTabletManager;
 
 static const YBTableName kTableName("my_keyspace", "test-table");
-static const int kNumReplicas = 2;
+static const int kNumReplicas = 3;
 
 class TsTabletManagerITest : public YBTest {
  public:
@@ -98,24 +99,27 @@ class TsTabletManagerITest : public YBTest {
   const YBSchema schema_;
 
   gscoped_ptr<MiniCluster> cluster_;
-  std::shared_ptr<YBClient> client_;
-  std::shared_ptr<Messenger> client_messenger_;
+  std::unique_ptr<Messenger> client_messenger_;
+  std::unique_ptr<YBClient> client_;
 };
 
 void TsTabletManagerITest::SetUp() {
   YBTest::SetUp();
 
   MessengerBuilder bld("client");
-  ASSERT_OK(bld.Build().MoveTo(&client_messenger_));
+  client_messenger_ = ASSERT_RESULT(bld.Build());
+  client_messenger_->TEST_SetOutboundIpBase(ASSERT_RESULT(HostToAddress("127.0.0.1")));
 
   MiniClusterOptions opts;
   opts.num_tablet_servers = kNumReplicas;
   cluster_.reset(new MiniCluster(env_.get(), opts));
   ASSERT_OK(cluster_->Start());
-  ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
+  client_ = ASSERT_RESULT(cluster_->CreateClient(client_messenger_.get()));
 }
 
 void TsTabletManagerITest::TearDown() {
+  client_.reset();
+  client_messenger_->Shutdown();
   cluster_->Shutdown();
   YBTest::TearDown();
 }
@@ -137,30 +141,32 @@ TEST_F(TsTabletManagerITest, TestReportNewLeaderOnLeaderChange) {
   gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&schema_)
-            .num_replicas(kNumReplicas)
+            .hash_schema(YBHashSchema::kMultiColumnHash)
+            .num_tablets(1)
             .Create());
   ASSERT_OK(client_->OpenTable(kTableName, &table));
 
+  rpc::ProxyCache proxy_cache(client_messenger_.get());
+
   // Build a TServerDetails map so we can check for convergence.
-  gscoped_ptr<MasterServiceProxy> master_proxy(
-      new MasterServiceProxy(client_messenger_, cluster_->mini_master()->bound_rpc_addr()));
+  MasterServiceProxy master_proxy(&proxy_cache, cluster_->mini_master()->bound_rpc_addr());
 
   itest::TabletServerMap ts_map;
-  ASSERT_OK(CreateTabletServerMap(master_proxy.get(), client_messenger_, &ts_map));
+  ASSERT_OK(CreateTabletServerMap(&master_proxy, &proxy_cache, &ts_map));
 
   // Collect the tablet peers so we get direct access to consensus.
-  vector<scoped_refptr<TabletPeer> > tablet_peers;
+  vector<std::shared_ptr<TabletPeer> > tablet_peers;
   for (int replica = 0; replica < kNumReplicas; replica++) {
     MiniTabletServer* ts = cluster_->mini_tablet_server(replica);
     ts->FailHeartbeats(); // Stop heartbeating we don't race against the Master.
-    vector<scoped_refptr<TabletPeer> > cur_ts_tablet_peers;
+    vector<std::shared_ptr<TabletPeer> > cur_ts_tablet_peers;
     // The replicas may not have been created yet, so loop until we see them.
     while (true) {
       ts->server()->tablet_manager()->GetTabletPeers(&cur_ts_tablet_peers);
       if (!cur_ts_tablet_peers.empty()) break;
       SleepFor(MonoDelta::FromMilliseconds(10));
     }
-    ASSERT_EQ(1, cur_ts_tablet_peers.size()); // Each TS should only have 1 tablet.
+    ASSERT_EQ(1, cur_ts_tablet_peers.size());
     ASSERT_OK(cur_ts_tablet_peers[0]->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
     tablet_peers.push_back(cur_ts_tablet_peers[0]);
   }

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "yb/common/ql_bfunc.h"
+#include "yb/common/ql_value.h"
 
 using std::endl;
 using std::make_pair;
@@ -27,12 +28,13 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 
+using yb::bfql::TSOpcode;
+
 namespace yb {
 namespace docdb {
 
 SubDocument::SubDocument(ValueType value_type) : PrimitiveValue(value_type) {
-  if (IsObjectType(value_type) ||
-      value_type == ValueType::kArray) {
+  if (IsCollectionType(value_type)) {
     EnsureContainerAllocated();
   }
 }
@@ -40,8 +42,12 @@ SubDocument::SubDocument(ValueType value_type) : PrimitiveValue(value_type) {
 SubDocument::~SubDocument() {
   switch (type_) {
     case ValueType::kObject: FALLTHROUGH_INTENDED;
-    case ValueType::kRedisTS:
-    case ValueType::kRedisSet:
+    case ValueType::kRedisList: FALLTHROUGH_INTENDED;
+    case ValueType::kRedisSortedSet: FALLTHROUGH_INTENDED;
+    case ValueType::kRedisSet: FALLTHROUGH_INTENDED;
+    case ValueType::kRedisTS: FALLTHROUGH_INTENDED;
+    case ValueType::kSSForward: FALLTHROUGH_INTENDED;
+    case ValueType::kSSReverse:
       if (has_valid_container()) {
         delete &object_container();
       }
@@ -58,7 +64,7 @@ SubDocument::~SubDocument() {
 
 SubDocument::SubDocument(const SubDocument& other) {
   if (IsPrimitiveValueType(other.type_) ||
-      other.type_ == ValueType::kInvalidValueType ||
+      other.type_ == ValueType::kInvalid ||
       other.type_ == ValueType::kTombstone) {
     new(this) PrimitiveValue(other);
   } else {
@@ -136,6 +142,7 @@ void SubDocument::MoveFrom(SubDocument* other) {
     new(this) PrimitiveValue(std::move(*other));
   } else {
     // For objects/arrays the internal state is just a type and a pointer.
+    extend_order_ = other->extend_order_;
     type_ = other->type_;
     ttl_seconds_ = other->ttl_seconds_;
     write_time_ = other->write_time_;
@@ -143,9 +150,9 @@ void SubDocument::MoveFrom(SubDocument* other) {
     // The internal state of the other subdocument is now owned by this one.
 #ifndef NDEBUG
     // Another layer of protection against trying to use the old state in debug mode.
-    memset(other, 0xab, sizeof(SubDocument));  // Fill with a random value.
+    memset(static_cast<void*>(other), 0xab, sizeof(SubDocument));  // Fill with a random value.
 #endif
-    other->type_ = ValueType::kNull;  // To avoid deallocation of the old object's memory.
+    other->type_ = ValueType::kNullLow;  // To avoid deallocation of the old object's memory.
   }
 }
 
@@ -155,6 +162,22 @@ Status SubDocument::ConvertToRedisTS() {
 
 Status SubDocument::ConvertToRedisSet() {
   return ConvertToCollection(ValueType::kRedisSet);
+}
+
+Status SubDocument::ConvertToRedisSortedSet() {
+  return ConvertToCollection(ValueType::kRedisSortedSet);
+}
+
+Status SubDocument::ConvertToRedisList() {
+  return ConvertToCollection(ValueType::kRedisList);
+}
+
+Status SubDocument::NumChildren(size_t *num_children) {
+  if (!has_valid_object_container()) {
+    return STATUS(IllegalState, "Not a valid object container");
+  }
+  *num_children = object_container().size();
+  return Status::OK();
 }
 
 SubDocument* SubDocument::GetChild(const PrimitiveValue& key) {
@@ -184,7 +207,7 @@ const SubDocument* SubDocument::GetChild(const PrimitiveValue& key) const {
 }
 
 pair<SubDocument*, bool> SubDocument::GetOrAddChild(const PrimitiveValue& key) {
-  DCHECK_EQ(ValueType::kObject, type_);
+  DCHECK(IsObjectType(type_));
   EnsureContainerAllocated();
   auto& obj_container = object_container();
   auto iter = obj_container.find(key);
@@ -238,12 +261,13 @@ void SubDocumentToStreamInternal(ostream& out,
                                  const SubDocument& subdoc,
                                  const int indent) {
   if (subdoc.IsPrimitive() ||
-      subdoc.value_type() == ValueType::kInvalidValueType ||
+      subdoc.value_type() == ValueType::kInvalid ||
       subdoc.value_type() == ValueType::kTombstone) {
     out << static_cast<const PrimitiveValue*>(&subdoc)->ToString();
     return;
   }
   switch (subdoc.value_type()) {
+    case ValueType::kRedisSortedSet: FALLTHROUGH_INTENDED;
     case ValueType::kObject: {
       out << "{";
       if (subdoc.container_allocated()) {
@@ -266,6 +290,7 @@ void SubDocumentToStreamInternal(ostream& out,
     case ValueType::kArray: {
       out << "[";
       if (subdoc.container_allocated()) {
+        out << (subdoc.GetExtendOrder() == ListExtendOrder::APPEND ? "APPEND" : "PREPEND") << "\n";
         const auto& list = subdoc.array_container();
         int i = 0;
         for (; i < list.size(); i++) {
@@ -284,6 +309,10 @@ void SubDocumentToStreamInternal(ostream& out,
     }
     case ValueType::kRedisSet: {
       SubDocCollectionToStreamInternal(out, subdoc, indent, "(", ")");
+      break;
+    }
+    case ValueType::kRedisList: {
+      SubDocCollectionToStreamInternal(out, subdoc, indent, "[", "]");
       break;
     }
     case ValueType::kRedisTS: {
@@ -328,17 +357,17 @@ void SubDocument::EnsureContainerAllocated() {
 
 SubDocument SubDocument::FromQLValuePB(const QLValuePB& value,
                                        ColumnSchema::SortingType sorting_type,
-                                       WriteAction write_action) {
+                                       TSOpcode write_instr) {
   switch (value.value_case()) {
     case QLValuePB::kMapValue: {
-      QLMapValuePB map = QLValue::map_value(value);
+      QLMapValuePB map = value.map_value();
       // this equality should be ensured by checks before getting here
       DCHECK_EQ(map.keys_size(), map.values_size());
 
       SubDocument map_doc;
       for (int i = 0; i < map.keys_size(); i++) {
         PrimitiveValue pv_key = PrimitiveValue::FromQLValuePB(map.keys(i), sorting_type);
-        SubDocument pv_val = SubDocument::FromQLValuePB(map.values(i), sorting_type, write_action);
+        SubDocument pv_val = SubDocument::FromQLValuePB(map.values(i), sorting_type, write_instr);
         map_doc.SetChild(pv_key, std::move(pv_val));
       }
       // ensure container allocated even if map is empty
@@ -346,13 +375,13 @@ SubDocument SubDocument::FromQLValuePB(const QLValuePB& value,
       return map_doc;
     }
     case QLValuePB::kSetValue: {
-      QLSeqValuePB set = QLValue::set_value(value);
+      QLSeqValuePB set = value.set_value();
       SubDocument set_doc;
       for (auto& elem : set.elems()) {
         PrimitiveValue pv_key = PrimitiveValue::FromQLValuePB(elem, sorting_type);
-        if (write_action == WriteAction::REMOVE_KEYS) {
+        if (write_instr == TSOpcode::kSetRemove || write_instr == TSOpcode::kMapRemove ) {
           // representing sets elems as keys pointing to tombstones to remove those entries
-          set_doc.SetChildPrimitive(pv_key, PrimitiveValue(ValueType::kTombstone));
+          set_doc.SetChildPrimitive(pv_key, PrimitiveValue::kTombstone);
         }  else {
           // representing sets elems as keys pointing to empty (null) values
           set_doc.SetChildPrimitive(pv_key, PrimitiveValue());
@@ -363,12 +392,12 @@ SubDocument SubDocument::FromQLValuePB(const QLValuePB& value,
       return set_doc;
     }
     case QLValuePB::kListValue: {
-      QLSeqValuePB list = QLValue::list_value(value);
+      QLSeqValuePB list = value.list_value();
       SubDocument list_doc(ValueType::kArray);
       // ensure container allocated even if list is empty
       list_doc.EnsureContainerAllocated();
       for (int i = 0; i < list.elems_size(); i++) {
-        SubDocument pv_val = SubDocument::FromQLValuePB(list.elems(i), sorting_type, write_action);
+        SubDocument pv_val = SubDocument::FromQLValuePB(list.elems(i), sorting_type, write_instr);
         list_doc.AddListElement(std::move(pv_val));
       }
       return list_doc;
@@ -379,13 +408,13 @@ SubDocument SubDocument::FromQLValuePB(const QLValuePB& value,
   }
 }
 
-void SubDocument::ToQLValuePB(SubDocument doc,
+void SubDocument::ToQLValuePB(const SubDocument& doc,
                               const shared_ptr<QLType>& ql_type,
                               QLValuePB* ql_value) {
   // interpreting empty collections as null values following Cassandra semantics
   if (ql_type->HasComplexValues() && (!doc.has_valid_object_container() ||
                                        doc.object_num_keys() == 0)) {
-    QLValue::SetNull(ql_value);
+    SetNull(ql_value);
     return;
   }
 
@@ -393,20 +422,20 @@ void SubDocument::ToQLValuePB(SubDocument doc,
     case MAP: {
       const shared_ptr<QLType>& keys_type = ql_type->params()[0];
       const shared_ptr<QLType>& values_type = ql_type->params()[1];
-      QLValue::set_map_value(ql_value);
+      QLMapValuePB *value_pb = ql_value->mutable_map_value();
       for (auto &pair : doc.object_container()) {
-        QLValuePB *key = QLValue::add_map_key(ql_value);
+        QLValuePB *key = value_pb->add_keys();
         PrimitiveValue::ToQLValuePB(pair.first, keys_type, key);
-        QLValuePB *value = QLValue::add_map_value(ql_value);
+        QLValuePB *value = value_pb->add_values();
         SubDocument::ToQLValuePB(pair.second, values_type, value);
       }
       return;
     }
     case SET: {
       const shared_ptr<QLType>& elems_type = ql_type->params()[0];
-      QLValue::set_set_value(ql_value);
+      QLSeqValuePB *value_pb = ql_value->mutable_set_value();
       for (auto &pair : doc.object_container()) {
-        QLValuePB *elem = QLValue::add_set_elem(ql_value);
+        QLValuePB *elem = value_pb->add_elems();
         PrimitiveValue::ToQLValuePB(pair.first, elems_type, elem);
         // set elems are represented as subdocument keys so we ignore the (empty) values
       }
@@ -414,21 +443,21 @@ void SubDocument::ToQLValuePB(SubDocument doc,
     }
     case LIST: {
       const shared_ptr<QLType>& elems_type = ql_type->params()[0];
-      QLValue::set_list_value(ql_value);
+      QLSeqValuePB *value_pb = ql_value->mutable_list_value();
       for (auto &pair : doc.object_container()) {
         // list elems are represented as subdocument values with keys only used for ordering
-        QLValuePB *elem = QLValue::add_list_elem(ql_value);
+        QLValuePB *elem = value_pb->add_elems();
         SubDocument::ToQLValuePB(pair.second, elems_type, elem);
       }
       return;
     }
     case USER_DEFINED_TYPE: {
       const shared_ptr<QLType>& keys_type = QLType::Create(INT16);
-      QLValue::set_map_value(ql_value);
+      QLMapValuePB *value_pb = ql_value->mutable_map_value();
       for (auto &pair : doc.object_container()) {
-        QLValuePB *key = QLValue::add_map_key(ql_value);
+        QLValuePB *key = value_pb->add_keys();
         PrimitiveValue::ToQLValuePB(pair.first, keys_type, key);
-        QLValuePB *value = QLValue::add_map_value(ql_value);
+        QLValuePB *value = value_pb->add_values();
         SubDocument::ToQLValuePB(pair.second, ql_type->param_type(key->int16_value()), value);
       }
       return;
@@ -441,106 +470,6 @@ void SubDocument::ToQLValuePB(SubDocument doc,
     }
   }
   LOG(FATAL) << "Unsupported datatype in SubDocument: " << ql_type->ToString();
-}
-
-void SubDocument::ToQLExpressionPB(SubDocument doc,
-                                   const shared_ptr<QLType>& ql_type,
-                                   QLExpressionPB* ql_expr) {
-  ToQLValuePB(doc, ql_type, ql_expr->mutable_value());
-}
-
-
-CHECKED_STATUS SubDocument::FromQLExpressionPB(const QLExpressionPB& ql_expr,
-                                               const ColumnSchema& column_schema,
-                                               const QLTableRow& table_row,
-                                               SubDocument* sub_doc,
-                                               WriteAction* write_action) {
-  switch (ql_expr.expr_case()) {
-    case QLExpressionPB::ExprCase::kValue:  // Scenarios: SET column = constant.
-      *sub_doc = FromQLValuePB(ql_expr.value(), column_schema.sorting_type(), *write_action);
-      return Status::OK();
-
-    case QLExpressionPB::ExprCase::kColumnId:  // Scenarios: SET column = column.
-      FALLTHROUGH_INTENDED;
-    case QLExpressionPB::ExprCase::kSubscriptedCol:  // Scenarios: SET column = column[key].
-      FALLTHROUGH_INTENDED;
-    case QLExpressionPB::ExprCase::kBfcall: {  // Scenarios: SET column = func().
-      QLValueWithPB result;
-      RETURN_NOT_OK(YQLExpression::Evaluate(ql_expr, table_row, &result, write_action));
-      // Type of the result could be changed for some write actions (e.g. REMOVE_KEYS from map)
-      *sub_doc = FromQLValuePB(result.value(), column_schema.sorting_type(), *write_action);
-      return Status::OK();
-    }
-
-    case QLExpressionPB::ExprCase::kTscall: {  // Scenarios: SELECT TTL(col).
-      QLValueWithPB result;
-      RETURN_NOT_OK(EvalQLBFCallTServerPB(ql_expr.tscall(), table_row, &result));
-      *sub_doc = FromQLValuePB(result.value(), column_schema.sorting_type(), *write_action);
-      return Status::OK();
-    }
-
-    case QLExpressionPB::ExprCase::kCondition:
-      LOG(FATAL) << "Internal error: Conditional expression is not allowed in this context";
-      break;
-
-    case QLExpressionPB::ExprCase::kBocall: FALLTHROUGH_INTENDED;
-    case QLExpressionPB::ExprCase::kBindId: FALLTHROUGH_INTENDED;
-    case QLExpressionPB::ExprCase::EXPR_NOT_SET:
-      break;
-  }
-  LOG(FATAL) << "Internal error: invalid column or value expression: " << ql_expr.expr_case();
-}
-
-// TODO(neil)
-// - Need to work with Mihnea on collection function and merge this work with DocExprExecutor().
-// - When memory pool is implemented in DocDB, we should run some perf tool to optimize the
-// expression evaluating process. The intermediate / temporary QLValue should be allocated
-// in the pool. Currently, the argument structures are on stack, but their contents are in the
-// heap memory.
-CHECKED_STATUS SubDocument::EvalQLBFCallTServerPB(const QLBCallPB& tscall,
-                                                  const QLTableRow& table_row,
-                                                  QLValueWithPB *result) {
-  bfql::TSOpcode tsopcode = static_cast<bfql::TSOpcode>(tscall.opcode());
-  switch (tsopcode) {
-    case bfql::TSOpcode::kNoOp:
-      break;
-
-    case bfql::TSOpcode::kWriteTime: {
-      // TODO(neil) Call Docdb for the value and fill in the result.
-      // "args" should be just one "kColumnId". The variable "table_row" is not enough for this
-      // operator, so we must pass other information together with value.
-      DCHECK_EQ(tscall.operands().size(), 1) << "WriteTime takes only one argument, a column";
-      const QLExpressionPB& operand = tscall.operands().Get(0);
-      DCHECK(operand.has_column_id()) << "WriteTime operator expects a column ID";
-      LOG(INFO) << "Seek WRITETIME for column " << operand.column_id();
-
-      LOG(FATAL) << "Failed to execute WRITETIME";
-    }
-
-    case bfql::TSOpcode::kTtl: {
-      // TODO(neil) Call Docdb for the value and fill in the result.
-      // "args" should be just one "kColumnId". The variable "table_row" is not enough for this
-      // operator, so we must pass other information together with value.
-      DCHECK_EQ(tscall.operands().size(), 1) << "WriteTime takes only one argument, a column";
-      const QLExpressionPB& operand = tscall.operands().Get(0);
-      DCHECK(operand.has_column_id()) << "WriteTime operator expects a column ID";
-      LOG(INFO) << "Seek WRITETIME for column " << operand.column_id();
-
-      LOG(FATAL) << "Failed to execute TTL";
-    }
-
-    case bfql::TSOpcode::kCount: FALLTHROUGH_INTENDED;
-    case bfql::TSOpcode::kSum: FALLTHROUGH_INTENDED;
-    case bfql::TSOpcode::kAvg: FALLTHROUGH_INTENDED;
-    case bfql::TSOpcode::kMin: FALLTHROUGH_INTENDED;
-    case bfql::TSOpcode::kMax:
-      // TODO(neil) Call DocDB to execute aggregate functions.
-      // These functions operate across many rows, so some state variables must be kept beyond the
-      // scope of one row. The variable "table_row" is not enough for these operators.
-      LOG(FATAL) << "Failed to execute aggregate function";
-  }
-
-  return Status::OK();
 }
 
 }  // namespace docdb

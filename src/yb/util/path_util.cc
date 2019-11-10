@@ -34,32 +34,49 @@
 
 // Use the POSIX version of dirname(3).
 #include <libgen.h>
+#include <fcntl.h>
 
 #include <string>
-
-#include "yb/util/env.h"
-#include "yb/util/env_util.h"
-#include "yb/gutil/gscoped_ptr.h"
-
 #if defined(__APPLE__)
 #include <mutex>
 #endif // defined(__APPLE__)
+
+#if defined(__linux__)
+#include <linux/falloc.h>
+#include <sys/sysinfo.h>
+#endif
+
+#include "yb/util/env_util.h"
+#include "yb/util/errno.h"
+#include "yb/util/debug/trace_event.h"
+#include "yb/util/thread_restrictions.h"
+#include "yb/gutil/gscoped_ptr.h"
 
 using std::string;
 
 namespace yb {
 
-std::string JoinPathSegments(const std::string &a,
-                             const std::string &b) {
-  CHECK(!a.empty()) << "empty first component: " << a;
+static const char* const kTmpTemplateSuffix = ".tmp.XXXXXX";
+
+void AppendPathSegments(std::string* out, const std::string &b) {
+  CHECK(!out->empty()) << "empty first component: " << *out;
   CHECK(!b.empty() && b[0] != '/')
     << "second path component must be non-empty and relative: "
     << b;
-  if (a[a.size() - 1] == '/') {
-    return a + b;
-  } else {
-    return a + "/" + b;
+  if ((*out)[out->size() - 1] != '/') {
+    *out += '/';
   }
+  *out += b;
+}
+
+Status FileCreationError(const std::string& path_dir, int err_number) {
+  switch (err_number) {
+    case EACCES: FALLTHROUGH_INTENDED;
+    case EPERM: FALLTHROUGH_INTENDED;
+    case EINVAL:
+      return STATUS(NotSupported, path_dir, Errno(err_number));
+  }
+  return Status::OK();
 }
 
 string DirName(const string& path) {
@@ -99,4 +116,29 @@ Status SetupRootDir(
   return Status::OK();
 }
 
+Status CheckODirectTempFileCreationInDir(Env* env,
+                                         const std::string& dir_path) {
+  std::string name_template;
+  if (!dir_path.empty() && dir_path.back() == '/') {
+    name_template = dir_path + kTmpTemplateSuffix;
+  } else {
+    name_template = dir_path + '/' + kTmpTemplateSuffix;
+  }
+  ThreadRestrictions::AssertIOAllowed();
+  std::unique_ptr<char[]> fname(new char[name_template.size() + 1]);
+  ::snprintf(fname.get(), name_template.size() + 1, "%s", name_template.c_str());
+#if defined(__linux__)
+  int fd = -1;
+  fd = ::mkostemp(fname.get(), O_DIRECT);
+
+  if (fd < 0) {
+    return FileCreationError(dir_path, errno);
+  }
+
+  if (unlink(fname.get()) != 0) {
+    return FileCreationError(dir_path, errno);
+  }
+#endif
+  return Status::OK();
+}
 } // namespace yb

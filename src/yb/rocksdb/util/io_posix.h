@@ -20,8 +20,8 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-#ifndef ROCKSDB_UTIL_IO_POSIX_H
-#define ROCKSDB_UTIL_IO_POSIX_H
+#ifndef YB_ROCKSDB_UTIL_IO_POSIX_H
+#define YB_ROCKSDB_UTIL_IO_POSIX_H
 
 #pragma once
 #include <unistd.h>
@@ -29,7 +29,7 @@
 
 // For non linux platform, the following macros are used only as place
 // holder.
-#if !(defined OS_LINUX) && !(defined CYGWIN)
+#if !(defined __linux__) && !(defined CYGWIN)
 #define POSIX_FADV_NORMAL 0     /* [MC1] no further special treatment */
 #define POSIX_FADV_RANDOM 1     /* [MC1] expect random page refs */
 #define POSIX_FADV_SEQUENTIAL 2 /* [MC1] expect sequential page refs */
@@ -39,46 +39,7 @@
 
 namespace rocksdb {
 
-static Status IOError(const std::string& context, int err_number) {
-  return STATUS(IOError, context, strerror(err_number));
-}
-
-class PosixSequentialFile : public SequentialFile {
- private:
-  std::string filename_;
-  FILE* file_;
-  int fd_;
-  bool use_os_buffer_;
-
- public:
-  PosixSequentialFile(const std::string& fname, FILE* f,
-                      const EnvOptions& options);
-  virtual ~PosixSequentialFile();
-
-  virtual Status Read(size_t n, Slice* result, char* scratch) override;
-  virtual Status Skip(uint64_t n) override;
-  virtual Status InvalidateCache(size_t offset, size_t length) override;
-};
-
-class PosixRandomAccessFile : public RandomAccessFile {
- private:
-  std::string filename_;
-  int fd_;
-  bool use_os_buffer_;
-
- public:
-  PosixRandomAccessFile(const std::string& fname, int fd,
-                        const EnvOptions& options);
-  virtual ~PosixRandomAccessFile();
-
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      char* scratch) const override;
-#ifdef OS_LINUX
-  virtual size_t GetUniqueId(char* id, size_t max_size) const override;
-#endif
-  virtual void Hint(AccessPattern pattern) override;
-  virtual Status InvalidateCache(size_t offset, size_t length) override;
-};
+#define STATUS_IO_ERROR(context, err_number) STATUS(IOError, (context), strerror(err_number))
 
 class PosixWritableFile : public WritableFile {
  private:
@@ -109,7 +70,7 @@ class PosixWritableFile : public WritableFile {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   virtual Status Allocate(uint64_t offset, uint64_t len) override;
   virtual Status RangeSync(uint64_t offset, uint64_t nbytes) override;
-  virtual size_t GetUniqueId(char* id, size_t max_size) const override;
+  virtual size_t GetUniqueId(char* id) const override;
 #endif
 };
 
@@ -123,10 +84,14 @@ class PosixMmapReadableFile : public RandomAccessFile {
  public:
   PosixMmapReadableFile(const int fd, const std::string& fname, void* base,
                         size_t length, const EnvOptions& options);
-  virtual ~PosixMmapReadableFile();
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      char* scratch) const override;
-  virtual Status InvalidateCache(size_t offset, size_t length) override;
+  ~PosixMmapReadableFile();
+  CHECKED_STATUS Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override;
+  CHECKED_STATUS InvalidateCache(size_t offset, size_t length) override;
+  yb::Result<uint64_t> Size() const override { return length_; }
+  yb::Result<uint64_t> INode() const override;
+  // Doesn't include memory usage by mmap.
+  size_t memory_footprint() const override;
+  const std::string& filename() const override { return filename_; }
 };
 
 class PosixMmapFile : public WritableFile {
@@ -190,4 +155,4 @@ class PosixDirectory : public Directory {
 
 }  // namespace rocksdb
 
-#endif // ROCKSDB_UTIL_IO_POSIX_H
+#endif // YB_ROCKSDB_UTIL_IO_POSIX_H

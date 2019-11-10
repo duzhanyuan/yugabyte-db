@@ -39,7 +39,7 @@ MetaIndexBuilder::MetaIndexBuilder()
 void MetaIndexBuilder::Add(const std::string& key,
                            const BlockHandle& handle) {
   std::string handle_encoding;
-  handle.EncodeTo(&handle_encoding);
+  handle.AppendEncodedTo(&handle_encoding);
   meta_block_handles_.insert({key, handle_encoding});
 }
 
@@ -83,6 +83,7 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   Add(TablePropertiesNames::kNumEntries, props.num_entries);
   Add(TablePropertiesNames::kNumDataBlocks, props.num_data_blocks);
   Add(TablePropertiesNames::kNumFilterBlocks, props.num_filter_blocks);
+  Add(TablePropertiesNames::kNumDataIndexBlocks, props.num_data_index_blocks);
   Add(TablePropertiesNames::kFilterSize, props.filter_size);
   Add(TablePropertiesNames::kFormatVersion, props.format_version);
   Add(TablePropertiesNames::kFixedKeyLen, props.fixed_key_len);
@@ -163,7 +164,7 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
   read_options.verify_checksums = false;
   Status s;
   s = ReadBlockContents(file, footer, read_options, handle, &block_contents,
-                        env, false);
+                        env, nullptr /* mem_tracker */, false);
 
   if (!s.ok()) {
     return s;
@@ -185,6 +186,7 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       {TablePropertiesNames::kNumDataBlocks, &new_table_properties->num_data_blocks},
       {TablePropertiesNames::kNumEntries, &new_table_properties->num_entries},
       {TablePropertiesNames::kNumFilterBlocks, &new_table_properties->num_filter_blocks},
+      {TablePropertiesNames::kNumDataIndexBlocks, &new_table_properties->num_data_index_blocks},
       {TablePropertiesNames::kFormatVersion, &new_table_properties->format_version},
       {TablePropertiesNames::kFixedKeyLen, &new_table_properties->fixed_key_len}, };
 
@@ -248,7 +250,7 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
   ReadOptions read_options;
   read_options.verify_checksums = false;
   s = ReadBlockContents(file, footer, read_options, metaindex_handle,
-                        &metaindex_contents, env, false);
+                        &metaindex_contents, env, nullptr /* mem_tracker */, false);
   if (!s.ok()) {
     return s;
   }
@@ -290,6 +292,7 @@ Status FindMetaBlock(InternalIterator* meta_index_iter,
 Status FindMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
                      uint64_t table_magic_number, Env* env,
                      const std::string& meta_block_name,
+                     const std::shared_ptr<yb::MemTracker>& mem_tracker,
                      BlockHandle* block_handle) {
   Footer footer;
   auto s = ReadFooterFromFile(file, file_size, &footer, table_magic_number);
@@ -302,7 +305,7 @@ Status FindMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
   ReadOptions read_options;
   read_options.verify_checksums = false;
   s = ReadBlockContents(file, footer, read_options, metaindex_handle,
-                        &metaindex_contents, env, false);
+                        &metaindex_contents, env, mem_tracker, false);
   if (!s.ok()) {
     return s;
   }
@@ -317,6 +320,7 @@ Status FindMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
 Status ReadMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
                      uint64_t table_magic_number, Env* env,
                      const std::string& meta_block_name,
+                     const std::shared_ptr<yb::MemTracker>& mem_tracker,
                      BlockContents* contents) {
   Status status;
   Footer footer;
@@ -331,7 +335,7 @@ Status ReadMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
   ReadOptions read_options;
   read_options.verify_checksums = false;
   status = ReadBlockContents(file, footer, read_options, metaindex_handle,
-                             &metaindex_contents, env, false);
+                             &metaindex_contents, env, mem_tracker, false);
   if (!status.ok()) {
     return status;
   }
@@ -350,8 +354,8 @@ Status ReadMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
   }
 
   // Reading metablock
-  return ReadBlockContents(file, footer, read_options, block_handle, contents,
-                           env, false);
+  return ReadBlockContents(
+      file, footer, read_options, block_handle, contents, env, mem_tracker, false);
 }
 
 }  // namespace rocksdb

@@ -1,144 +1,94 @@
-# YugaByte Database
+<img src="https://github.com/yugabyte/yugabyte-db/raw/master/architecture/images/ybDB_horizontal.jpg" align="center" alt="YugabyteDB"/>
 
-YugaByte is a cloud-native database for mission-critical applications. This repository contains the
-Community Edition of the YugaByte Database. YugaByte supports Apache Cassandra Query Language and
-Redis APIs, with SQL support on the roadmap.
+---------------------------------------
 
-Here are a few resources for getting started with YugaByte:
-* [Community Edition Quick Start](http://docs.yugabyte.com/community-edition/quick-start/) to
-  get started with YugaByte using a pre-built YugaByte Community Edition package.
-* See [YugaByte Documentation](http://docs.yugabyte.com/) for architecture,
-  production deployment options and languages supported. In particular, see
-  [Architecture / Concepts](http://docs.yugabyte.com/architecture/concepts/) and
-  [Architecture / Core Functions](http://docs.yugabyte.com/architecture/core-functions/) sections.
-* See [www.yugabyte.com](https://www.yugabyte.com/) for general information about YugaByte.
-* Check out the [YugaByte Community Forum](http://forum.yugabyte.com) and post your questions
-  or comments.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Documentation Status](https://readthedocs.org/projects/ansicolortags/badge/?version=latest)](https://docs.yugabyte.com/)
+[![Ask in forum](https://img.shields.io/badge/ask%20us-forum-orange.svg)](https://forum.yugabyte.com/)
+[![Slack chat](https://img.shields.io/badge/Slack:-%23yugabyte_db-blueviolet.svg?logo=slack)](https://www.yugabyte.com/slack)
+[![Analytics](https://yugabyte.appspot.com/UA-104956980-4/home?pixel&useReferer)](https://github.com/yugabyte/ga-beacon)
 
-## Build Prerequisites
+- [What is YugabyteDB?](#what-is-yugabytedb)
+- [Get Started](#get-started)
+- [Build Apps](#build-apps)
+- [Architecture](#architecture)
+- [Need Help?](#need-help)
+- [Contribute](#contribute)
+- [License](#license)
+- [Read More](#read-more)
 
-### CentOS 7
+# What is YugabyteDB?
 
-CentOS 7 is the main recommended development and production platform for YugaByte.
+YugabyteDB is a high-performance, cloud-native distributed SQL database. Here are its salient points:
+* Has a pluggable query layer, and supports two distributed SQL APIs:
+    * **[Yugabyte SQL (YSQL)](https://docs.yugabyte.com/latest/api/ysql/)** - PostgreSQL-compatible fully relational API
+    * **[Yugabyte Cloud QL (YCQL)](https://docs.yugabyte.com/latest/api/ycql/)** - Semi-relational SQL-like API with documents/indexing support and Apache Cassandra QL roots 
+* Automated sharding, Raft consensus replication and distributed transactions, based on the Google Spanner architecture
+* Offers horizontal write scalability, strong write consistency and tunable read consistency (strong reads by default with follower & observer reads as options)
+* Extremely resilient with native failover and repair - can tolerate disk, node, zone and region failures automatically
+* Supports geo-distributed deployments (multi-zone, multi-region, multi-cloud)
+* Built-in enterprise features such as distributed backups, in-flight/at-rest encryption and read replicas (for observer reads)
+* Can be deployed in public clouds and natively inside Kubernetes
+* Best fit for powering massively-scalable, globally-distributed, cloud-native applications that require absolute data correctness and high tolerance to failures
+* 100% open source under the [Apache 2.0 license](https://github.com/yugabyte/yugabyte-db/blob/master/LICENSE.md)
 
-Update packages on your system, install development tools and additional packages:
+Read more about YugabyteDB in our [Docs](https://docs.yugabyte.com/latest/introduction/).
 
-```bash
-sudo yum update
-sudo yum groupinstall -y 'Development Tools'
-sudo yum install -y ruby perl-Digest epel-release cyrus-sasl-devel cyrus-sasl-plain ccache
-sudo yum install -y cmake3 ctest3
-```
+# Get Started
 
-Also we expect `cmake` / `ctest` binaries to be at least version 3. On CentOS one way to achive
-this is to symlink them into `/usr/local/bin`.
+* [Install YugabyteDB](https://docs.yugabyte.com/latest/quick-start/install/)
+* [Create a local cluster](https://docs.yugabyte.com/latest/quick-start/create-local-cluster/)
+* [Connect and try out SQL commands](https://docs.yugabyte.com/latest/quick-start/explore-ysql/)
+* [Build an app](https://docs.yugabyte.com/latest/quick-start/build-apps/) using a PostgreSQL-compatible driver or ORM.
+* Try a real-world app:
+    * [Microservices-oriented e-commerce app](https://github.com/yugabyte/yugastore-java)
+    * [Streaming IoT app with Kafka and Spark Streaming](https://docs.yugabyte.com/latest/develop/realworld-apps/iot-spark-kafka-ksql/)
 
-```bash
-sudo ln -s /usr/bin/cmake3 /usr/local/bin/cmake
-sudo ln -s /usr/bin/ctest3 /usr/local/bin/ctest
-```
+Cannot find what you are looking for? Have a question? Please post your questions or comments on our Community [Slack](https://www.yugabyte.com/slack) or [Forum](https://forum.yugabyte.com).
 
-You could also symlink them into another directory that is on your PATH.
+# Build Apps
 
-We also use [Linuxbrew](https://github.com/linuxbrew/brew) to provide some of the third-party
-dependencies on CentOS. We install Linuxbrew in a separate directory, `~/.linuxbrew-yb-build`,
-so that it does not conflict with any other Linuxbrew installation on your workstation, and does
-not contain any unnecessary packages that would interfere with the build.
+YugabyteDB supports a number of languages and client drivers. Below is a brief list.
 
-```
-git clone git@github.com:linuxbrew/brew.git ~/.linuxbrew-yb-build
-~/.linuxbrew-yb-build/bin/brew install autoconf automake boost flex gcc libtool
-```
+| Language  | ORM | YSQL Drivers | YCQL Drivers |
+| --------- | --- | ------------ | ------------ |
+| Java  | [Spring/Hibernate](https://docs.yugabyte.com/latest/quick-start/build-apps/java/ysql-spring-data/) | [PostgreSQL JDBC](https://docs.yugabyte.com/latest/quick-start/build-apps/java/ysql-jdbc/) | [cassandra-driver-core-yb](https://docs.yugabyte.com/latest/quick-start/build-apps/java/ycql/)
+| Go  | [Gorm](https://github.com/yugabyte/orm-examples) | [pq](https://docs.yugabyte.com/latest/quick-start/build-apps/go/#ysql) | [gocql](https://docs.yugabyte.com/latest/quick-start/build-apps/go/#ycql)
+| NodeJS  | [Sequelize](https://github.com/yugabyte/orm-examples) | [pg](https://docs.yugabyte.com/latest/quick-start/build-apps/nodejs/#ysql) | [cassandra-driver](https://docs.yugabyte.com/latest/quick-start/build-apps/nodejs/#ycql)
+| Python  | [SQLAlchemy](https://github.com/yugabyte/orm-examples) | [psycopg2](https://docs.yugabyte.com/latest/quick-start/build-apps/python/#ysql) | [yb-cassandra-driver](https://docs.yugabyte.com/latest/quick-start/build-apps/python/#ycql)
+| Ruby  | [ActiveRecord](https://github.com/yugabyte/orm-examples) | [pg](https://docs.yugabyte.com/latest/quick-start/build-apps/ruby/#ysql) | [yugabyte-ycql-driver](https://docs.yugabyte.com/latest/quick-start/build-apps/ruby/#ycql)
+| C#  | [EntityFramework](https://github.com/yugabyte/orm-examples) | [npgsql](http://www.npgsql.org/) | [CassandraCSharpDriver](https://docs.yugabyte.com/latest/quick-start/build-apps/csharp/#ycql)
+| C++ | Not tested | [libpqxx](https://docs.yugabyte.com/latest/quick-start/build-apps/cpp/#ysql) | [cassandra-cpp-driver](https://docs.yugabyte.com/latest/quick-start/build-apps/cpp/#ycql)
+| C   | Not tested | [libpq](https://docs.yugabyte.com/latest/quick-start/build-apps/c/#ysql) | Not tested
 
-We don't need to add `~/.linuxbrew-yb-build/bin` to PATH. The build scripts will automatically
-discover this Linuxbrew installation.
+# Architecture
 
-### Mac OS X
+<img src="https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/architecture/images/yb-architecture.jpg" align="center" alt="YugabyteDB Architecture"/>
 
-Install [Homebrew](https://brew.sh/):
+Review detailed architecture in our [Docs](https://docs.yugabyte.com/latest/architecture/).
 
-```bash
-/usr/bin/ruby -e "$(
-  curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
-```
+# Need Help?
 
-Install the following packages using Homebrew:
-```
-brew install autoconf automake bash bison boost ccache cmake coreutils flex gnu-tar libtool \
-             pkg-config pstree wget zlib
-```
+* You can ask questions, find answers, help others on our Community [Slack](https://www.yugabyte.com/slack) and [Forum](https://forum.yugabyte.com) as well as [Stack Overflow](https://stackoverflow.com/questions/tagged/yugabyte-db)
 
-Also YugaByte build scripts rely on Bash 4. Make sure that `which bash` outputs
-`/usr/local/bin/bash` before proceeding. You may need to put `/usr/local/bin` as the first directory
-on PATH in your `~/.bashrc` to achieve that.
+* Please use [GitHub issues](https://github.com/yugabyte/yugabyte-db/issues) to report issues.
 
-### All platforms: Java prerequisites
+# Contribute
 
-YugaByte core is written in C++, but the repository contains Java code needed to run sample
-applications. To build the Java part, you need:
-* JDK 8
-* [Apache Maven](https://maven.apache.org/).
+As an open source project with a strong focus on the user community, we welcome contributions as GitHub pull requests. See our [Contributor Guides](https://docs.yugabyte.com/latest/contribute/) to get going. Discussions and RFCs for features happen on the design discussions section of [our Forum](https://forum.yugabyte.com).
 
-Also make sure Maven's `bin` directory is added to your PATH, e.g. by adding to your `~/.bashrc`
-```
-export PATH=$HOME/tools/apache-maven-3.5.0/bin:$PATH
-```
-if you've installed Maven into `~/tools/apache-maven-3.5.0`.
+# License
 
-For building YugaByte Java code, you'll need to install Java and Apache Maven.
+Source code in this repository is variously licensed under the Apache License 2.0 and the Polyform Free Trial License 1.0.0. A copy of each license can be found in the [licenses](licenses) directory.
 
-### Java Driver
+The build produces two sets of binaries:
+* The entire database with all its features (including the enterprise ones) are licensed under the Apache License 2.0
+* The  binaries that contain `-managed` in the artifact and help run a managed service are licensed under the Polyform Free Trial License 1.0.0.
 
-YugaByte and Apache Cassandra use different approaches to split data between nodes. In order to
-route client requests to the right server without extra hops, we provide a [custom
-LoadBalancingPolicy](https://goo.gl/At7kvu) in [our modified version
-](https://github.com/yugabyte/cassandra-java-driver) of Datastax's Apache Cassandra Java driver.
+> By default, the build options generate only the Apache License 2.0 binaries.
 
-The latest version of our driver is available on Maven Central. You can build your application
-using our driver by adding the following Maven dependency to your application:
 
-```
-<dependency>
-  <groupId>com.yugabyte</groupId>
-  <artifactId>cassandra-driver-core</artifactId>
-  <version>3.2.0-yb-8</version>
-</dependency>
-```
+# Read More
 
-## Building YugaByte code
-
-Assuming this repository is checked out in `~/code/yugabyte-db`, do the following:
-
-```
-cd ~/code/yugabyte-db
-./yb_build.sh release --with-assembly
-```
-
-The above command will build the release configuration, put the C++ binaries in
-`build/release-gcc-dynamic-community`, and will also create the `build/latest` symlink to that
-directory. Then it will build the Java code as well. The `--with-assembly` flag tells the build
-script to build the `yb-sample-apps.jar` file containing sample Java apps.
-
-## Running a Local Cluster
-
-Now you can follow the [Communty Edition Quick Start / Create local cluster
-](http://docs.yugabyte.com/community-edition/quick-start/#create-local-cluster) tutorial
-to create a local cluster and test it using Apache CQL shell and Redis clients, as well as run
-the provied Java sample apps.
-
-## Reporting Issues
-
-Please use [GitHub issues](https://github.com/YugaByte/yugabyte-db/issues) to report issues.
-Also feel free to post on the [YugaByte Community Forum](http://forum.yugabyte.com).
-
-## Contributing
-
-We accept contributions as GitHub pull requests. Our code style is available
-[here](https://goo.gl/Hkt5BU)
-(mostly based on [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)).
-
-## License
-
-YugaByte Community Edition is distributed under an Apache 2.0 license. See the
-[LICENSE.txt](https://github.com/YugaByte/yugabyte-db/blob/master/LICENSE.txt) file for
-details.
+* To see our updates, go to [The Distributed SQL Blog](https://blog.yugabyte.com/).
+* See how YugabyteDB [compares with other databases](https://docs.yugabyte.com/latest/comparisons/). 

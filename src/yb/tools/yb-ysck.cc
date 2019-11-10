@@ -40,6 +40,7 @@
 
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/rpc/messenger.h"
 #include "yb/tools/ysck_remote.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
@@ -90,11 +91,10 @@ static string GetYsckUsage(const char* progname) {
 // Error information is appended to the provided vector.
 // If the vector is empty upon completion, ysck ran successfully.
 static void RunYsck(vector<string>* error_messages) {
-  std::vector<Endpoint> master_addrs;
-  PUSH_PREPEND_NOT_OK(ParseAddressList(FLAGS_master_address,
-                                       master::kMasterDefaultPort,
-                                       &master_addrs),
-                      error_messages, "Unable to parse master address");
+  std::vector<HostPort> master_addrs;
+  PUSH_PREPEND_NOT_OK(
+      HostPort::ParseStrings(FLAGS_master_address, master::kMasterDefaultPort, &master_addrs),
+      error_messages, "Unable to parse master address");
 
   shared_ptr<YsckMaster> master;
   PUSH_PREPEND_NOT_OK(RemoteYsckMaster::Build(master_addrs[0], &master),

@@ -13,18 +13,29 @@
 
 #include "yb/integration-tests/load_generator.h"
 
-#include <gflags/gflags_declare.h>
 #include <memory>
 #include <queue>
 #include <random>
 #include <thread>
 
-#include "cpp_redis/redis_client.hpp"
-#include "cpp_redis/reply.hpp"
+#include <gflags/gflags_declare.h>
+
+#include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/session.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
+
 #include "yb/common/common.pb.h"
+#include "yb/common/partial_row.h"
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/yql/redis/redisserver/redis_client.h"
+
 #include "yb/util/atomic.h"
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
@@ -33,6 +44,8 @@
 #include "yb/util/stopwatch.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/threadlocal.h"
+
+using namespace std::literals;
 
 using std::atomic;
 using std::atomic_bool;
@@ -57,14 +70,10 @@ using yb::TableType;
 using yb::client::YBClient;
 using yb::client::YBError;
 using yb::client::YBNoOp;
-using yb::client::YBPredicate;
-using yb::client::KuduInsert;
 using yb::client::YBSession;
-using yb::client::YBScanBatch;
-using yb::client::YBScanner;
-using yb::client::YBRowResult;
 using yb::client::YBTable;
 using yb::client::YBValue;
+using yb::redisserver::RedisReply;
 
 DEFINE_bool(load_gen_verbose,
             false,
@@ -87,10 +96,7 @@ DEFINE_int32(load_gen_wait_time_increment_step_ms,
 namespace {
 
 void ConfigureYBSession(YBSession* session) {
-  CHECK_OK(session->SetFlushMode(YBSession::FlushMode::MANUAL_FLUSH));
-  session->SetTimeoutMillis(60000);
-  CHECK_OK(
-      session->SetExternalConsistencyMode(YBSession::ExternalConsistencyMode::CLIENT_PROPAGATED));
+  session->SetTimeout(60s);
 }
 
 string FormatWithSize(const string& s) {
@@ -166,10 +172,10 @@ ostream& operator <<(ostream& out, const KeyIndexSet &key_index_set) {
 // SessionFactory
 // ------------------------------------------------------------------------------------------------
 
-YBSessionFactory::YBSessionFactory(yb::client::YBClient* client, yb::client::YBTable* table)
+YBSessionFactory::YBSessionFactory(client::YBClient* client, client::TableHandle* table)
     : client_(client), table_(table) {}
 
-string YBSessionFactory::ClientId() { return client_->client_id(); }
+string YBSessionFactory::ClientId() { return client_->id().ToString(); }
 
 SingleThreadedWriter* YBSessionFactory::GetWriter(MultiThreadedWriter* writer, int idx) {
   return new YBSingleThreadedWriter(writer, client_, table_, idx);
@@ -286,6 +292,7 @@ void MultiThreadedWriter::WaitForCompletion() {
 
 void MultiThreadedWriter::RunActionThread(int writer_index) {
   unique_ptr<SingleThreadedWriter> writer(session_factory_->GetWriter(this, writer_index));
+  writer->set_pause_flag(pause_flag_);
   writer->Run();
 
   LOG(INFO) << "Writer thread " << writer_index << " finished";
@@ -296,6 +303,10 @@ void SingleThreadedWriter::Run() {
   LOG(INFO) << "Writer thread " << writer_index_ << " started";
   ConfigureSession();
   while (!multi_threaded_writer_->IsStopRequested()) {
+    if (pause_flag_ && pause_flag_->load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(10ms);
+      continue;
+    }
     int64_t key_index = multi_threaded_writer_->next_key_++;
     if (key_index >= multi_threaded_writer_->num_keys_) {
       break;
@@ -326,14 +337,9 @@ void ConfigureRedisSessions(
   std::vector<string> addresses;
   SplitStringUsing(redis_server_addresses, ",", &addresses);
   for (auto& addr : addresses) {
-    shared_ptr<RedisClient> client(new RedisClient());
-    auto remote = ParseEndpoint(addr, 6379);
-    CHECK_OK(remote);
-    auto endpoint = *remote;
-    client->connect(remote->address().to_string(), remote->port(), [endpoint](RedisClient&) {
-      LOG(ERROR) << "client disconnected (disconnection handler) from " << endpoint;
-    });
-    clients->push_back(client);
+    auto remote = CHECK_RESULT(ParseEndpoint(addr, 6379));
+    clients->push_back(std::make_shared<RedisClient>(
+        remote.address().to_string(), remote.port()));
   }
 }
 
@@ -344,11 +350,10 @@ void RedisSingleThreadedWriter::ConfigureSession() {
 bool RedisSingleThreadedWriter::Write(
     int64_t key_index, const string& key_str, const string& value_str) {
   bool success = false;
-  auto* multi_writer = multi_threaded_writer_;
   auto writer_index = writer_index_;
   int64_t idx = key_index % clients_.size();
-  clients_[idx]->set(
-      key_str, value_str, [&success, multi_writer, key_index, writer_index](RedisReply& reply) {
+  clients_[idx]->Send(
+      {"SET", key_str, value_str}, [&success, key_index, writer_index](const RedisReply& reply) {
         if ("OK" == reply.as_string()) {
           VLOG(2) << "Writer " << writer_index << " Successfully inserted key #" << key_index
                   << " into redis ";
@@ -358,7 +363,7 @@ bool RedisSingleThreadedWriter::Write(
           success = false;
         }
       });
-  clients_[idx]->sync_commit();
+  clients_[idx]->Commit();
 
   return success;
 }
@@ -369,7 +374,7 @@ void RedisSingleThreadedWriter::HandleInsertionFailure(int64_t key_index, const 
 
 void RedisSingleThreadedWriter::CloseSession() {
   for (auto client : clients_) {
-    client->disconnect();
+    client->Disconnect();
   }
 }
 
@@ -378,7 +383,7 @@ bool RedisNoopSingleThreadedWriter::Write(
   bool success = false;
   auto writer_index = writer_index_;
   int64_t idx = key_index % clients_.size();
-  clients_[idx]->echo("OK", [&success, key_index, writer_index](RedisReply& reply) {
+  clients_[idx]->Send({"ECHO", "OK"}, [&success, key_index, writer_index](const RedisReply& reply) {
     if ("OK" == reply.as_string()) {
       VLOG(2) << "Writer " << writer_index << " Successfully inserted key #" << key_index
               << " into redis ";
@@ -388,7 +393,7 @@ bool RedisNoopSingleThreadedWriter::Write(
       success = false;
     }
   });
-  clients_[idx]->sync_commit();
+  clients_[idx]->Commit();
 
   return success;
 }
@@ -400,31 +405,43 @@ void YBSingleThreadedWriter::ConfigureSession() {
 
 bool YBSingleThreadedWriter::Write(
     int64_t key_index, const string& key_str, const string& value_str) {
-  shared_ptr<KuduInsert> insert(table_->NewInsert());
+  auto insert = table_->NewInsertOp();
   // Generate a Put for key_str, value_str
-  CHECK_OK(insert->mutable_row()->SetBinary("k", key_str.c_str()));
-  CHECK_OK(insert->mutable_row()->SetBinary("v", value_str.c_str()));
+  QLAddStringHashValue(insert->mutable_request(), key_str);
+  table_->AddStringColumnValue(insert->mutable_request(), "v", value_str);
   // submit a the put to apply.
   // If successful, add to inserted
   Status apply_status = session_->Apply(insert);
-  if (apply_status.ok()) {
-    Status flush_status = session_->Flush();
-    if (flush_status.ok()) {
-      multi_threaded_writer_->inserted_keys_.Insert(key_index);
-      VLOG(2) << "Successfully inserted key #" << key_index << " at hybrid_time "
-              << client_->GetLatestObservedHybridTime() << " or earlier";
-    } else {
-      LOG(WARNING) << "Error inserting key '" << key_str << "': "
-                   << "Flush() failed"
-                   << " (" << flush_status.ToString() << ")";
-      return false;
-    }
-  } else {
+  if (!apply_status.ok()) {
     LOG(WARNING) << "Error inserting key '" << key_str << "': "
                  << "Apply() failed"
                  << " (" << apply_status.ToString() << ")";
     return false;
   }
+  Status flush_status = session_->Flush();
+  if (!flush_status.ok()) {
+    for (const auto& error : session_->GetPendingErrors()) {
+      // It means that key was actually written successfully, but our retry failed because
+      // it was detected as duplicate request.
+      if (error->status().IsAlreadyPresent()) {
+        return true;
+      }
+      LOG(WARNING) << "Error inserting key '" << key_str << "': " << error->status();
+    }
+
+    LOG(WARNING) << "Error inserting key '" << key_str << "': "
+                 << "Flush() failed (" << flush_status << ")";
+    return false;
+  }
+  if (insert->response().status() != QLResponsePB::YQL_STATUS_OK) {
+    LOG(WARNING) << "Error inserting key '" << key_str << "': "
+                 << insert->response().error_message();
+    return false;
+  }
+
+  multi_threaded_writer_->inserted_keys_.Insert(key_index);
+  VLOG(2) << "Successfully inserted key #" << key_index << " at hybrid_time "
+          << client_->GetLatestObservedHybridTime() << " or earlier";
 
   return true;
 }
@@ -473,23 +490,13 @@ void MultiThreadedWriter::RunInsertionTrackerThread() {
 // SingleThreadedScanner
 // ------------------------------------------------------------------------------------------------
 
-SingleThreadedScanner::SingleThreadedScanner(YBTable* table)
-    : table_(table),
-      num_rows_(0) {
-}
+SingleThreadedScanner::SingleThreadedScanner(client::TableHandle* table) : table_(table) {}
 
 int64_t SingleThreadedScanner::CountRows() {
-  YBScanner scanner(table_);
-  CHECK_OK(scanner.Open());
-  vector<YBRowResult> results;
-  while (scanner.HasMoreRows()) {
-    CHECK_OK(scanner.NextBatch(&results));
-    num_rows_ += results.size();
-    results.clear();
-  }
+  auto result = boost::size(client::TableRange(*table_));
 
-  LOG(INFO) << " num read rows = " << num_rows_;
-  return num_rows_;
+  LOG(INFO) << " num read rows = " << result;
+  return result;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -558,7 +565,7 @@ void RedisSingleThreadedReader::ConfigureSession() {
 
 void RedisSingleThreadedReader::CloseSession() {
   for (auto client : clients_) {
-    client->disconnect();
+    client->Disconnect();
   }
 }
 
@@ -569,7 +576,7 @@ void YBSingleThreadedReader::ConfigureSession() {
 
 bool NoopSingleThreadedWriter::Write(
     int64_t key_index, const string& key_str, const string& value_str) {
-  YBNoOp noop(table_);
+  YBNoOp noop(table_->get());
   gscoped_ptr<YBPartialRow> row(table_->schema().NewRow());
   CHECK_OK(row->SetBinary("k", key_str));
   Status s = noop.Execute(*row);
@@ -583,56 +590,58 @@ bool NoopSingleThreadedWriter::Write(
 ReadStatus YBSingleThreadedReader::PerformRead(
     int64_t key_index, const string& key_str, const string& expected_value_str) {
   uint64_t read_ts = client_->GetLatestObservedHybridTime();
-  YBScanner scanner(table_);
-  CHECK_OK(scanner.SetSelection(YBClient::ReplicaSelection::LEADER_ONLY));
-  CHECK_OK(scanner.SetProjectedColumns({ "k", "v" }));
-  CHECK_OK(scanner.AddConjunctPredicate(
-      table_->NewComparisonPredicate("k", YBPredicate::EQUAL, YBValue::CopyString(key_str))));
 
-  Status scanner_open_status = scanner.Open();
-  for (int i = 1;
-       i <= FLAGS_load_gen_scanner_open_retries && !scanner_open_status.ok();
-       ++i) {
-    LOG(ERROR) << "Failed to open scanner: " << scanner_open_status.ToString() << ", re-trying.";
-    SleepFor(MonoDelta::FromMilliseconds(FLAGS_load_gen_wait_time_increment_step_ms * i));
-    scanner_open_status = scanner.Open();
-  }
-  CHECK_OK(scanner_open_status);
-
-  if (!scanner.HasMoreRows()) {
-    LOG(ERROR) << "No rows found for key #" << key_index << " (read hybrid_time: " << read_ts
-               << ")";
-    // We don't increment the read error count here because the caller may retry up to the
-    // configured number of times in this case.
-    return ReadStatus::NO_ROWS;
-  }
-
-  vector<YBScanBatch::RowPtr> rows;
-  CHECK_OK(scanner.NextBatch(&rows));
-  if (rows.size() != 1) {
-    LOG(ERROR) << "Found an invalid number of rows for key #" << key_index << ": " << rows.size()
-               << " (expected to find 1 row), read hybrid_time: " << read_ts;
-    multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
-    return ReadStatus::OTHER_ERROR;
-  }
-
-  Slice returned_key, returned_value;
-  CHECK_OK(rows.front().GetBinary("k", &returned_key));
-  if (returned_key != key_str) {
-    LOG(ERROR) << "Invalid key returned by the read operation: '" << returned_key << "', "
-               << "expected: '" << key_str << "', read hybrid_time: " << read_ts;
-    multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
-    return ReadStatus::OTHER_ERROR;
-  }
-
-  CHECK_OK(rows.front().GetBinary("v", &returned_value));
-  if (returned_value != expected_value_str) {
-    LOG(ERROR) << "Invalid value returned by the read operation for key '" << key_str
-               << "': " << FormatWithSize(returned_value.ToString())
-               << ", expected: " << FormatWithSize(expected_value_str)
-               << ", read hybrid_time: " << read_ts;
-    multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
-    return ReadStatus::OTHER_ERROR;
+  for (int i = 1;; ++i) {
+    auto read_op = table_->NewReadOp();
+    QLAddStringHashValue(read_op->mutable_request(), key_str);
+    table_->AddColumns({"k", "v"}, read_op->mutable_request());
+    auto status = session_->ApplyAndFlush(read_op);
+    boost::optional<QLRowBlock> row_block;
+    if (status.ok()) {
+      auto result = read_op->MakeRowBlock();
+      if (!result.ok()) {
+        status = std::move(result.status());
+      } else {
+        row_block = std::move(*result);
+      }
+    }
+    if (!status.ok()) {
+      LOG(ERROR) << "Failed to read: " << status << ", re-trying.";
+      if (i >= FLAGS_load_gen_scanner_open_retries) {
+        CHECK_OK(status);
+      }
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_load_gen_wait_time_increment_step_ms * i));
+      continue;
+    }
+    if (row_block->row_count() == 0) {
+      LOG(ERROR) << "No rows found for key #" << key_index
+                 << " (read hybrid_time: " << read_ts << ")";
+      return ReadStatus::NO_ROWS;
+    }
+    if (row_block->row_count() != 1) {
+      LOG(ERROR) << "Found an invalid number of rows for key #" << key_index << ": "
+                 << row_block->row_count() << " (expected to find 1 row), read hybrid_time: "
+                 << read_ts;
+      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
+      return ReadStatus::OTHER_ERROR;
+    }
+    auto row = row_block->rows()[0];
+    if (row.column(0).binary_value() != key_str) {
+      LOG(ERROR) << "Invalid key returned by the read operation: '" << row.column(0).binary_value()
+                 << "', expected: '" << key_str << "', read hybrid_time: " << read_ts;
+      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
+      return ReadStatus::OTHER_ERROR;
+    }
+    auto returned_value = row.column(1).binary_value();
+    if (returned_value != expected_value_str) {
+      LOG(ERROR) << "Invalid value returned by the read operation for key '" << key_str
+                 << "': " << FormatWithSize(returned_value)
+                 << ", expected: " << FormatWithSize(expected_value_str)
+                 << ", read hybrid_time: " << read_ts;
+      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
+      return ReadStatus::OTHER_ERROR;
+    }
+    break;
   }
 
   return ReadStatus::OK;
@@ -644,10 +653,12 @@ ReadStatus RedisSingleThreadedReader::PerformRead(
     int64_t key_index, const string& key_str, const string& expected_value_str) {
   string value_str;
   int64_t idx = key_index % clients_.size();
-  clients_[idx]->get(key_str, [&value_str](RedisReply& reply) { value_str = reply.as_string(); });
+  clients_[idx]->Send({"GET", key_str}, [&value_str](const RedisReply& reply) {
+    value_str = reply.as_string();
+  });
   VLOG(3) << "Trying to read key #" << key_index << " from redis "
           << " key : " << key_str;
-  clients_[idx]->sync_commit();
+  clients_[idx]->Commit();
 
   if (expected_value_str != value_str) {
     LOG(INFO) << "Read the wrong value for #" << key_index << " from redis "
@@ -697,31 +708,31 @@ int64_t SingleThreadedReader::NextKeyIndexToRead(std::mt19937_64* random_number_
   VLOG(3) << "Reader thread " << reader_index_ << " waiting to load insertion point";
   int64_t written_up_to = multi_threaded_reader_->insertion_point_->load();
   do {
-        VLOG(3) << "Reader thread " << reader_index_ << " coin toss";
-        switch ((*random_number_generator)() % 3) {
-          case 0:
-            // Read the latest value that the insertion tracker knows we've written up to.
-            key_index = written_up_to;
-            break;
-          case 1:
-            // Read one of the keys that have been successfully inserted but have not been processed
-            // by the insertion tracker thread yet.
-            key_index =
-                multi_threaded_reader_->inserted_keys_->GetRandomKey(random_number_generator);
-            if (key_index == -1) {
-              // The set is empty.
-              key_index = written_up_to;
-            }
-            break;
-
-          default:
-            // We're assuming the total number of keys is < RAND_MAX (~2 billion) here.
-            key_index = (*random_number_generator)() % (written_up_to + 1);
-            break;
+    VLOG(3) << "Reader thread " << reader_index_ << " coin toss";
+    switch ((*random_number_generator)() % 3) {
+      case 0:
+        // Read the latest value that the insertion tracker knows we've written up to.
+        key_index = written_up_to;
+        break;
+      case 1:
+        // Read one of the keys that have been successfully inserted but have not been processed
+        // by the insertion tracker thread yet.
+        key_index =
+            multi_threaded_reader_->inserted_keys_->GetRandomKey(random_number_generator);
+        if (key_index == -1) {
+          // The set is empty.
+          key_index = written_up_to;
         }
-        // Ensure we don't try to read a key for which a write failed.
-      } while (multi_threaded_reader_->failed_keys_->Contains(key_index) &&
-               !multi_threaded_reader_->IsStopRequested());
+        break;
+
+      default:
+        // We're assuming the total number of keys is < RAND_MAX (~2 billion) here.
+        key_index = (*random_number_generator)() % (written_up_to + 1);
+        break;
+    }
+    // Ensure we don't try to read a key for which a write failed.
+  } while (multi_threaded_reader_->failed_keys_->Contains(key_index) &&
+           !multi_threaded_reader_->IsStopRequested());
 
   VLOG(1) << "Reader thread " << reader_index_ << " saw written_up_to=" << written_up_to
           << " and picked key #" << key_index;

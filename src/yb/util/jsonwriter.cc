@@ -54,8 +54,12 @@ namespace yb {
 // Since Squeasel exposes a stringstream as its interface, this is needed to avoid overcopying.
 class UTF8StringStreamBuffer {
  public:
+  typedef typename rapidjson::UTF8<>::Ch Ch;
   explicit UTF8StringStreamBuffer(std::stringstream* out);
-  void Put(rapidjson::UTF8<>::Ch c);
+  void Put(Ch c);
+
+  void PutUnsafe(Ch c) { Put(c); }
+  void Flush() {}
  private:
   std::stringstream* out_;
 };
@@ -187,7 +191,8 @@ void JsonWriter::Protobuf(const Message& pb) {
     String(field->name());
     if (field->is_repeated()) {
       StartArray();
-      for (int i = 0; i < reflection->FieldSize(pb, field); i++) {
+      auto field_size = reflection->FieldSize(pb, field);
+      for (int i = 0; i < field_size; i++) {
         ProtobufRepeatedField(pb, field, i);
       }
       EndArray();

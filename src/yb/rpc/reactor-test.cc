@@ -32,15 +32,17 @@
 
 #include "yb/rpc/reactor.h"
 
+#include <thread>
+
 #include "yb/rpc/rpc-test-base.h"
 #include "yb/util/countdown_latch.h"
 
+using std::shared_ptr;
+using namespace std::literals;
+using namespace std::placeholders;
 
 namespace yb {
 namespace rpc {
-
-using std::shared_ptr;
-using namespace std::placeholders;
 
 MessengerOptions MakeMessengerOptions() {
   auto result = kDefaultClientMessengerOptions;
@@ -51,54 +53,59 @@ MessengerOptions MakeMessengerOptions() {
 class ReactorTest : public RpcTestBase {
  public:
   ReactorTest()
-    : messenger_(CreateMessenger("my_messenger", MakeMessengerOptions())),
+    : messenger_(CreateMessenger("my_messenger", MakeMessengerOptions()).release()),
       latch_(1) {
   }
 
   void ScheduledTask(const Status& status, const Status& expected_status) {
-    CHECK_EQ(expected_status.CodeAsString(), status.CodeAsString());
+    ASSERT_EQ(expected_status.CodeAsString(), status.CodeAsString());
     latch_.CountDown();
   }
 
   void ScheduledTaskCheckThread(const Status& status, const Thread* thread) {
-    CHECK_OK(status);
-    CHECK_EQ(thread, Thread::current_thread());
+    ASSERT_OK(status);
+    ASSERT_EQ(thread, Thread::current_thread());
     latch_.CountDown();
   }
 
   void ScheduledTaskScheduleAgain(const Status& status) {
-    messenger_->ScheduleOnReactor(
+    auto task_id = messenger_->ScheduleOnReactor(
         std::bind(&ReactorTest::ScheduledTaskCheckThread, this, _1, Thread::current_thread()),
-        MonoDelta::FromMilliseconds(0));
+        0s, SOURCE_LOCATION(), nullptr /* messenger */);
+    ASSERT_EQ(task_id, 0);
     latch_.CountDown();
   }
 
  protected:
-  const shared_ptr<Messenger> messenger_;
+  AutoShutdownMessengerHolder messenger_;
   CountDownLatch latch_;
 };
 
 TEST_F(ReactorTest, TestFunctionIsCalled) {
-  messenger_->ScheduleOnReactor(
-      std::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()), MonoDelta::FromSeconds(0));
+  auto task_id = messenger_->ScheduleOnReactor(
+      std::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()), 0s,
+      SOURCE_LOCATION(), nullptr /* messenger */);
+  ASSERT_EQ(task_id, 0);
   latch_.Wait();
 }
 
 TEST_F(ReactorTest, TestFunctionIsCalledAtTheRightTime) {
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
-  messenger_->ScheduleOnReactor(
+  MonoTime before = MonoTime::Now();
+  auto task_id = messenger_->ScheduleOnReactor(
       std::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()),
-      MonoDelta::FromMilliseconds(100));
+      100ms, SOURCE_LOCATION(), nullptr /* messenger */);
+  ASSERT_EQ(task_id, 0);
   latch_.Wait();
-  MonoTime after = MonoTime::Now(MonoTime::FINE);
+  MonoTime after = MonoTime::Now();
   MonoDelta delta = after.GetDeltaSince(before);
   CHECK_GE(delta.ToMilliseconds(), 100);
 }
 
 TEST_F(ReactorTest, TestFunctionIsCalledIfReactorShutdown) {
-  messenger_->ScheduleOnReactor(
+  auto task_id = messenger_->ScheduleOnReactor(
       std::bind(&ReactorTest::ScheduledTask, this, _1, STATUS(Aborted, "doesn't matter")),
-      MonoDelta::FromSeconds(60));
+      60s, SOURCE_LOCATION(), nullptr /* messenger */);
+  ASSERT_EQ(task_id, 0);
   messenger_->Shutdown();
   latch_.Wait();
 }
@@ -107,8 +114,10 @@ TEST_F(ReactorTest, TestReschedulesOnSameReactorThread) {
   // Our scheduled task will schedule yet another task.
   latch_.Reset(2);
 
-  messenger_->ScheduleOnReactor(
-      std::bind(&ReactorTest::ScheduledTaskScheduleAgain, this, _1), MonoDelta::FromSeconds(0));
+  auto task_id = messenger_->ScheduleOnReactor(
+      std::bind(&ReactorTest::ScheduledTaskScheduleAgain, this, _1), 0s,
+      SOURCE_LOCATION(), nullptr /* messenger */);
+  ASSERT_EQ(task_id, 0);
   latch_.Wait();
   latch_.Wait();
 }

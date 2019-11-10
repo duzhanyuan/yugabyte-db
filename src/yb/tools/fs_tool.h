@@ -41,18 +41,15 @@
 
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/util/status.h"
-#include "yb/tablet/delta_key.h"
 
 namespace yb {
 
 class FsManager;
 class Schema;
-class BlockId;
 class RandomAccessFile;
 
 namespace tablet {
-class TabletMetadata;
-class RowSetMetadata;
+class RaftGroupMetadata;
 }
 
 namespace tools {
@@ -100,66 +97,17 @@ class FsTool {
   // Prints the header for a log segment residing in 'path'.
   CHECKED_STATUS PrintLogSegmentHeader(const std::string& path, int indent);
 
-  // Lists blocks for a tablet organized by rowset.
-  CHECKED_STATUS ListBlocksForTablet(const std::string& tablet_id);
-
-  // Lists blocks for all tablets.
-  CHECKED_STATUS ListBlocksForAllTablets();
-
   // Prints the tablet metadata for a tablet 'tablet_id'.
   CHECKED_STATUS PrintTabletMeta(const std::string& tablet_id, int indent);
 
-  // Dumps the blocks that make up a tablet, rowset by rowset. This ends up
-  // outputting on a column-by-column basis, as close as possible to the raw
-  // storage. See also: DumpRowSet().
-  CHECKED_STATUS DumpTabletBlocks(const std::string& tablet_id,
-                    const DumpOptions& opts,
-                    int indent);
-
   // Dump the data stored in a tablet. The output here is much more readable
-  // than DumpTabletBlocks, since it reconstructs rows and associates undo/redo deltas
-  // with those rows.
+  // than DumpTabletBlocks, since it reconstructs docdb values.
   CHECKED_STATUS DumpTabletData(const std::string& tablet_id);
-
-  // Dumps column blocks, all types of delta blocks for a given
-  // rowset.
-  CHECKED_STATUS DumpRowSet(const std::string& tablet_id,
-                    int64_t rowset_id,
-                    const DumpOptions& opts,
-                    int indent);
-
-  CHECKED_STATUS DumpCFileBlock(const std::string& block_id,
-                        const DumpOptions& opts,
-                        int indent);
 
   // Prints the server's UUID to whom the data belongs and nothing else.
   CHECKED_STATUS PrintUUID(int indent);
  private:
   CHECKED_STATUS ListSegmentsInDir(const std::string& segments_dir);
-
-  CHECKED_STATUS ListBlocksInRowSet(const Schema& schema,
-                            const tablet::RowSetMetadata& rs_meta);
-
-  CHECKED_STATUS DumpRowSetInternal(const Schema& schema,
-                            const std::shared_ptr<tablet::RowSetMetadata>& rs_meta,
-                            const DumpOptions& opts,
-                            int indent);
-
-  CHECKED_STATUS DumpCFileBlockInternal(const BlockId& block_id,
-                                const DumpOptions& opts,
-                                int indent);
-
-  CHECKED_STATUS DumpDeltaCFileBlockInternal(const Schema& schema,
-                                     const std::shared_ptr<tablet::RowSetMetadata>& rs_meta,
-                                     const BlockId& block_id,
-                                     tablet::DeltaType delta_type,
-                                     const DumpOptions& opts,
-                                     int indent,
-                                     bool metadata_only);
-
-  CHECKED_STATUS OpenBlockAsFile(const BlockId& block_id,
-                         uint64_t* file_size,
-                         std::shared_ptr<RandomAccessFile>* block_reader);
 
   bool initialized_;
   const DetailLevel detail_level_;

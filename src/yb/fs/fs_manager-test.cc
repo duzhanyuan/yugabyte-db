@@ -34,7 +34,6 @@
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
-#include "yb/fs/block_manager.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/gutil/strings/util.h"
 #include "yb/util/metrics.h"
@@ -78,28 +77,9 @@ class FsManagerTestBase : public YBTest {
     fs_manager_.reset(new FsManager(env_.get(), opts));
   }
 
-  void TestReadWriteDataFile(const Slice& data) {
-    uint8_t buffer[64];
-    DCHECK_LT(data.size(), sizeof(buffer));
-
-    // Test Write
-    gscoped_ptr<fs::WritableBlock> writer;
-    ASSERT_OK(fs_manager()->CreateNewBlock(&writer));
-    ASSERT_OK(writer->Append(data));
-    ASSERT_OK(writer->Close());
-
-    // Test Read
-    Slice result;
-    gscoped_ptr<fs::ReadableBlock> reader;
-    ASSERT_OK(fs_manager()->OpenBlock(writer->id(), &reader));
-    ASSERT_OK(reader->Read(0, data.size(), &result, buffer));
-    ASSERT_EQ(data.size(), result.size());
-    ASSERT_EQ(0, result.compare(data));
-  }
-
   void ValidateRootDataPaths(const string& data_path, const string& wal_path) {
     ASSERT_TRUE(HasPrefixString(fs_manager()->GetConsensusMetadataDir(), data_path));
-    ASSERT_TRUE(HasPrefixString(fs_manager()->GetTabletMetadataDir(), data_path));
+    ASSERT_TRUE(HasPrefixString(fs_manager()->GetRaftGroupMetadataDir(), data_path));
     vector<string> data_dirs = fs_manager()->GetDataRootDirs();
     ASSERT_EQ(1, data_dirs.size());
     ASSERT_TRUE(HasPrefixString(data_dirs[0], data_path));
@@ -132,22 +112,38 @@ class FsManagerTestBase : public YBTest {
     *out_opts = opts;
   }
 
+  void SetupForDelete(bool delete_logs_dir = false) {
+    string path = GetTestPath("new_fs_root");
+    ASSERT_OK(env_->CreateDir(path));
+
+    ReinitFsManager(vector <string> (), {path});
+    ASSERT_OK(fs_manager()->CreateInitialFileSystemLayout());
+    ValidateRootDataPaths(path, "");
+
+    log_dir_ = path + "/yb-data/logs";
+    ASSERT_OK(env_->CreateDir(log_dir_));
+    ASSERT_OK(fs_manager()->DeleteFileSystemLayout(delete_logs_dir));
+  }
+
+  void EnsureDataDirNotPresent() {
+    std::vector <std::string> data_dirs = fs_manager()->GetDataRootDirs();
+    for (auto data_dir : data_dirs) {
+      bool is_dir = false;
+      ASSERT_NOK(env_->IsDirectory(data_dir, &is_dir));
+      ASSERT_FALSE(is_dir);
+    }
+  }
+
   FsManager *fs_manager() const { return fs_manager_.get(); }
+
+  string log_dir() const { return log_dir_; }
 
   const char* kServerType = "tserver_test";
 
  private:
-  gscoped_ptr<FsManager> fs_manager_;
+  std::unique_ptr<FsManager> fs_manager_;
+  string log_dir_ = "";
 };
-
-TEST_F(FsManagerTestBase, TestBaseOperations) {
-  fs_manager()->DumpFileSystemTree(std::cout);
-
-  TestReadWriteDataFile(Slice("test0"));
-  TestReadWriteDataFile(Slice("test1"));
-
-  fs_manager()->DumpFileSystemTree(std::cout);
-}
 
 TEST_F(FsManagerTestBase, TestIllegalPaths) {
   vector<string> illegal = { "", "asdf", "/foo\n\t" };
@@ -194,8 +190,8 @@ TEST_F(FsManagerTestBase, TestListTablets) {
   ASSERT_OK(fs_manager()->ListTabletIds(&tablet_ids));
   ASSERT_EQ(0, tablet_ids.size());
 
-  string path = fs_manager()->GetTabletMetadataDir();
-  gscoped_ptr<WritableFile> writer;
+  string path = fs_manager()->GetRaftGroupMetadataDir();
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(
       JoinPathSegments(path, "foo.tmp"), &writer));
   ASSERT_OK(env_->NewWritableFile(
@@ -214,7 +210,7 @@ TEST_F(FsManagerTestBase, TestCannotUseNonEmptyFsRoot) {
   ReinitFsManager({ path }, { path });
   ASSERT_OK(fs_manager()->CreateInitialFileSystemLayout());
   {
-    gscoped_ptr<WritableFile> writer;
+    std::unique_ptr<WritableFile> writer;
     ASSERT_OK(env_->NewWritableFile(
         JoinPathSegments(GetServerTypeDataPath(path, kServerType), "some_file"), &writer));
   }
@@ -268,6 +264,26 @@ TEST_F(FsManagerTestBase, TestPathsFromFlags) {
     ASSERT_STR_CONTAINS(s.ToString(),
                         "List of data directories (fs_data_dirs) not provided");
   }
+}
+
+TEST_F(FsManagerTestBase, TestDataDirDeletedAndNotLogDir) {
+  SetupForDelete();
+
+  EnsureDataDirNotPresent();
+
+  bool is_dir = false;
+  ASSERT_OK(env_->IsDirectory(log_dir(), &is_dir));
+  ASSERT_TRUE(is_dir);
+}
+
+TEST_F(FsManagerTestBase, TestLogDirAlsoDeleted) {
+  SetupForDelete(true);
+
+  EnsureDataDirNotPresent();
+
+  bool is_dir = false;
+  ASSERT_NOK(env_->IsDirectory(log_dir(), &is_dir));
+  ASSERT_FALSE(is_dir);
 }
 
 } // namespace yb

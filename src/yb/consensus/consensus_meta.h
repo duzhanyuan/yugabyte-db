@@ -43,6 +43,7 @@
 namespace yb {
 
 class FsManager;
+class ServerRegistrationPB;
 
 namespace consensus {
 
@@ -74,19 +75,19 @@ class ConsensusMetadata {
   // Create a ConsensusMetadata object with provided initial state.
   // Encoded PB is flushed to disk before returning.
   static CHECKED_STATUS Create(FsManager* fs_manager,
-                       const std::string& tablet_id,
-                       const std::string& peer_uuid,
-                       const RaftConfigPB& config,
-                       int64_t current_term,
-                       gscoped_ptr<ConsensusMetadata>* cmeta);
+                               const std::string& tablet_id,
+                               const std::string& peer_uuid,
+                               const RaftConfigPB& config,
+                               int64_t current_term,
+                               std::unique_ptr<ConsensusMetadata>* cmeta);
 
   // Load a ConsensusMetadata object from disk.
   // Returns Status::NotFound if the file could not be found. May return other
   // Status codes if unable to read the file.
   static CHECKED_STATUS Load(FsManager* fs_manager,
-                     const std::string& tablet_id,
-                     const std::string& peer_uuid,
-                     gscoped_ptr<ConsensusMetadata>* cmeta);
+                             const std::string& tablet_id,
+                             const std::string& peer_uuid,
+                             std::unique_ptr<ConsensusMetadata>* cmeta);
 
   // Delete the ConsensusMetadata file associated with the given tablet from
   // disk.
@@ -153,6 +154,17 @@ class ConsensusMetadata {
   // Persist current state of the protobuf to disk.
   CHECKED_STATUS Flush();
 
+  // The on-disk size of the consensus metadata, as of the last call to Load() or Flush().
+  int64_t on_disk_size() const {
+    return on_disk_size_.load(std::memory_order_acquire);
+  }
+
+  // A lock-free way to read role and term atomically.
+  std::pair<RaftPeerPB::Role, int64_t> GetRoleAndTerm() const;
+
+  // Used internally for storing the role + term combination atomically.
+  using PackedRoleAndTerm = uint64;
+
  private:
   ConsensusMetadata(FsManager* fs_manager, std::string tablet_id,
                     std::string peer_uuid);
@@ -161,6 +173,11 @@ class ConsensusMetadata {
 
   // Updates the cached active role.
   void UpdateActiveRole();
+
+  // Updates the cached on-disk size of the consensus metadata.
+  Status UpdateOnDiskSize();
+
+  void UpdateRoleAndTermCache();
 
   // Transient fields.
   // Constants:
@@ -180,8 +197,19 @@ class ConsensusMetadata {
   // Durable fields.
   ConsensusMetadataPB pb_;
 
+  // The on-disk size of the consensus metadata, as of the last call to Load() or Flush().
+  std::atomic<uint64_t> on_disk_size_;
+
+  // Active role and term. Stored as a separate atomic field for fast read-only access. This is
+  // still only modified under the lock.
+  std::atomic<PackedRoleAndTerm> role_and_term_cache_;
+
   DISALLOW_COPY_AND_ASSIGN(ConsensusMetadata);
 };
+
+const HostPortPB& DesiredHostPort(const RaftPeerPB& peer, const CloudInfoPB& from);
+void TakeRegistration(ServerRegistrationPB* source, RaftPeerPB* dest);
+void CopyRegistration(ServerRegistrationPB source, RaftPeerPB* dest);
 
 } // namespace consensus
 } // namespace yb

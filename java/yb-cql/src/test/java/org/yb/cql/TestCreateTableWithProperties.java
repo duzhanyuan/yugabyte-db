@@ -13,13 +13,18 @@
 package org.yb.cql;
 
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertNull;
+import static org.yb.AssertionWrappers.assertTrue;
 
 import java.util.Random;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestCreateTableWithProperties extends BaseCQLTest {
   @Test
   public void testCreateTable() throws Exception {
@@ -536,6 +541,32 @@ public class TestCreateTableWithProperties extends BaseCQLTest {
     RunValidTableProperty("compression = {'sstable_compression' : ''}");
     RunInvalidTableProperty(
         "compression = {'class' : 'LZ4Compressor', 'sstable_compression' : ''}");
+  }
+
+  @Test
+  public void testTransactions() throws Exception {
+
+    // Test create table with and without transactions.
+    String create_stmt = "create table %s (k int primary key) %s;";
+    session.execute(String.format(create_stmt, "test_txn_1", ""));
+    session.execute(String.format(create_stmt, "test_txn_2",
+                                  "with transactions = {'enabled' : false};"));
+    session.execute(String.format(create_stmt, "test_txn_3",
+                                  "with transactions = {'enabled' : true};"));
+
+    // Verify the transactions property.
+    assertQueryRowsUnordered("select table_name, transactions from system_schema.tables where " +
+                "keyspace_name = '" + DEFAULT_TEST_KEYSPACE + "' and " +
+                "table_name in ('test_txn_1', 'test_txn_2', 'test_txn_3');",
+        "Row[test_txn_1, {enabled=false}]",
+        "Row[test_txn_2, {enabled=false}]",
+        "Row[test_txn_3, {enabled=true}]");
+
+    // Test invalid transactions property settings.
+    RunInvalidTableProperty("transactions = {'enabled' : 'bar'}");
+    RunInvalidTableProperty("transactions = {'foo' : 'bar'}");
+    RunInvalidTableProperty("transactions = 'foo'");
+    RunInvalidTableProperty("transactions = 1234");
   }
 
 }

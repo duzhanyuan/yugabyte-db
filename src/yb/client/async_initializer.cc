@@ -12,6 +12,10 @@
 
 #include "yb/client/async_initializer.h"
 
+#include "yb/common/wire_protocol.h"
+
+#include "yb/gutil/strings/join.h"
+
 using namespace std::literals;
 
 namespace yb {
@@ -20,53 +24,63 @@ namespace client {
 AsyncClientInitialiser::AsyncClientInitialiser(
     const std::string& client_name, const uint32_t num_reactors, const uint32_t timeout_seconds,
     const std::string& tserver_uuid, const yb::server::ServerBaseOptions* opts,
-    scoped_refptr<MetricEntity> metric_entity)
-    : client_future_(client_promise_.get_future()) {
+    scoped_refptr<MetricEntity> metric_entity,
+    const std::shared_ptr<MemTracker>& parent_mem_tracker,
+    rpc::Messenger* messenger)
+    : messenger_(messenger), client_future_(client_promise_.get_future()) {
   client_builder_.set_client_name(client_name);
   client_builder_.default_rpc_timeout(MonoDelta::FromSeconds(timeout_seconds));
-  client_builder_.add_master_server_addr(opts->master_addresses_flag);
-  client_builder_.set_skip_master_leader_resolution(opts->GetMasterAddresses()->size() == 1);
+  // Client does not care about master replication factor, it only needs endpoint of master leader.
+  // So we put all known master addresses to speed up leader resolution.
+  std::vector<std::string> master_addresses;
+  for (const auto& list : *opts->GetMasterAddresses()) {
+    for (const auto& hp : list) {
+      master_addresses.push_back(hp.ToString());
+    }
+  }
+  client_builder_.add_master_server_addr(JoinStrings(master_addresses, ","));
+  client_builder_.set_skip_master_leader_resolution(master_addresses.size() == 1);
   client_builder_.set_metric_entity(metric_entity);
   if (num_reactors > 0) {
     client_builder_.set_num_reactors(num_reactors);
   }
+  client_builder_.set_parent_mem_tracker(parent_mem_tracker);
 
   // Build cloud_info_pb.
-  CloudInfoPB cloud_info_pb;
-  cloud_info_pb.set_placement_cloud(opts->placement_cloud);
-  cloud_info_pb.set_placement_region(opts->placement_region);
-  cloud_info_pb.set_placement_zone(opts->placement_zone);
-  client_builder_.set_cloud_info_pb(cloud_info_pb);
+  client_builder_.set_cloud_info_pb(opts->MakeCloudInfoPB());
 
   if (!tserver_uuid.empty()) {
     client_builder_.set_tserver_uuid(tserver_uuid);
   }
-
-  init_client_thread_ = std::thread(std::bind(&AsyncClientInitialiser::InitClient, this));
 }
 
 AsyncClientInitialiser::~AsyncClientInitialiser() {
   Shutdown();
-  init_client_thread_.join();
+  if (init_client_thread_.joinable()) {
+    init_client_thread_.join();
+  }
 }
 
-const std::shared_ptr<client::YBClient>& AsyncClientInitialiser::client() const {
+void AsyncClientInitialiser::Start() {
+  init_client_thread_ = std::thread(std::bind(&AsyncClientInitialiser::InitClient, this));
+}
+
+YBClient* AsyncClientInitialiser::client() const {
   return client_future_.get();
 }
 
 void AsyncClientInitialiser::InitClient() {
   LOG(INFO) << "Starting to init ybclient";
   while (!stopping_) {
-    client::YBClientPtr client;
-
-    auto status = client_builder_.Build(&client);
-    if (status.ok()) {
+    auto result = client_builder_.Build(messenger_);
+    if (result.ok()) {
       LOG(INFO) << "Successfully built ybclient";
-      client_promise_.set_value(client);
+      client_holder_.reset(result->release());
+      client_promise_.set_value(client_holder_.get());
       break;
     }
 
-    LOG(ERROR) << "Failed to initialize client: " << status;
+    LOG(ERROR) << "Failed to initialize client: " << result.status();
     std::this_thread::sleep_for(1s);
   }
 }

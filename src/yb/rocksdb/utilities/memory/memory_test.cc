@@ -26,7 +26,7 @@
 #include "yb/rocksdb/utilities/memory_util.h"
 #include "yb/rocksdb/utilities/stackable_db.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
@@ -42,7 +42,7 @@ class MemoryTest : public testing::Test {
 
   std::string RandomString(int len) {
     std::string r;
-    test::RandomString(&rnd_, len, &r);
+    rocksdb::RandomString(&rnd_, len, &r);
     return r;
   }
 

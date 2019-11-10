@@ -32,7 +32,6 @@
 
 #include <vector>
 
-#include "yb/common/iterator.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/log_anchor_registry.h"
 #include "yb/consensus/log-test-base.h"
@@ -86,33 +85,34 @@ class BootstrapTest : public LogTestBase {
     LogTestBase::SetUp();
   }
 
-  Status LoadTestTabletMetadata(int mrs_id, int delta_id, scoped_refptr<TabletMetadata>* meta) {
+  Status LoadTestRaftGroupMetadata(RaftGroupMetadataPtr* meta) {
     Schema schema = SchemaBuilder(schema_).Build();
     std::pair<PartitionSchema, Partition> partition = CreateDefaultPartition(schema);
 
-    RETURN_NOT_OK(TabletMetadata::LoadOrCreate(
-      fs_manager_.get(),
-      log::kTestTable,
-      log::kTestTablet,
-      log::kTestTable,
-      kTableType,
-      schema,
-      partition.first,
-      partition.second,
-      TABLET_DATA_READY,
-      meta));
+    RETURN_NOT_OK(RaftGroupMetadata::LoadOrCreate(
+        fs_manager_.get(),
+        log::kTestTable,
+        log::kTestTablet,
+        log::kTestTable,
+        kTableType,
+        schema,
+        partition.first,
+        partition.second,
+        boost::none /* index_info */,
+        TABLET_DATA_READY,
+        meta));
     return (*meta)->Flush();
   }
 
-  Status PersistTestTabletMetadataState(TabletDataState state) {
-    scoped_refptr<TabletMetadata> meta;
-    RETURN_NOT_OK(LoadTestTabletMetadata(-1, -1, &meta));
+  Status PersistTestRaftGroupMetadataState(TabletDataState state) {
+    RaftGroupMetadataPtr meta;
+    RETURN_NOT_OK(LoadTestRaftGroupMetadata(&meta));
     meta->set_tablet_data_state(state);
     RETURN_NOT_OK(meta->Flush());
     return Status::OK();
   }
 
-  Status RunBootstrapOnTestTablet(const scoped_refptr<TabletMetadata>& meta,
+  Status RunBootstrapOnTestTablet(const RaftGroupMetadataPtr& meta,
                                   shared_ptr<TabletClass>* tablet,
                                   ConsensusBootstrapInfo* boot_info) {
     gscoped_ptr<TabletStatusListener> listener(new TabletStatusListener(meta));
@@ -121,23 +121,27 @@ class BootstrapTest : public LogTestBase {
     TabletOptions tablet_options;
     BootstrapTabletData data = {
         meta,
-        scoped_refptr<Clock>(LogicalClock::CreateStartingAt(HybridTime::kInitialHybridTime)),
-        shared_ptr<MemTracker>(),
+        std::shared_future<client::YBClient*>(),
+        scoped_refptr<Clock>(LogicalClock::CreateStartingAt(HybridTime::kInitial)),
+        shared_ptr<MemTracker>() /* mem_tracker */,
+        shared_ptr<MemTracker>() /* block_based_table_mem_tracker */,
         nullptr /* metric_registry */,
         listener.get(),
         log_anchor_registry,
         tablet_options,
-        nullptr /* transaction_coordinator_context */};
+        std::string(), // log_prefix_suffix
+        nullptr, // transaction_participant_context
+        client::LocalTabletFilter(),
+        nullptr, // transaction_coordinator_context
+        append_pool_.get()};
     RETURN_NOT_OK(BootstrapTablet(data, tablet, &log_, boot_info));
     return Status::OK();
   }
 
-  Status BootstrapTestTablet(int mrs_id,
-                             int delta_id,
-                             shared_ptr<TabletClass>* tablet,
+  Status BootstrapTestTablet(shared_ptr<TabletClass>* tablet,
                              ConsensusBootstrapInfo* boot_info) {
-    scoped_refptr<TabletMetadata> meta;
-    RETURN_NOT_OK_PREPEND(LoadTestTabletMetadata(mrs_id, delta_id, &meta),
+    RaftGroupMetadataPtr meta;
+    RETURN_NOT_OK_PREPEND(LoadTestRaftGroupMetadata(&meta),
                           "Unable to load test tablet metadata");
 
     consensus::RaftConfigPB config;
@@ -146,8 +150,8 @@ class BootstrapTest : public LogTestBase {
     peer->set_permanent_uuid(meta->fs_manager()->uuid());
     peer->set_member_type(consensus::RaftPeerPB::VOTER);
 
-    gscoped_ptr<ConsensusMetadata> cmeta;
-    RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(meta->fs_manager(), meta->tablet_id(),
+    std::unique_ptr<ConsensusMetadata> cmeta;
+    RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(meta->fs_manager(), meta->raft_group_id(),
                                                     meta->fs_manager()->uuid(),
                                                     config, kMinimumTerm, &cmeta),
                           "Unable to create consensus metadata");
@@ -159,51 +163,44 @@ class BootstrapTest : public LogTestBase {
 
   void IterateTabletRows(const Tablet* tablet,
                          vector<string>* results) {
-    gscoped_ptr<RowwiseIterator> iter;
-    // TODO: there seems to be something funny with hybrid_times in this test.
-    // Unless we explicitly scan at a snapshot including all hybrid_times, we don't
-    // see the bootstrapped operation. This is likely due to KUDU-138 -- perhaps
-    // we aren't properly setting up the clock after bootstrap.
-    ASSERT_OK(tablet->NewRowIterator(schema_, boost::none, &iter));
-    ScanSpec scan_spec;
-    ASSERT_OK(iter->Init(&scan_spec));
-    ASSERT_OK(IterateToStringList(iter.get(), results));
+    auto iter = tablet->NewRowIterator(schema_, boost::none);
+    ASSERT_OK(iter);
+    ASSERT_OK(IterateToStringList(iter->get(), results));
     for (const string& result : *results) {
       VLOG(1) << result;
     }
   }
 };
 
-// Tests a normal bootstrap scenario
+// Tests a normal bootstrap scenario.
 TEST_F(BootstrapTest, TestBootstrap) {
   BuildLog();
   const auto current_op_id = MakeOpId(1, current_index_);
   AppendReplicateBatch(current_op_id, current_op_id);
   shared_ptr<TabletClass> tablet;
   ConsensusBootstrapInfo boot_info;
-  ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  ASSERT_OK(BootstrapTestTablet(&tablet, &boot_info));
 
   vector<string> results;
   IterateTabletRows(tablet.get(), &results);
 }
 
-// Tests attempting a local bootstrap of a tablet that was in the middle of a
-// remote bootstrap before "crashing".
+// Tests attempting a local bootstrap of a tablet that was in the middle of a remote bootstrap
+// before "crashing".
 TEST_F(BootstrapTest, TestIncompleteRemoteBootstrap) {
   BuildLog();
 
-  ASSERT_OK(PersistTestTabletMetadataState(TABLET_DATA_COPYING));
+  ASSERT_OK(PersistTestRaftGroupMetadataState(TABLET_DATA_COPYING));
   shared_ptr<TabletClass> tablet;
   ConsensusBootstrapInfo boot_info;
-  Status s = BootstrapTestTablet(-1, -1, &tablet, &boot_info);
+  Status s = BootstrapTestTablet(&tablet, &boot_info);
   ASSERT_TRUE(s.IsCorruption()) << "Expected corruption: " << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "TabletMetadata bootstrap state is TABLET_DATA_COPYING");
+  ASSERT_STR_CONTAINS(s.ToString(), "RaftGroupMetadata bootstrap state is TABLET_DATA_COPYING");
   LOG(INFO) << "State is still TABLET_DATA_COPYING, as expected: " << s.ToString();
 }
 
-// Test for where the server crashes in between REPLICATE and COMMIT.
-// Bootstrap should not replay the operation, but should return it in
-// the ConsensusBootstrapInfo
+// Test a crash before a REPLICATE message is marked as committed by a future REPLICATE message.
+// Bootstrap should not replay the operation, but should return it in the ConsensusBootstrapInfo.
 TEST_F(BootstrapTest, TestOrphanedReplicate) {
   BuildLog();
 
@@ -217,9 +214,9 @@ TEST_F(BootstrapTest, TestOrphanedReplicate) {
   // Bootstrap the tablet. It shouldn't replay anything.
   ConsensusBootstrapInfo boot_info;
   shared_ptr<TabletClass> tablet;
-  ASSERT_OK(BootstrapTestTablet(0, 0, &tablet, &boot_info));
+  ASSERT_OK(BootstrapTestTablet(&tablet, &boot_info));
 
-  // Table should be empty because we didn't replay the REPLICATE
+  // Table should be empty because we didn't replay the REPLICATE.
   vector<string> results;
   IterateTabletRows(tablet.get(), &results);
   ASSERT_EQ(0, results.size());
@@ -238,8 +235,8 @@ TEST_F(BootstrapTest, TestOrphanedReplicate) {
 TEST_F(BootstrapTest, TestMissingConsensusMetadata) {
   BuildLog();
 
-  scoped_refptr<TabletMetadata> meta;
-  ASSERT_OK(LoadTestTabletMetadata(-1, -1, &meta));
+  RaftGroupMetadataPtr meta;
+  ASSERT_OK(LoadTestRaftGroupMetadata(&meta));
 
   shared_ptr<TabletClass> tablet;
   ConsensusBootstrapInfo boot_info;
@@ -265,7 +262,7 @@ TEST_F(BootstrapTest, TestCommitFirstMessageBySpecifyingCommittedIndexInSecond) 
                        {TupleForAppend(10, 2, "this is a test mutate")}, true /* sync */);
   ConsensusBootstrapInfo boot_info;
   shared_ptr<TabletClass> tablet;
-  ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  ASSERT_OK(BootstrapTestTablet(&tablet, &boot_info));
   ASSERT_EQ(boot_info.orphaned_replicates.size(), 1);
   ASSERT_OPID_EQ(boot_info.last_committed_id, insert_opid);
 
@@ -294,7 +291,7 @@ TEST_F(BootstrapTest, TestOperationOverwriting) {
   // When bootstrapping we should apply ops 1.1 and get 3.2 as pending.
   ConsensusBootstrapInfo boot_info;
   shared_ptr<TabletClass> tablet;
-  ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  ASSERT_OK(BootstrapTestTablet(&tablet, &boot_info));
 
   ASSERT_EQ(boot_info.orphaned_replicates.size(), 1);
   ASSERT_OPID_EQ(boot_info.orphaned_replicates[0]->id(), MakeOpId(3, 2));
@@ -304,13 +301,13 @@ TEST_F(BootstrapTest, TestOperationOverwriting) {
   IterateTabletRows(tablet.get(), &results);
   ASSERT_EQ(1, results.size());
 
-  ASSERT_EQ("(int32 key=1, int32 int_val=0, string string_val=this is a test insert)",
+  ASSERT_EQ("{ int32_value: 1 int32_value: 0 string_value: \"this is a test insert\" }",
             results[0]);
 }
 
-// Test that we do not crash when a consensus-only operation has a hybrid_time
-// that is higher than a hybrid_time assigned to a write operation that follows
-// it in the log.
+// Test that we do not crash when a consensus-only operation has a hybrid_time that is higher than a
+// hybrid_time assigned to a write operation that follows it in the log.
+// TODO: this must not happen in YB. Ensure this is not happening and update the test.
 TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderHybridTime) {
   BuildLog();
 
@@ -331,7 +328,7 @@ TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderHybridTime) {
 
   ConsensusBootstrapInfo boot_info;
   shared_ptr<TabletClass> tablet;
-  ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  ASSERT_OK(BootstrapTestTablet(&tablet, &boot_info));
   ASSERT_EQ(boot_info.orphaned_replicates.size(), 0);
   ASSERT_OPID_EQ(boot_info.last_committed_id, second_opid);
 
@@ -339,6 +336,29 @@ TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderHybridTime) {
   vector<string> results;
   IterateTabletRows(tablet.get(), &results);
   ASSERT_EQ(1, results.size());
+}
+
+// Test that we don't overflow opids. Regression test for KUDU-1933.
+TEST_F(BootstrapTest, TestBootstrapHighOpIdIndex) {
+  // Start appending with a log index 3 under the int32 max value.
+  // Append 6 log entries, which will roll us right through the int32 max.
+  const int64_t first_log_index = std::numeric_limits<int32_t>::max() - 3;
+  const int kNumEntries = 6;
+  BuildLog();
+  current_index_ = first_log_index;
+  for (int i = 0; i < kNumEntries; i++) {
+    AppendReplicateBatchToLog(1);
+  }
+
+  // Kick off tablet bootstrap and ensure everything worked.
+  shared_ptr<TabletClass> tablet;
+  ConsensusBootstrapInfo boot_info;
+  ASSERT_OK(BootstrapTestTablet(&tablet, &boot_info));
+  OpId last_opid;
+  last_opid.set_term(1);
+  last_opid.set_index(current_index_ - 1);
+  ASSERT_OPID_EQ(last_opid, boot_info.last_id);
+  ASSERT_OPID_EQ(last_opid, boot_info.last_committed_id);
 }
 
 } // namespace tablet

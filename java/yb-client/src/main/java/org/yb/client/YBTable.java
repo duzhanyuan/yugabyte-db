@@ -32,6 +32,7 @@
 package org.yb.client;
 
 import static org.yb.Common.TableType;
+
 import org.yb.Schema;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.annotations.InterfaceStability;
@@ -39,6 +40,12 @@ import org.yb.annotations.InterfaceStability;
 import com.stumbleupon.async.Deferred;
 
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+
 
 /**
  * A YBTable represents a table on a particular cluster. It holds the current
@@ -58,9 +65,12 @@ public class YBTable {
   private final PartitionSchema partitionSchema;
   private final AsyncYBClient client;
   private final String name;
-  private final String keySpace;
+  private final String keyspace;
   private final String tableId;
   private final TableType tableType;
+
+  private static final String OBSERVER = "OBSERVER";
+  private static final String PRE_OBSERVER = "PRE_OBSERVER";
 
   /**
    * Package-private constructor, use {@link YBClient#openTable(String)} to get an instance.
@@ -69,14 +79,14 @@ public class YBTable {
    * @param schema this table's schema
    */
   YBTable(AsyncYBClient client, String name, String tableId, Schema schema,
-          PartitionSchema partitionSchema, TableType tableType, String keySpace) {
+          PartitionSchema partitionSchema, TableType tableType, String keyspace) {
     this.schema = schema;
     this.partitionSchema = partitionSchema;
     this.client = client;
     this.name = name;
     this.tableId = tableId;
     this.tableType = tableType;
-    this.keySpace = keySpace;
+    this.keyspace = keyspace;
   }
 
   YBTable(AsyncYBClient client, String name, String tableId,
@@ -125,8 +135,8 @@ public class YBTable {
    * Get this table's keyspace.
    * @return this table's keyspace.
    */
-  public String getKeySpace() {
-    return this.keySpace;
+  public String getKeyspace() {
+    return this.keyspace;
   }
 
   /**
@@ -143,30 +153,6 @@ public class YBTable {
    */
   public AsyncYBClient getAsyncClient() {
     return this.client;
-  }
-
-  /**
-   * Get a new insert configured with this table's schema. The returned object should not be reused.
-   * @return an insert with this table's schema
-   */
-  public Insert newInsert() {
-    return new Insert(this);
-  }
-
-  /**
-   * Get a new update configured with this table's schema. The returned object should not be reused.
-   * @return an update with this table's schema
-   */
-  public Update newUpdate() {
-    return new Update(this);
-  }
-
-  /**
-   * Get a new delete configured with this table's schema. The returned object should not be reused.
-   * @return a delete with this table's schema
-   */
-  public Delete newDelete() {
-    return new Delete(this);
   }
 
   /**
@@ -226,4 +212,72 @@ public class YBTable {
     return client.locateTable(tableId, startKey, endKey, deadline);
   }
 
+  /**
+   * Loop through all replicas in the table and store a mapping from tserver placement uuid to
+   * a list of lists, containing the live replica count per ts, followed by the read
+   * replica count per ts. If there are two placement uuids, live and readOnly, and two
+   * tservers in each uuid, and RF=1 for both live and readOnly with 8 tablets
+   * in the table, the resulting map would look like this:
+   * "live" : { [[1, 1], [0, 0]] }, "readOnly" : { [[0, 0], [1, 1]] }.
+   * The first list in the map correspond to live replica counts per tserver, and the
+   * second list corresponds to read only replica counts.
+   * @param deadline deadline in milliseconds for getTabletsLocations rpc.
+   * @return a map from placement zone to a list of lists of integers.
+   */
+  public Map<String, List<List<Integer>>> getMemberTypeCountsForEachTSType(long deadline)
+      throws Exception {
+    // Intermediate map which contains an internal map from ts uuid to live and
+    // read replica counts.
+    Map<String, Map<String, List<Integer>>> intermediateMap =
+        new HashMap<String, Map<String, List<Integer>>>();
+    List<LocatedTablet> tablets = getTabletsLocations(deadline);
+    for (LocatedTablet tablet : tablets) {
+      for (LocatedTablet.Replica replica : tablet.getReplicas()) {
+        String placementUuid = replica.getTsPlacementUuid();
+        Map<String, List<Integer>> tsMap;
+        if (intermediateMap.containsKey(placementUuid)) {
+          tsMap = intermediateMap.get(placementUuid);
+        } else {
+          tsMap = new HashMap<String, List<Integer>>();
+        }
+        String tsUuid = replica.getTsUuid();
+        List<Integer> liveReadOnlyCounts;
+        if (tsMap.containsKey(tsUuid)) {
+          liveReadOnlyCounts = tsMap.get(tsUuid);
+        } else {
+          liveReadOnlyCounts = new ArrayList<>(Arrays.asList(0, 0));
+        }
+        if (replica.getMemberType().equals(OBSERVER) ||
+            replica.getMemberType().equals(PRE_OBSERVER)) {
+          // This is an read only member,
+          int currCount = liveReadOnlyCounts.get(1);
+          liveReadOnlyCounts.set(1, currCount + 1);
+        } else {
+          int currCount = liveReadOnlyCounts.get(0);
+          liveReadOnlyCounts.set(0, currCount + 1);
+        }
+        tsMap.put(tsUuid, liveReadOnlyCounts);
+        intermediateMap.put(placementUuid, tsMap);
+      }
+    }
+
+    // Now, convert our internal map into the return map by getting rid of ts uuid.
+    Map<String, List<List<Integer>>> returnMap = new HashMap<String, List<List<Integer>>>();
+    for (Map.Entry<String, Map<String, List<Integer>>> placementEntry :
+         intermediateMap.entrySet()) {
+      List<List<Integer>> newEntry = new ArrayList<List<Integer>>();
+      List<Integer> liveCounts = new ArrayList<Integer>();
+      List<Integer> readOnlyCounts = new ArrayList<Integer>();
+      for (Map.Entry<String, List<Integer>> tsEntry : placementEntry.getValue().entrySet()) {
+        liveCounts.add(tsEntry.getValue().get(0));
+        readOnlyCounts.add(tsEntry.getValue().get(1));
+      }
+      Collections.sort(liveCounts);
+      Collections.sort(readOnlyCounts);
+      newEntry.add(liveCounts);
+      newEntry.add(readOnlyCounts);
+      returnMap.put(placementEntry.getKey(), newEntry);;
+    }
+    return returnMap;
+  }
 }

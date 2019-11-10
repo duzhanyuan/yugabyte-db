@@ -22,24 +22,32 @@ YQLAuthRolesVTable::YQLAuthRolesVTable(const Master* const master)
     : YQLVirtualTable(master::kSystemAuthRolesTableName, master, CreateSchema()) {
 }
 
-Status YQLAuthRolesVTable::RetrieveData(const QLReadRequestPB& request,
-                                        std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
+Result<std::shared_ptr<QLRowBlock>> YQLAuthRolesVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<QLRowBlock>(schema_);
   std::vector<scoped_refptr<RoleInfo>> roles;
-  master_->catalog_manager()->GetAllRoles(&roles);
-  for (const auto role : roles) {
+  master_->catalog_manager()->permissions_manager()->GetAllRoles(&roles);
+  for (const auto& role : roles) {
     auto l = role->LockForRead();
     const auto& pb = l->data().pb;
-    QLRow& row = (*vtable)->Extend();
+    QLRow& row = vtable->Extend();
     RETURN_NOT_OK(SetColumnValue(kRole, pb.role(), &row));
     RETURN_NOT_OK(SetColumnValue(kCanLogin, pb.can_login(), &row));
     RETURN_NOT_OK(SetColumnValue(kIsSuperuser, pb.is_superuser(), &row));
-    // TODO: how to set a list?
-    // RETURN_NOT_OK(SetColumnValue(kMemberOf, pb.member_of(), &row));
-    RETURN_NOT_OK(SetColumnValue(kSaltedHash, pb.salted_hash(), &row));
+
+    QLValuePB members;
+    QLSeqValuePB* list_value = members.mutable_list_value();
+
+    for (const auto& member : pb.member_of()) {
+      (*list_value->add_elems()).set_string_value(member);
+    }
+    RETURN_NOT_OK(SetColumnValue(kMemberOf, members, &row));
+    if (pb.has_salted_hash()) {
+        RETURN_NOT_OK(SetColumnValue(kSaltedHash, pb.salted_hash(), &row));
+    }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 

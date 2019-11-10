@@ -40,6 +40,7 @@ TEST_F(RateLimiterTest, StartStop) {
   std::unique_ptr<RateLimiter> limiter(new GenericRateLimiter(100, 100, 10));
 }
 
+#ifndef OS_MACOSX
 TEST_F(RateLimiterTest, Rate) {
   auto* env = Env::Default();
   struct Arg {
@@ -55,8 +56,8 @@ TEST_F(RateLimiterTest, Rate) {
   auto writer = [](void* p) {
     auto* thread_env = Env::Default();
     auto* arg = static_cast<Arg*>(p);
-    // Test for 2 seconds
-    auto until = thread_env->NowMicros() + 2 * 1000000;
+    // Test for 10 seconds
+    auto until = thread_env->NowMicros() + 10 * 1000000;
     Random r((uint32_t)(thread_env->NowNanos() %
                         std::numeric_limits<uint32_t>::max()));
     while (thread_env->NowMicros() < until) {
@@ -95,11 +96,12 @@ TEST_F(RateLimiterTest, Rate) {
               arg.request_size - 1, target / 1024, rate / 1024,
               elapsed / 1000000.0);
 
-      ASSERT_GE(rate / target, 0.9);
-      ASSERT_LE(rate / target, 1.1);
+      ASSERT_GE(rate / target, 0.8);
+      ASSERT_LE(rate / target, 1.2);
     }
   }
 }
+#endif
 
 }  // namespace rocksdb
 

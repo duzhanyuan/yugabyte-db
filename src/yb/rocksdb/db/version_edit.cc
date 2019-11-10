@@ -23,14 +23,22 @@
 
 #include "yb/rocksdb/db/version_edit.h"
 
+#include "yb/rocksdb/db/version_edit.pb.h"
 #include "yb/rocksdb/db/version_set.h"
+#include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/event_logger.h"
 #include "yb/rocksdb/util/sync_point.h"
+#include "yb/util/logging.h"
 #include "yb/util/slice.h"
+#include "yb/util/debug-util.h"
+#include "yb/util/flag_tags.h"
 
-#include "yb/rocksdb/db/version_edit.pb.h"
-#include "yb/rocksdb/metadata.h"
+DEFINE_bool(use_per_file_metadata_for_flushed_frontier, false,
+            "Allows taking per-file metadata in version edits into account when computing the "
+            "flushed frontier.");
+TAG_FLAG(use_per_file_metadata_for_flushed_frontier, hidden);
+TAG_FLAG(use_per_file_metadata_for_flushed_frontier, advanced);
 
 namespace rocksdb {
 
@@ -59,25 +67,52 @@ void FileMetaData::UpdateBoundaries(InternalKey key, const FileBoundaryValuesBas
   if (smallest.key.empty()) {
     smallest.key = largest.key;
   }
-  UpdateBoundariesExceptKey(source, UpdateBoundariesType::ALL);
+  UpdateBoundariesExceptKey(source, UpdateBoundariesType::kAll);
+}
+
+bool FileMetaData::Unref(TableCache* table_cache) {
+  refs--;
+  if (refs <= 0) {
+    if (table_reader_handle) {
+      DCHECK_ONLY_NOTNULL(table_cache);
+      table_cache->ReleaseHandle(table_reader_handle);
+      table_reader_handle = nullptr;
+    }
+    return true;
+  } else {
+    return false;
+  }
 }
 
 void FileMetaData::UpdateBoundariesExceptKey(const FileBoundaryValuesBase& source,
                                              UpdateBoundariesType type) {
-  if (type != UpdateBoundariesType::LARGEST) {
+  if (type != UpdateBoundariesType::kLargest) {
     smallest.seqno = std::min(smallest.seqno, source.seqno);
+    UserFrontier::Update(
+        source.user_frontier.get(), UpdateUserValueType::kSmallest, &smallest.user_frontier);
+
     for (const auto& user_value : source.user_values) {
-      UpdateUserValue(&smallest.user_values, user_value, UpdateUserValueType::SMALLEST);
+      UpdateUserValue(&smallest.user_values, user_value, UpdateUserValueType::kSmallest);
     }
   }
-  if (type != UpdateBoundariesType::SMALLEST) {
+  if (type != UpdateBoundariesType::kSmallest) {
     largest.seqno = std::max(largest.seqno, source.seqno);
+    UserFrontier::Update(
+        source.user_frontier.get(), UpdateUserValueType::kLargest, &largest.user_frontier);
+
     for (const auto& user_value : source.user_values) {
-      UpdateUserValue(&largest.user_values, user_value, UpdateUserValueType::LARGEST);
+      UpdateUserValue(&largest.user_values, user_value, UpdateUserValueType::kLargest);
     }
   }
 }
 
+
+std::string FileMetaData::ToString() const {
+  return yb::Format("{ number: $0 total_size: $1 base_size: $2 refs: $3 "
+                    "being_compacted: $4 smallest: $5 largest: $6 }",
+                    fd.GetNumber(), fd.GetTotalFileSize(), fd.GetBaseFileSize(), refs,
+                    being_compacted, smallest, largest);
+}
 
 void VersionEdit::Clear() {
   comparator_.reset();
@@ -92,13 +127,16 @@ void VersionEdit::Clear() {
   column_family_ = 0;
   column_family_name_.reset();
   is_column_family_drop_ = false;
-  flushed_op_id_ = OpId();
+  flushed_frontier_.reset();
 }
 
 void EncodeBoundaryValues(const FileBoundaryValues<InternalKey>& values, BoundaryValuesPB* out) {
   auto key = values.key.Encode();
   out->set_key(key.data(), key.size());
   out->set_seqno(values.seqno);
+  if (values.user_frontier) {
+    values.user_frontier->ToPB(out->mutable_user_frontier());
+  }
 
   for (const auto& user_value : values.user_values) {
     auto* value = out->add_user_values();
@@ -111,14 +149,12 @@ void EncodeBoundaryValues(const FileBoundaryValues<InternalKey>& values, Boundar
 Status DecodeBoundaryValues(BoundaryValuesExtractor* extractor,
                             const BoundaryValuesPB& values,
                             FileBoundaryValues<InternalKey>* out) {
-  if (!values.has_key()) {
-    return STATUS(Corruption, "key missing");
-  }
-  if (!values.has_seqno()) {
-    return STATUS(Corruption, "seqno missing");
-  }
   out->key = InternalKey::DecodeFrom(values.key());
   out->seqno = values.seqno();
+  if (values.has_user_frontier() && extractor) {
+    out->user_frontier = extractor->CreateFrontier();
+    out->user_frontier->FromPB(values.user_frontier());
+  }
   if (extractor != nullptr) {
     for (const auto &user_value : values.user_values()) {
       UserBoundaryValuePtr decoded;
@@ -134,7 +170,7 @@ Status DecodeBoundaryValues(BoundaryValuesExtractor* extractor,
   return Status();
 }
 
-bool VersionEdit::EncodeTo(std::string* dst) const {
+bool VersionEdit::AppendEncodedTo(std::string* dst) const {
   VersionEditPB pb;
   auto result = EncodeTo(&pb);
   if (result) {
@@ -160,10 +196,8 @@ bool VersionEdit::EncodeTo(VersionEditPB* dst) const {
   if (last_sequence_) {
     pb.set_last_sequence(*last_sequence_);
   }
-  if (flushed_op_id_) {
-    auto& op_id = *pb.mutable_last_op_id();
-    op_id.set_term(flushed_op_id_.term);
-    op_id.set_index(flushed_op_id_.index);
+  if (flushed_frontier_) {
+    flushed_frontier_->ToPB(pb.mutable_flushed_frontier());
   }
   if (max_column_family_) {
     pb.set_max_column_family(*max_column_family_);
@@ -193,9 +227,6 @@ bool VersionEdit::EncodeTo(VersionEditPB* dst) const {
     if (f.marked_for_compaction) {
       new_file.set_marked_for_compaction(true);
     }
-    auto& op_id = *new_file.mutable_last_op_id();
-    op_id.set_term(f.last_op_id.term);
-    op_id.set_index(f.last_op_id.index);
     if (f.imported) {
       new_file.set_imported(true);
     }
@@ -224,6 +255,8 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice& 
     return STATUS(Corruption, "VersionEdit");
   }
 
+  VLOG(1) << "Parsed version edit: " << pb.ShortDebugString();
+
   if (pb.has_comparator()) {
     comparator_ = std::move(*pb.mutable_comparator());
   }
@@ -239,8 +272,16 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice& 
   if (pb.has_last_sequence()) {
     last_sequence_ = pb.last_sequence();
   }
-  if (pb.has_last_op_id()) {
-    flushed_op_id_ = OpId(pb.last_op_id().term(), pb.last_op_id().index());
+  if (extractor) {
+    // BoundaryValuesExtractor could be not set when running from internal RocksDB tools.
+    if (pb.has_obsolete_last_op_id()) {
+      flushed_frontier_ = extractor->CreateFrontier();
+      flushed_frontier_->FromOpIdPBDeprecated(pb.obsolete_last_op_id());
+    }
+    if (pb.has_flushed_frontier()) {
+      flushed_frontier_ = extractor->CreateFrontier();
+      flushed_frontier_->FromPB(pb.flushed_frontier());
+    }
   }
   if (pb.has_max_column_family()) {
     max_column_family_ = pb.max_column_family();
@@ -252,15 +293,20 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice& 
 
   const size_t new_files_size = static_cast<size_t>(pb.new_files_size());
   new_files_.resize(new_files_size);
+
   for (size_t i = 0; i < new_files_size; ++i) {
     auto& source = pb.new_files(static_cast<int>(i));
     int level = source.level();
     new_files_[i].first = level;
     auto& meta = new_files_[i].second;
     meta.fd = FileDescriptor(source.number(),
-                             source.has_path_id() ? source.path_id() : 0,
+                             source.path_id(),
                              source.total_file_size(),
                              source.base_file_size());
+    if (source.has_obsolete_last_op_id() && extractor) {
+      meta.largest.user_frontier = extractor->CreateFrontier();
+      meta.largest.user_frontier->FromOpIdPBDeprecated(source.obsolete_last_op_id());
+    }
     auto status = DecodeBoundaryValues(extractor, source.smallest(), &meta.smallest);
     if (!status.ok()) {
       return status;
@@ -269,22 +315,44 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice& 
     if (!status.ok()) {
       return status;
     }
-    meta.marked_for_compaction = source.has_marked_for_compaction() &&
-                                 source.marked_for_compaction();
+    meta.marked_for_compaction = source.marked_for_compaction();
     max_level_ = std::max(max_level_, level);
-    if (source.has_last_op_id()) {
-      meta.last_op_id = OpId(source.last_op_id().term(), source.last_op_id().index());
+    meta.imported = source.imported();
+
+    // Use the relevant fields in the "largest" frontier to update the "flushed" frontier for this
+    // version edit. In practice this will only look at OpId and will discard hybrid time and
+    // history cutoff (which probably won't be there anyway) coming from the boundary values.
+    //
+    // This is enabled only if --use_per_file_metadata_for_flushed_frontier is specified, until we
+    // know that we don't have any clusters with wrong per-file flushed frontier metadata in version
+    // edits, such as that restored from old backups from unrelated clusters.
+    if (FLAGS_use_per_file_metadata_for_flushed_frontier && meta.largest.user_frontier) {
+      if (!flushed_frontier_) {
+        LOG(DFATAL) << "Flushed frontier not present but a file's largest user frontier present: "
+                    << meta.largest.user_frontier->ToString()
+                    << ", version edit protobuf:\n" << pb.DebugString();
+      } else if (!flushed_frontier_->Dominates(*meta.largest.user_frontier,
+                                               UpdateUserValueType::kLargest)) {
+        // The flushed frontier of this VersionEdit must already include the information provided
+        // by flushed frontiers of individual files.
+        LOG(DFATAL) << "Flushed frontier is present but has to be updated with data from "
+                    << "file boundary: flushed_frontier=" << flushed_frontier_->ToString()
+                    << ", a file's larget user frontier: "
+                    << meta.largest.user_frontier->ToString()
+                    << ", version edit protobuf:\n" << pb.DebugString();
+      }
+      UpdateUserFrontier(
+          &flushed_frontier_, meta.largest.user_frontier, UpdateUserValueType::kLargest);
     }
-    meta.imported = source.has_imported() && source.imported();
   }
 
-  column_family_ = pb.has_column_family() ? pb.column_family() : 0;
+  column_family_ = pb.column_family();
 
-  if (pb.has_column_family_name()) {
+  if (!pb.column_family_name().empty()) {
     column_family_name_ = pb.column_family_name();
   }
 
-  is_column_family_drop_ = pb.has_is_column_family_drop() && pb.is_column_family_drop();
+  is_column_family_drop_ = pb.is_column_family_drop();
 
   return Status();
 }
@@ -295,89 +363,24 @@ std::string VersionEdit::DebugString(bool hex_key) const {
   return pb.DebugString();
 }
 
-std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
-  JSONWriter jw;
-  jw << "EditNumber" << edit_num;
-
-  if (comparator_) {
-    jw << "Comparator" << *comparator_;
-  }
-  if (log_number_) {
-    jw << "LogNumber" << *log_number_;
-  }
-  if (prev_log_number_) {
-    jw << "PrevLogNumber" << *prev_log_number_;
-  }
-  if (next_file_number_) {
-    jw << "NextFileNumber" << *next_file_number_;
-  }
-  if (last_sequence_) {
-    jw << "LastSeq" << *last_sequence_;
-  }
-  if (flushed_op_id_) {
-    jw << "FlushedOpId";
-    jw.StartObject();
-    jw << "Term" << flushed_op_id_.term;
-    jw << "Index" << flushed_op_id_.index;
-    jw.EndObject();
-  }
-
-  if (!deleted_files_.empty()) {
-    jw << "DeletedFiles";
-    jw.StartArray();
-
-    for (DeletedFileSet::const_iterator iter = deleted_files_.begin();
-         iter != deleted_files_.end();
-         ++iter) {
-      jw.StartArrayedObject();
-      jw << "Level" << iter->first;
-      jw << "FileNumber" << iter->second;
-      jw.EndArrayedObject();
-    }
-
-    jw.EndArray();
-  }
-
-  if (!new_files_.empty()) {
-    jw << "AddedFiles";
-    jw.StartArray();
-
-    for (size_t i = 0; i < new_files_.size(); i++) {
-      jw.StartArrayedObject();
-      jw << "Level" << new_files_[i].first;
-      const FileMetaData& f = new_files_[i].second;
-      jw << "FileNumber" << f.fd.GetNumber();
-      jw << "FileSize" << f.fd.GetTotalFileSize();
-      jw << "SmallestIKey" << f.smallest.key.DebugString(hex_key);
-      jw << "LargestIKey" << f.largest.key.DebugString(hex_key);
-      jw.EndArrayedObject();
-    }
-
-    jw.EndArray();
-  }
-
-  jw << "ColumnFamily" << column_family_;
-
-  if (column_family_name_) {
-    jw << "ColumnFamilyAdd" << *column_family_name_;
-  }
-  if (is_column_family_drop_) {
-    jw << "ColumnFamilyDrop" << std::string();
-  }
-  if (max_column_family_) {
-    jw << "MaxColumnFamily" << *max_column_family_;
-  }
-
-  jw.EndObject();
-
-  return jw.Get();
-}
-
 void VersionEdit::InitNewDB() {
   log_number_ = 0;
   next_file_number_ = VersionSet::kInitialNextFileNumber;
   last_sequence_ = 0;
-  flushed_op_id_ = OpId();
+  flushed_frontier_.reset();
+}
+
+void VersionEdit::UpdateFlushedFrontier(UserFrontierPtr value) {
+  ModifyFlushedFrontier(std::move(value), FrontierModificationMode::kUpdate);
+}
+
+void VersionEdit::ModifyFlushedFrontier(UserFrontierPtr value, FrontierModificationMode mode) {
+  if (mode == FrontierModificationMode::kForce) {
+    flushed_frontier_ = std::move(value);
+    force_flushed_frontier_ = true;
+  } else {
+    UpdateUserFrontier(&flushed_frontier_, std::move(value), UpdateUserValueType::kLargest);
+  }
 }
 
 }  // namespace rocksdb

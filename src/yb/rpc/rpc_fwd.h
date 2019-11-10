@@ -17,15 +17,26 @@
 #define YB_RPC_RPC_FWD_H
 
 #include <chrono>
+#include <functional>
 
-#include <boost/intrusive_ptr.hpp>
+#include <boost/version.hpp>
 
 #include "yb/gutil/ref_counted.h"
+
+#include "yb/rpc/rpc_introspection.pb.h"
+
+#include "yb/util/enums.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace boost {
 namespace asio {
 
+#if BOOST_VERSION >= 106600
+class io_context;
+typedef io_context io_service;
+#else
 class io_service;
+#endif
 
 } // namespace asio
 } // namespace boost
@@ -33,32 +44,83 @@ class io_service;
 namespace yb {
 namespace rpc {
 
+class Acceptor;
 class AcceptorPool;
-class Messenger;
+class ConnectionContext;
+class GrowableBufferAllocator;
+class MessengerBuilder;
+class Proxy;
+class ProxyCache;
+class Reactor;
+class ReactorTask;
+class RpcConnectionPB;
 class RpcContext;
 class RpcController;
+class RpcService;
 class Rpcs;
+class Protocol;
 class Scheduler;
+class SecureContext;
+class ServicePoolImpl;
+class Stream;
+class StreamReadBuffer;
+class ThreadPool;
+class ThreadPoolTask;
+class LocalYBInboundCall;
+
+struct CallData;
+struct ProcessDataResult;
+struct RpcMethodMetrics;
+struct RpcMetrics;
 
 class RpcCommand;
 typedef std::shared_ptr<RpcCommand> RpcCommandPtr;
 
 class Connection;
+class ConnectionContext;
 typedef std::shared_ptr<Connection> ConnectionPtr;
+typedef std::weak_ptr<Connection> ConnectionWeakPtr;
 
 class InboundCall;
 typedef std::shared_ptr<InboundCall> InboundCallPtr;
 
+class Messenger;
+
 class OutboundCall;
 typedef std::shared_ptr<OutboundCall> OutboundCallPtr;
+
+class OutboundData;
+typedef std::shared_ptr<OutboundData> OutboundDataPtr;
+
+class ServerEventList;
+typedef std::shared_ptr<ServerEventList> ServerEventListPtr;
+
+class ServiceIf;
+typedef std::shared_ptr<ServiceIf> ServiceIfPtr;
 
 class ErrorStatusPB;
 
 typedef boost::asio::io_service IoService;
 
+typedef std::function<int(const std::string&, const std::string&)> Publisher;
+
 // SteadyTimePoint is something like MonoTime, but 3rd party libraries know it and don't know about
 // our private MonoTime.
 typedef std::chrono::steady_clock::time_point SteadyTimePoint;
+
+class ConnectionContextFactory;
+typedef std::shared_ptr<ConnectionContextFactory> ConnectionContextFactoryPtr;
+
+class StreamFactory;
+typedef std::shared_ptr<StreamFactory> StreamFactoryPtr;
+
+YB_STRONGLY_TYPED_BOOL(ReadBufferFull);
+
+typedef int64_t ScheduledTaskId;
+constexpr ScheduledTaskId kInvalidTaskId = -1;
+constexpr size_t kMinBufferForSidecarSlices = 16;
+
+YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 
 } // namespace rpc
 } // namespace yb

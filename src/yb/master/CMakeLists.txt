@@ -44,7 +44,9 @@ set(MASTER_YRPC_LIBS
   rpc_header_proto
   tablet_proto
   tserver_proto
-  wire_protocol_proto)
+  wire_protocol_proto
+  yb_pgwrapper
+  cdc_consumer_proto)
 ADD_YB_LIBRARY(master_proto
   SRCS ${MASTER_YRPC_SRCS}
   DEPS ${MASTER_YRPC_LIBS}
@@ -52,15 +54,42 @@ ADD_YB_LIBRARY(master_proto
 
 set(MASTER_PROTO_LIBS
   master_proto
-  ${MASTER_PROTO_LIBS_EXTENTIONS})
+  ${MASTER_PROTO_LIBS_EXTENSIONS})
 
 set(MASTER_SRCS
+  async_flush_tablets_task.cc
+  async_rpc_tasks.cc
+  call_home.cc
+  catalog_manager.cc
+  catalog_manager_util.cc
+  catalog_entity_info.cc
+  catalog_manager_bg_tasks.cc
+  catalog_loaders.cc
+  scoped_leader_shared_lock.cc
+  cluster_balance.cc
+  encryption_manager.cc
+  permissions_manager.cc
+  flush_manager.cc
+  master.cc
+  master_options.cc
+  master_service_base.cc
+  master_service.cc
+  master_tablet_service.cc
+  master_tserver.cc
+  master-path-handlers.cc
+  mini_master.cc
+  sys_catalog.cc
+  initial_sys_catalog_snapshot.cc
   system_tablet.cc
-  system_tables_handler.cc
+  tasks_tracker.cc
+  ts_descriptor.cc
+  ts_manager.cc
   yql_virtual_table.cc
   yql_vtable_iterator.cc
   util/yql_vtable_helpers.cc
   yql_auth_roles_vtable.cc
+  yql_auth_role_permissions_vtable.cc
+  yql_auth_resource_role_permissions_index.cc
   yql_aggregates_vtable.cc
   yql_columns_vtable.cc
   yql_empty_vtable.cc
@@ -69,27 +98,13 @@ set(MASTER_SRCS
   yql_keyspaces_vtable.cc
   yql_peers_vtable.cc
   yql_local_vtable.cc
+  yql_size_estimates_vtable.cc
   yql_tables_vtable.cc
   yql_triggers_vtable.cc
   yql_types_vtable.cc
   yql_views_vtable.cc
   yql_partitions_vtable.cc
-  async_rpc_tasks.cc
-  catalog_manager.cc
-  cluster_balance.cc
-  master.cc
-  master_options.cc
-  master_service_base.cc
-  master_service.cc
-  master-path-handlers.cc
-  mini_master.cc
-  sys_catalog.cc
-  ts_descriptor.cc
-  ts_manager.cc
-  master_tablet_service.cc
-  master_tserver.cc
-  call_home.cc
-  ${MASTER_SRCS_EXTENTIONS})
+  ${MASTER_SRCS_EXTENSIONS})
 
 add_library(master ${MASTER_SRCS})
 target_link_libraries(master
@@ -105,7 +120,8 @@ target_link_libraries(master
   ${MASTER_PROTO_LIBS}
   rpc_header_proto
   master_util
-  version_info_proto)
+  version_info_proto
+  yb_pggate_flags)
 
 set(MASTER_RPC_SRCS
   master_rpc.cc)
@@ -126,17 +142,22 @@ ADD_YB_LIBRARY(master_util
   SRCS ${MASTER_UTIL_SRCS}
   DEPS ${MASTER_RPC_LIBS})
 
-# Tests
-set(YB_TEST_LINK_LIBS master ${MASTER_PROTO_LIBS} yb_client ${YB_MIN_TEST_LIBS})
-ADD_YB_TEST(catalog_manager-test)
-ADD_YB_TEST(master-test RESOURCE_LOCK "master-web-port")
-ADD_YB_TEST(sys_catalog-test RESOURCE_LOCK "master-web-port")
+# A library with common code shared between master tests.
+set(MASTER_TEST_COMMON_SRCS
+  master-test_base.cc)
+add_library(master_test_common ${MASTER_TEST_COMMON_SRCS})
+target_link_libraries(master_test_common
+  master ${MASTER_PROTO_LIBS} yb_client ${YB_MIN_TEST_LIBS})
 
-if(YB_ENT_CURRENT_SOURCE_DIR)
-  # Set the test source file folder.
-  set(CMAKE_CURRENT_LIST_DIR ${YB_ENT_CURRENT_SOURCE_DIR})
-  ADD_YB_TEST(${CATALOG_MANAGER_EXTENTIONS_TEST1})
-endif()
+# Tests
+set(YB_TEST_LINK_LIBS master ${MASTER_PROTO_LIBS} master_test_common yb_client ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(catalog_manager-test)
+ADD_YB_TEST(master-test)
+ADD_YB_TEST(sys_catalog-test)
+
+foreach(ADDITIONAL_TEST ${MASTER_ADDITIONAL_TESTS})
+  ADD_YB_TEST(${ADDITIONAL_TEST})
+endforeach(ADDITIONAL_TEST)
 
 # Actual master executable
 add_executable(yb-master master_main.cc)

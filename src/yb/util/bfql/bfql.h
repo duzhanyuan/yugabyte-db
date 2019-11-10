@@ -67,7 +67,7 @@
 // EXAMPPLE
 // --------
 // The test "/yb/util/bfql/bfql-test.cc" would be a good example on builtin-call usage.
-// The file "/yb/ql/ptree/pt_bfunc.cc" can be used as example at the moment.
+// The file "/yb/yql/cql/ql/ptree/pt_bfunc.cc" can be used as example at the moment.
 //--------------------------------------------------------------------------------------------------
 
 #ifndef YB_UTIL_BFQL_BFQL_H_
@@ -76,15 +76,13 @@
 #include <vector>
 #include <list>
 
-#include "yb/client/client.h"
 #include "yb/util/logging.h"
 #include "yb/util/bfql/bfql_template.h"
 #include "yb/util/bfql/tserver_opcodes.h"
+#include "yb/util/bfql/bfunc_names.h"
 
 namespace yb {
 namespace bfql {
-
-const char *const kCastFuncName = "cast";
 
 //--------------------------------------------------------------------------------------------------
 // class BFCompileApi<PType, RType> has one main entry function - FindQLOpcode().

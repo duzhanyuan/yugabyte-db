@@ -32,14 +32,9 @@
 
 #include "yb/tserver/tablet_server_options.h"
 
-#include <glog/logging.h>
-#include <gflags/gflags.h>
-
 #include "yb/master/master.h"
 #include "yb/tserver/tablet_server.h"
-#include "yb/util/flag_tags.h"
-#include "yb/util/flags.h"
-#include "yb/util/net/net_util.h"
+#include "yb/tserver/tserver_flags.h"
 
 using std::vector;
 
@@ -48,26 +43,29 @@ namespace tserver {
 
 const char* TabletServerOptions::kServerType = "tserver";
 
-TabletServerOptions::TabletServerOptions() {
+Result<TabletServerOptions> TabletServerOptions::CreateTabletServerOptions() {
+  server::MasterAddresses master_addresses;
+  std::string master_addresses_resolved_str;
+  RETURN_NOT_OK(server::DetermineMasterAddresses(
+      "tserver_master_addrs", FLAGS_tserver_master_addrs,
+      FLAGS_tserver_master_replication_factor, &master_addresses, &master_addresses_resolved_str));
+
+  TabletServerOptions opts(std::make_shared<server::MasterAddresses>(std::move(master_addresses)));
+  opts.master_addresses_flag = master_addresses_resolved_str;
+  return opts;
+}
+
+TabletServerOptions::TabletServerOptions(server::MasterAddressesPtr master_addresses) {
   server_type = kServerType;
   rpc_opts.default_port = TabletServer::kDefaultPort;
 
-  master_addresses_flag = FLAGS_tserver_master_addrs;
-
-  vector<HostPort> master_addresses;
-  Status s = HostPort::ParseStrings(FLAGS_tserver_master_addrs,
-                                    master::kMasterDefaultPort,
-                                    &master_addresses);
-  SetMasterAddresses(std::make_shared<std::vector<HostPort>>(std::move(master_addresses)));
-  if (!s.ok()) {
-    LOG(FATAL) << "Couldn't parse " << FLAGS_tserver_master_addrs << " flag: " << s.ToString();
-  }
-
+  SetMasterAddresses(std::move(master_addresses));
   ValidateMasterAddresses();
 }
 
+
 void TabletServerOptions::ValidateMasterAddresses() const {
-  addresses_shared_ptr master_addresses = GetMasterAddresses();
+  auto master_addresses = GetMasterAddresses();
   if (master_addresses->empty()) {
     LOG(FATAL) << "No masters were specified in the master addresses flag '"
                << master_addresses_flag << "', but a minimum of one is required.";

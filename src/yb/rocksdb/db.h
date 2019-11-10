@@ -21,8 +21,8 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_DB_H
-#define ROCKSDB_INCLUDE_ROCKSDB_DB_H
+#ifndef YB_ROCKSDB_DB_H
+#define YB_ROCKSDB_DB_H
 
 #include <stdint.h>
 #include <stdio.h>
@@ -39,7 +39,7 @@
 #include "yb/rocksdb/thread_status.h"
 #include "yb/rocksdb/transaction_log.h"
 #include "yb/rocksdb/types.h"
-#include "yb/rocksdb/version.h"
+#include "yb/util/result.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -94,9 +94,6 @@ class ColumnFamilyHandle {
   virtual Status GetDescriptor(ColumnFamilyDescriptor* desc) = 0;
 };
 
-static const int kMajorVersion = __ROCKSDB_MAJOR__;
-static const int kMinorVersion = __ROCKSDB_MINOR__;
-
 // A range of keys
 struct Range {
   Slice start;          // Included in the range
@@ -105,6 +102,8 @@ struct Range {
   Range() { }
   Range(const Slice& s, const Slice& l) : start(s), limit(l) { }
 };
+
+YB_DEFINE_ENUM(FlushAbility, (kNoNewData)(kHasNewData)(kAlreadyFlushing))
 
 // A collections of table properties objects, where
 //  key: is the table's file name.
@@ -125,6 +124,8 @@ class DB {
   static Status Open(const Options& options,
                      const std::string& name,
                      DB** dbptr);
+
+  static yb::Result<std::unique_ptr<DB>> Open(const Options& options, const std::string& name);
 
   // Open the database for read only. All DB interfaces
   // that modify data, like put/delete, will return error.
@@ -628,6 +629,8 @@ class DB {
     return SetOptions(DefaultColumnFamily(), new_options);
   }
 
+  virtual void SetDisableFlushOnShutdown(bool disable_flush_on_shutdown) {}
+
   // CompactFiles() inputs a list of files specified by file numbers and
   // compacts them to the specified level. Note that the behavior is different
   // from CompactRange() in that CompactFiles() performs the compaction job
@@ -691,6 +694,8 @@ class DB {
   // Get Env object from the DB
   virtual Env* GetEnv() const = 0;
 
+  virtual Env* GetCheckpointEnv() const = 0;
+
   // Get DB Options that we use.  During the process of opening the
   // column family, the options provided when calling DB::Open() or
   // DB::CreateColumnFamily() will have been "sanitized" and transformed
@@ -708,6 +713,12 @@ class DB {
                        ColumnFamilyHandle* column_family) = 0;
   virtual Status Flush(const FlushOptions& options) {
     return Flush(options, DefaultColumnFamily());
+  }
+
+  // Wait for end of mem-table data flushing.
+  virtual Status WaitForFlush(ColumnFamilyHandle* column_family) = 0;
+  virtual Status WaitForFlush() {
+    return WaitForFlush(DefaultColumnFamily());
   }
 
   // Sync the wal. Note that Write() followed by SyncWAL() is not exactly the
@@ -780,14 +791,39 @@ class DB {
   // path relative to the db directory. eg. 000001.sst, /archive/000003.log
   virtual Status DeleteFile(std::string name) = 0;
 
-  // Returns the total combined size of all the SST Files in the rocksdb instance.
-  virtual uint64_t GetTotalSSTFileSize() { return 0; }
+  // Returns the total combined size of all the SST Files for the current version in the rocksdb
+  // instance.
+  virtual uint64_t GetCurrentVersionSstFilesSize() { return 0; }
+  virtual uint64_t GetCurrentVersionSstFilesUncompressedSize() { return 0; }
 
-  // Returns a list of all table files with their level, start key
-  // and end key
+  // Returns total number of SST Files.
+  virtual uint64_t GetCurrentVersionNumSSTFiles() { return 0; }
+
+  // Returns the combined size of all the SST Files data blocks for the current version in the
+  // rocksdb instance.
+  virtual uint64_t GetCurrentVersionDataSstFilesSize() { return 0; }
+
+  // Returns a list of all table files for the current version with their level, start key and end
+  // key.
   virtual void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* /*metadata*/) {}
 
-  virtual OpId GetFlushedOpId() { return OpId(); }
+  std::vector<LiveFileMetaData> GetLiveFilesMetaData() {
+    std::vector<LiveFileMetaData> result;
+    GetLiveFilesMetaData(&result);
+    return result;
+  }
+
+  virtual UserFrontierPtr GetFlushedFrontier() { return nullptr; }
+
+  virtual CHECKED_STATUS ModifyFlushedFrontier(
+      UserFrontierPtr values,
+      FrontierModificationMode mode) {
+    return Status::OK();
+  }
+
+  virtual FlushAbility GetFlushAbility() { return FlushAbility::kHasNewData; }
+
+  virtual UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) { return nullptr; }
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -859,6 +895,11 @@ class DB {
     return STATUS(NotSupported, "");
   }
 
+  virtual bool NeedsDelay() { return false; }
+
+  // Used in testing to make the old memtable immutable and start writing to a new one.
+  virtual void TEST_SwitchMemtable() {}
+
  private:
   // No copying allowed
   DB(const DB&);
@@ -879,4 +920,4 @@ Status RepairDB(const std::string& dbname, const Options& options);
 
 }  // namespace rocksdb
 
-#endif  // ROCKSDB_INCLUDE_ROCKSDB_DB_H
+#endif  // YB_ROCKSDB_DB_H

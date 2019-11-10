@@ -35,6 +35,7 @@
 #include <mutex>
 #include <functional>
 
+#include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_peers.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/opid_util.h"
@@ -49,6 +50,8 @@
 #include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/status.h"
+
+using namespace std::literals;
 
 namespace yb {
 namespace consensus {
@@ -77,10 +80,11 @@ Status VoteCounter::RegisterVote(const std::string& voter_uuid, ElectionVote vot
     // Detect changed votes.
     ElectionVote prior_vote = votes_[voter_uuid];
     if (PREDICT_FALSE(prior_vote != vote)) {
-      string msg = Substitute("Peer $0 voted a different way twice in the same election. "
-                              "First vote: $1, second vote: $2.",
-                              voter_uuid, prior_vote, vote);
-      return STATUS(InvalidArgument, msg);
+      return STATUS_FORMAT(
+          InvalidArgument,
+          "Peer $0 voted a different way twice in the same election. "
+          "First vote: $1, second vote: $2.",
+          voter_uuid, prior_vote, vote);
     }
 
     // This was just a duplicate. Allow the caller to log it but don't change
@@ -103,32 +107,27 @@ Status VoteCounter::RegisterVote(const std::string& voter_uuid, ElectionVote vot
   // This is a valid vote, so store it.
   InsertOrDie(&votes_, voter_uuid, vote);
   switch (vote) {
-    case VOTE_GRANTED:
+    case ElectionVote::kGranted:
       ++yes_votes_;
       break;
-    case VOTE_DENIED:
+    case ElectionVote::kDenied:
       ++no_votes_;
       break;
+    case ElectionVote::kUnknown:
+      return STATUS_FORMAT(InvalidArgument, "Invalid vote: $0", vote);
   }
   *is_duplicate = false;
   return Status::OK();
 }
 
-bool VoteCounter::IsDecided() const {
-  return yes_votes_ >= majority_size_ ||
-         no_votes_ > num_voters_ - majority_size_;
-}
-
-Status VoteCounter::GetDecision(ElectionVote* decision) const {
+ElectionVote VoteCounter::GetDecision() const {
   if (yes_votes_ >= majority_size_) {
-    *decision = VOTE_GRANTED;
-    return Status::OK();
+    return ElectionVote::kGranted;
   }
   if (no_votes_ > num_voters_ - majority_size_) {
-    *decision = VOTE_DENIED;
-    return Status::OK();
+    return ElectionVote::kDenied;
   }
-  return STATUS(IllegalState, "Vote not yet decided");
+  return ElectionVote::kUnknown;
 }
 
 int VoteCounter::GetTotalVotesCounted() const {
@@ -140,50 +139,22 @@ bool VoteCounter::AreAllVotesIn() const {
 }
 
 ///////////////////////////////////////////////////
-// ElectionResult
-///////////////////////////////////////////////////
-
-ElectionResult::ElectionResult(ConsensusTerm election_term_,
-                               ElectionVote decision_,
-                               MonoTime old_leader_lease_expiration_,
-                               MicrosTime old_leader_ht_lease_expiration_)
-  : election_term(election_term_),
-    decision(decision_),
-    has_higher_term(false),
-    higher_term(kMinimumTerm),
-    old_leader_lease_expiration(old_leader_lease_expiration_),
-    old_leader_ht_lease_expiration(old_leader_ht_lease_expiration_) {
-}
-
-ElectionResult::ElectionResult(ConsensusTerm election_term,
-                               ElectionVote decision,
-                               ConsensusTerm higher_term,
-                               const std::string& message)
-  : election_term(election_term),
-    decision(decision),
-    has_higher_term(true),
-    higher_term(higher_term),
-    message(message),
-    old_leader_ht_lease_expiration(HybridTime::kMin.GetPhysicalValueMicros()) {
-  CHECK_EQ(VOTE_DENIED, decision);
-  CHECK_GT(higher_term, election_term);
-  DCHECK(!message.empty());
-}
-
-///////////////////////////////////////////////////
 // LeaderElection
 ///////////////////////////////////////////////////
 
 LeaderElection::LeaderElection(const RaftConfigPB& config,
                                PeerProxyFactory* proxy_factory,
                                const VoteRequestPB& request,
-                               gscoped_ptr<VoteCounter> vote_counter,
+                               std::unique_ptr<VoteCounter> vote_counter,
                                MonoDelta timeout,
+                               PreElection preelection,
+                               TEST_SuppressVoteRequest suppress_vote_request,
                                ElectionDecisionCallback decision_callback)
-    : has_responded_(false),
-      request_(request),
-      vote_counter_(vote_counter.Pass()),
-      timeout_(std::move(timeout)),
+    : request_(request),
+      result_(preelection, request.candidate_term()),
+      vote_counter_(std::move(vote_counter)),
+      timeout_(timeout),
+      suppress_vote_request_(suppress_vote_request),
       decision_callback_(std::move(decision_callback)) {
   for (const RaftPeerPB& peer : config.peers()) {
     if (request.candidate_uuid() == peer.permanent_uuid()) continue;
@@ -196,9 +167,9 @@ LeaderElection::LeaderElection(const RaftConfigPB& config,
 
     voting_follower_uuids_.push_back(peer.permanent_uuid());
 
-    gscoped_ptr<VoterState> state(new VoterState());
-    state->proxy_status = proxy_factory->NewProxy(peer, &state->proxy);
-    InsertOrDie(&voter_state_, peer.permanent_uuid(), state.release());
+    auto state = std::make_unique<VoterState>();
+    state->proxy = proxy_factory->NewProxy(peer);
+    CHECK(voter_state_.emplace(peer.permanent_uuid(), std::move(state)).second);
   }
 
   // Ensure that the candidate has already voted for itself.
@@ -208,14 +179,14 @@ LeaderElection::LeaderElection(const RaftConfigPB& config,
   CHECK_EQ(vote_counter_->GetTotalVotesCounted() + voting_follower_uuids_.size(),
            vote_counter_->GetTotalExpectedVotes())
       << "Expected different number of followers. Follower UUIDs: ["
-      << JoinStringsIterator(voting_follower_uuids_.begin(), voting_follower_uuids_.end(), ", ")
+      << yb::ToString(voting_follower_uuids_)
       << "]; RaftConfig: {" << config.ShortDebugString() << "}";
 }
 
 LeaderElection::~LeaderElection() {
   std::lock_guard<Lock> guard(lock_);
   DCHECK(has_responded_); // We must always call the callback exactly once.
-  STLDeleteValues(&voter_state_);
+  voter_state_.clear();
 }
 
 void LeaderElection::Run() {
@@ -230,23 +201,14 @@ void LeaderElection::Run() {
     VoterState* state = nullptr;
     {
       std::lock_guard<Lock> guard(lock_);
-      state = FindOrDie(voter_state_, voter_uuid);
+      if (result_.decided()) { // Already have result.
+        break;
+      }
+      auto it = voter_state_.find(voter_uuid);
+      CHECK(it != voter_state_.end());
+      state = it->second.get();
       // Safe to drop the lock because voter_state_ is not mutated outside of
       // the constructor / destructor. We do this to avoid deadlocks below.
-    }
-
-    // If we failed to construct the proxy, just record a 'NO' vote with the status
-    // that indicates why it failed.
-    if (!state->proxy_status.ok()) {
-      LOG_WITH_PREFIX(WARNING) << "Was unable to construct an RPC proxy to peer "
-                               << voter_uuid << ": " << state->proxy_status.ToString()
-                               << ". Counting it as a 'NO' vote.";
-      {
-        std::lock_guard<Lock> guard(lock_);
-        RecordVoteUnlocked(voter_uuid, VOTE_DENIED);
-      }
-      CheckForDecision();
-      continue;
     }
 
     // Send the RPC request.
@@ -256,11 +218,15 @@ void LeaderElection::Run() {
     state->request = request_;
     state->request.set_dest_uuid(voter_uuid);
 
-    state->proxy->RequestConsensusVoteAsync(
-        &state->request, &state->response, &state->rpc,
-        // We use gutil Bind() for the refcounting and std::bind to adapt the
-        // gutil Callback to a thunk.
-        std::bind(&Closure::Run, Bind(&LeaderElection::VoteResponseRpcCallback, this, voter_uuid)));
+    LeaderElectionPtr retained_self = this;
+    if (!suppress_vote_request_) {
+      state->proxy->RequestConsensusVoteAsync(
+          &state->request, &state->response, &state->rpc,
+          std::bind(&LeaderElection::VoteResponseRpcCallback, this, voter_uuid, retained_self));
+    } else {
+      state->response.set_responder_uuid(voter_uuid);
+      VoteResponseRpcCallback(voter_uuid, retained_self);
+    }
   }
 }
 
@@ -269,20 +235,16 @@ void LeaderElection::CheckForDecision() {
   {
     std::lock_guard<Lock> guard(lock_);
     // Check if the vote has been newly decided.
-    if (!result_ && vote_counter_->IsDecided()) {
-      ElectionVote decision;
-      CHECK_OK(vote_counter_->GetDecision(&decision));
+    auto decision = vote_counter_->GetDecision();
+    if (!result_.decided() && decision != ElectionVote::kUnknown) {
       LOG_WITH_PREFIX(INFO) << "Election decided. Result: candidate "
-                << ((decision == VOTE_GRANTED) ? "won." : "lost.");
-      result_.emplace(election_term(),
-                      decision,
-                      old_leader_lease_expiration_,
-                      old_leader_ht_lease_expiration_);
+                << ((decision == ElectionVote::kGranted) ? "won." : "lost.");
+      result_.decision = decision;
     }
     // Check whether to respond. This can happen as a result of either getting
     // a majority vote or of something invalidating the election, like
     // observing a higher term.
-    if (result_ && !has_responded_) {
+    if (result_.decided() && !has_responded_) {
       has_responded_ = true;
       to_respond = true;
     }
@@ -291,34 +253,47 @@ void LeaderElection::CheckForDecision() {
   // Respond outside of the lock.
   if (to_respond) {
     // This is thread-safe since result_ is write-once.
-    decision_callback_.Run(*result_);
+    decision_callback_(result_);
   }
 }
 
-void LeaderElection::VoteResponseRpcCallback(const std::string& voter_uuid) {
+void LeaderElection::VoteResponseRpcCallback(const std::string& voter_uuid,
+                                             const LeaderElectionPtr& self) {
   {
     std::lock_guard<Lock> guard(lock_);
-    VoterState* state = FindOrDie(voter_state_, voter_uuid);
+
+    if (has_responded_) {
+      return;
+    }
+
+    auto it = voter_state_.find(voter_uuid);
+    CHECK(it != voter_state_.end());
+    VoterState* state = it->second.get();
 
     // Check for RPC errors.
     if (!state->rpc.status().ok()) {
       LOG_WITH_PREFIX(WARNING) << "RPC error from VoteRequest() call to peer " << voter_uuid
                   << ": " << state->rpc.status().ToString();
-      RecordVoteUnlocked(voter_uuid, VOTE_DENIED);
+      RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);
 
     // Check for tablet errors.
     } else if (state->response.has_error()) {
       LOG_WITH_PREFIX(WARNING) << "Tablet error from VoteRequest() call to peer "
                    << voter_uuid << ": "
                    << StatusFromPB(state->response.error().status()).ToString();
-      RecordVoteUnlocked(voter_uuid, VOTE_DENIED);
+      RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);
 
     // If the peer changed their IP address, we shouldn't count this vote since
     // our knowledge of the configuration is in an inconsistent state.
     } else if (PREDICT_FALSE(voter_uuid != state->response.responder_uuid())) {
       LOG_WITH_PREFIX(DFATAL) << "Received vote response from peer we thought had UUID "
                   << voter_uuid << ", but its actual UUID is " << state->response.responder_uuid();
-      RecordVoteUnlocked(voter_uuid, VOTE_DENIED);
+      RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);
+
+    // Node does not support preelection
+    } else if (result_.preelection && !state->response.preelection()) {
+      result_.preelections_not_supported_by_uuid = voter_uuid;
+      HandleVoteDeniedUnlocked(voter_uuid, *state);
 
     // Count the granted votes.
     } else if (state->response.vote_granted()) {
@@ -355,16 +330,18 @@ void LeaderElection::RecordVoteUnlocked(const std::string& voter_uuid, ElectionV
 
 void LeaderElection::HandleHigherTermUnlocked(const string& voter_uuid, const VoterState& state) {
   DCHECK(lock_.is_locked());
-  DCHECK_GT(state.response.responder_term(), election_term());
+  DCHECK_GT(state.response.responder_term(), consensus_term());
 
   string msg = Substitute("Vote denied by peer $0 with higher term. Message: $1",
                           state.response.responder_uuid(),
                           StatusFromPB(state.response.consensus_error().status()).ToString());
   LOG_WITH_PREFIX(WARNING) << msg;
 
-  if (!result_) {
+  if (!result_.decided()) {
     LOG_WITH_PREFIX(INFO) << "Cancelling election due to peer responding with higher term";
-    result_.emplace(election_term(), VOTE_DENIED, state.response.responder_term(), msg);
+    result_.decision = ElectionVote::kDenied;
+    result_.higher_term = state.response.responder_term();
+    result_.message = msg;
   }
 }
 
@@ -373,18 +350,20 @@ void LeaderElection::HandleVoteGrantedUnlocked(const string& voter_uuid, const V
   DCHECK_EQ(state.response.responder_term(), election_term());
   DCHECK(state.response.vote_granted());
   if (state.response.has_remaining_leader_lease_duration_ms()) {
-    old_leader_lease_expiration_.MakeAtLeast(MonoTime::FineNow() +
-        MonoDelta::FromMilliseconds(state.response.remaining_leader_lease_duration_ms()));
+    CoarseTimeLease lease(
+        state.response.leader_lease_uuid(),
+        CoarseMonoClock::Now() + state.response.remaining_leader_lease_duration_ms() * 1ms);
+    result_.old_leader_lease.TryUpdate(lease);
   }
 
   if (state.response.has_leader_ht_lease_expiration()) {
-    old_leader_ht_lease_expiration_ = std::max(
-        old_leader_ht_lease_expiration_,
-        state.response.leader_ht_lease_expiration());
+    PhysicalComponentLease lease(
+        state.response.leader_ht_lease_uuid(), state.response.leader_ht_lease_expiration());
+    result_.old_leader_ht_lease.TryUpdate(lease);
   }
 
   LOG_WITH_PREFIX(INFO) << "Vote granted by peer " << voter_uuid;
-  RecordVoteUnlocked(voter_uuid, VOTE_GRANTED);
+  RecordVoteUnlocked(voter_uuid, ElectionVote::kGranted);
 }
 
 void LeaderElection::HandleVoteDeniedUnlocked(const string& voter_uuid, const VoterState& state) {
@@ -393,20 +372,21 @@ void LeaderElection::HandleVoteDeniedUnlocked(const string& voter_uuid, const Vo
 
   // If one of the voters responds with a greater term than our own, and we
   // have not yet triggered the decision callback, it cancels the election.
-  if (state.response.responder_term() > election_term()) {
+  if (state.response.responder_term() > consensus_term()) {
     return HandleHigherTermUnlocked(voter_uuid, state);
   }
 
   LOG_WITH_PREFIX(INFO) << "Vote denied by peer " << voter_uuid << ". Message: "
             << StatusFromPB(state.response.consensus_error().status()).ToString();
-  RecordVoteUnlocked(voter_uuid, VOTE_DENIED);
+  RecordVoteUnlocked(voter_uuid, ElectionVote::kDenied);
 }
 
 std::string LeaderElection::LogPrefix() const {
-  return Substitute("T $0 P $1 [CANDIDATE]: Term $2 election: ",
+  return Substitute("T $0 P $1 [CANDIDATE]: Term $2 $3election: ",
                     request_.tablet_id(),
                     request_.candidate_uuid(),
-                    request_.candidate_term());
+                    request_.candidate_term(),
+                    (result_.preelection ? "pre-" : ""));
 }
 
 } // namespace consensus

@@ -39,6 +39,7 @@
 
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/operations/operation_driver.h"
 #include "yb/util/flag_tags.h"
@@ -64,9 +65,9 @@ METRIC_DEFINE_gauge_uint64(tablet, write_operations_inflight,
                            yb::MetricUnit::kOperations,
                            "Number of write operations currently in-flight");
 METRIC_DEFINE_gauge_uint64(tablet, alter_schema_operations_inflight,
-                           "Alter Schema Operations In Flight",
+                           "Change Metadata Operations In Flight",
                            yb::MetricUnit::kOperations,
-                           "Number of alter schema operations currently in-flight");
+                           "Number of change metadata operations currently in-flight");
 METRIC_DEFINE_gauge_uint64(tablet, update_transaction_operations_inflight,
                            "Update Transaction Operations In Flight",
                            yb::MetricUnit::kOperations,
@@ -75,6 +76,14 @@ METRIC_DEFINE_gauge_uint64(tablet, snapshot_operations_inflight,
                            "Snapshot Operations In Flight",
                            yb::MetricUnit::kOperations,
                            "Number of snapshot operations currently in-flight");
+METRIC_DEFINE_gauge_uint64(tablet, truncate_operations_inflight,
+                           "Truncate Operations In Flight",
+                           yb::MetricUnit::kOperations,
+                           "Number of truncate operations currently in-flight");
+METRIC_DEFINE_gauge_uint64(tablet, empty_operations_inflight,
+                           "Empty Operations In Flight",
+                           yb::MetricUnit::kOperations,
+                           "Number of none operations currently in-flight");
 
 METRIC_DEFINE_counter(tablet, operation_memory_pressure_rejections,
                       "Operation Memory Pressure Rejections",
@@ -92,27 +101,26 @@ using strings::Substitute;
 
 #define MINIT(x) x(METRIC_##x.Instantiate(entity))
 #define GINIT(x) x(METRIC_##x.Instantiate(entity, 0))
+#define INSTANTIATE(upper, lower) \
+  operations_inflight[to_underlying(OperationType::BOOST_PP_CAT(k, upper))] = \
+      BOOST_PP_CAT(BOOST_PP_CAT(METRIC_, lower), _operations_inflight).Instantiate(entity, 0);
 OperationTracker::Metrics::Metrics(const scoped_refptr<MetricEntity>& entity)
     : GINIT(all_operations_inflight),
       MINIT(operation_memory_pressure_rejections) {
-  operations_inflight[Operation::WRITE_TXN] =
-      METRIC_write_operations_inflight.Instantiate(entity, 0);
-  operations_inflight[Operation::ALTER_SCHEMA_TXN] =
-      METRIC_alter_schema_operations_inflight.Instantiate(entity, 0);
-  operations_inflight[Operation::UPDATE_TRANSACTION_TXN] =
-      METRIC_update_transaction_operations_inflight.Instantiate(entity, 0);
-  operations_inflight[Operation::SNAPSHOT_TXN] =
-      METRIC_snapshot_operations_inflight.Instantiate(entity, 0);
-  static_assert(4 == Operation::kOperationTypes, "Init metrics for all operation types");
+  INSTANTIATE(Write, write);
+  INSTANTIATE(ChangeMetadata, alter_schema);
+  INSTANTIATE(UpdateTransaction, update_transaction);
+  INSTANTIATE(Snapshot, snapshot);
+  INSTANTIATE(Truncate, truncate);
+  INSTANTIATE(Empty, empty);
+  static_assert(6 == kElementsInOperationType, "Init metrics for all operation types");
 }
+#undef INSTANTIATE
 #undef GINIT
 #undef MINIT
 
-OperationTracker::State::State()
-  : memory_footprint(0) {
-}
-
-OperationTracker::OperationTracker() {
+OperationTracker::OperationTracker(const std::string& log_prefix)
+    : log_prefix_(log_prefix) {
 }
 
 OperationTracker::~OperationTracker() {
@@ -124,19 +132,19 @@ OperationTracker::~OperationTracker() {
 }
 
 Status OperationTracker::Add(OperationDriver* driver) {
-  int64_t driver_mem_footprint = driver->state()->request()->SpaceUsed();
+  int64_t driver_mem_footprint = driver->SpaceUsed();
   if (mem_tracker_ && !mem_tracker_->TryConsume(driver_mem_footprint)) {
     if (metrics_) {
       metrics_->operation_memory_pressure_rejections->Increment();
     }
 
     // May be null in unit tests.
-    TabletPeer* peer = driver->state()->tablet_peer();
+    Tablet* tablet = driver->state()->tablet();
 
     string msg = Substitute(
         "Operation failed, tablet $0 operation memory consumption ($1) "
         "has exceeded its limit ($2) or the limit of an ancestral tracker",
-        peer ? peer->tablet()->tablet_id() : "(unknown)",
+        tablet ? tablet->tablet_id() : "(unknown)",
         mem_tracker_->consumption(), mem_tracker_->limit());
 
     YB_LOG_EVERY_N_SECS(WARNING, 1) << msg << THROTTLE_MSG;
@@ -161,7 +169,7 @@ void OperationTracker::IncrementCounters(const OperationDriver& driver) const {
   }
 
   metrics_->all_operations_inflight->Increment();
-  metrics_->operations_inflight[driver.operation_type()]->Increment();
+  metrics_->operations_inflight[to_underlying(driver.operation_type())]->Increment();
 }
 
 void OperationTracker::DecrementCounters(const OperationDriver& driver) const {
@@ -171,27 +179,38 @@ void OperationTracker::DecrementCounters(const OperationDriver& driver) const {
 
   DCHECK_GT(metrics_->all_operations_inflight->value(), 0);
   metrics_->all_operations_inflight->Decrement();
-  DCHECK_GT(metrics_->operations_inflight[driver.operation_type()]->value(), 0);
-  metrics_->operations_inflight[driver.operation_type()]->Decrement();
+  auto index = to_underlying(driver.operation_type());
+  DCHECK_GT(metrics_->operations_inflight[index]->value(), 0);
+  metrics_->operations_inflight[index]->Decrement();
 }
 
-void OperationTracker::Release(OperationDriver* driver) {
+void OperationTracker::Release(OperationDriver* driver, OpIds* applied_op_ids) {
   DecrementCounters(*driver);
 
   State st;
+  yb::OpId op_id = driver->GetOpId();
+  OperationType operation_type = driver->operation_type();
   {
     // Remove the operation from the map, retaining the state for use
     // below.
     std::lock_guard<simple_spinlock> l(lock_);
     st = FindOrDie(pending_operations_, driver);
     if (PREDICT_FALSE(pending_operations_.erase(driver) != 1)) {
-      LOG(FATAL) << "Could not remove pending operation from map: "
+      LOG_WITH_PREFIX(FATAL) << "Could not remove pending operation from map: "
           << driver->ToStringUnlocked();
     }
   }
 
-  if (mem_tracker_) {
+  if (mem_tracker_ && st.memory_footprint) {
     mem_tracker_->Release(st.memory_footprint);
+  }
+
+  if (operation_type != OperationType::kEmpty) {
+    if (applied_op_ids) {
+      applied_op_ids->push_back(op_id);
+    } else if (post_tracker_) {
+      post_tracker_(op_id);
+    }
   }
 }
 
@@ -221,7 +240,7 @@ Status OperationTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
   const int complain_ms = 1000;
   int wait_time = 250;
   int num_complaints = 0;
-  MonoTime start_time = MonoTime::Now(MonoTime::FINE);
+  MonoTime start_time = MonoTime::Now();
   while (1) {
     auto operations = GetPendingOperations();
 
@@ -229,7 +248,7 @@ Status OperationTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
       break;
     }
 
-    MonoDelta diff = MonoTime::Now(MonoTime::FINE).GetDeltaSince(start_time);
+    MonoDelta diff = MonoTime::Now().GetDeltaSince(start_time);
     if (diff.MoreThan(timeout)) {
       return STATUS(TimedOut, Substitute("Timed out waiting for all operations to finish. "
                                          "$0 operations pending. Waited for $1",
@@ -237,15 +256,16 @@ Status OperationTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
     }
     int64_t waited_ms = diff.ToMilliseconds();
     if (waited_ms / complain_ms > num_complaints) {
-      LOG(WARNING) << Substitute("OperationTracker waiting for $0 outstanding operations to"
-                                 " complete now for $1 ms", operations.size(), waited_ms);
+      LOG_WITH_PREFIX(WARNING)
+          << Substitute("OperationTracker waiting for $0 outstanding operations to"
+                        " complete now for $1 ms", operations.size(), waited_ms);
       num_complaints++;
     }
     wait_time = std::min(wait_time * 5 / 4, 1000000);
 
-    LOG(INFO) << "Dumping currently running operations: ";
+    LOG_WITH_PREFIX(INFO) << "Dumping currently running operations: ";
     for (scoped_refptr<OperationDriver> driver : operations) {
-      LOG(INFO) << driver->ToString();
+      LOG_WITH_PREFIX(INFO) << driver->ToString();
     }
     SleepFor(MonoDelta::FromMicroseconds(wait_time));
   }

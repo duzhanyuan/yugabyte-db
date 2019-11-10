@@ -39,9 +39,10 @@
 
 #include "yb/common/partial_row.h"
 #include "yb/common/row.h"
-#include "yb/common/row_operations.h"
+#include "yb/common/ql_protocol.pb.h"
 #include "yb/docdb/docdb.pb.h"
 #include "yb/docdb/doc_key.h"
+#include "yb/util/yb_partition.h"
 
 namespace yb {
 
@@ -52,46 +53,80 @@ using docdb::PrimitiveValue;
 using docdb::ValueType;
 
 inline Schema GetSimpleTestSchema() {
-  return Schema({ ColumnSchema("key", INT32),
+  return Schema({ ColumnSchema("key", INT32, false, true),
                   ColumnSchema("int_val", INT32),
                   ColumnSchema("string_val", STRING, true) },
                 1);
 }
 
-inline void AddTestRowWithNullableStringToPB(RowOperationsPB::Type op_type,
-                                             const Schema& schema,
-                                             int32_t key,
-                                             int32_t int_val,
-                                             const char* string_val,
-                                             RowOperationsPB* ops) {
-  DCHECK(schema.initialized());
-  YBPartialRow row(&schema);
-  CHECK_OK(row.SetInt32("key", key));
-  CHECK_OK(row.SetInt32("int_val", int_val));
-  if (string_val) {
-    CHECK_OK(row.SetStringCopy("string_val", string_val));
-  }
-  RowOperationsPBEncoder enc(ops);
-  enc.Add(op_type, row);
+template <class WriteRequestPB, class Type>
+QLWriteRequestPB* TestRow(int32_t key, Type type, WriteRequestPB* req) {
+  auto wb = req->add_ql_write_batch();
+  wb->set_schema_version(0);
+  wb->set_type(type);
+
+  std::string hash_key;
+  YBPartition::AppendIntToKey<int32_t, uint32_t>(key, &hash_key);
+  wb->set_hash_code(YBPartition::HashColumnCompoundValue(hash_key));
+  wb->add_hashed_column_values()->mutable_value()->set_int32_value(key);
+  return wb;
 }
 
-inline void AddTestRowToPB(RowOperationsPB::Type op_type,
-                           const Schema& schema,
-                           int32_t key,
-                           int32_t int_val,
-                           const string& string_val,
-                           RowOperationsPB* ops) {
-  AddTestRowWithNullableStringToPB(op_type, schema, key, int_val, string_val.c_str(), ops);
+template <class WriteRequestPB>
+QLWriteRequestPB* AddTestRowDelete(int32_t key, WriteRequestPB* req) {
+  return TestRow(key, QLWriteRequestPB::QL_STMT_DELETE, req);
 }
 
-inline void AddTestKeyToPB(RowOperationsPB::Type op_type,
-                           const Schema& schema,
-                           int32_t key,
-                           RowOperationsPB* ops) {
-  YBPartialRow row(&schema);
-  CHECK_OK(row.SetInt32(0, key));
-  RowOperationsPBEncoder enc(ops);
-  enc.Add(op_type, row);
+template <class WriteRequestPB>
+QLWriteRequestPB* AddTestRowInsert(int32_t key, WriteRequestPB* req) {
+  return TestRow(key, QLWriteRequestPB::QL_STMT_INSERT, req);
+}
+
+template <class Type, class WriteRequestPB>
+QLWriteRequestPB* AddTestRow(int32_t key,
+                int32_t int_val,
+                Type type,
+                WriteRequestPB* req) {
+  auto wb = TestRow(key, type, req);
+  auto column_value = wb->add_column_values();
+  column_value->set_column_id(kFirstColumnId + 1);
+  column_value->mutable_expr()->mutable_value()->set_int32_value(int_val);
+  return wb;
+}
+
+template <class Type, class WriteRequestPB>
+void AddTestRow(int32_t key,
+                int32_t int_val,
+                const string& string_val,
+                Type type,
+                WriteRequestPB* req) {
+  auto wb = AddTestRow(key, int_val, type, req);
+  auto column_value = wb->add_column_values();
+  column_value->set_column_id(kFirstColumnId + 2);
+  column_value->mutable_expr()->mutable_value()->set_string_value(string_val);
+}
+
+template <class WriteRequestPB>
+void AddTestRowInsert(int32_t key,
+                      int32_t int_val,
+                      WriteRequestPB* req) {
+  AddTestRow(key, int_val, QLWriteRequestPB::QL_STMT_INSERT, req);
+}
+
+template <class WriteRequestPB>
+void AddTestRowInsert(int32_t key,
+                      int32_t int_val,
+                      const string& string_val,
+                      WriteRequestPB* req) {
+  AddTestRow(key, int_val, string_val, QLWriteRequestPB::QL_STMT_INSERT, req);
+}
+
+template <class WriteRequestPB>
+void AddTestRowUpdate(int32_t key,
+                      int32_t int_val,
+                      const string& string_val,
+                      WriteRequestPB* req) {
+  AddTestRow(key, int_val, string_val, QLWriteRequestPB::QL_STMT_UPDATE, req);
 }
 
 inline void AddKVToPB(int32_t key_val,
@@ -103,12 +138,15 @@ inline void AddKVToPB(int32_t key_val,
 
   auto add_kv_pair =
     [&](const SubDocKey &subdoc_key, const PrimitiveValue &primitive_value) {
-        KeyValuePairPB *const kv = write_batch->add_kv_pairs();
+        KeyValuePairPB *const kv = write_batch->add_write_pairs();
         kv->set_key(subdoc_key.Encode().AsStringRef());
         kv->set_value(primitive_value.ToValue());
     };
 
-  const DocKey doc_key({PrimitiveValue::Int32(key_val)});
+  std::string hash_key;
+  YBPartition::AppendIntToKey<int32_t, uint32_t>(key_val, &hash_key);
+  auto hash = YBPartition::HashColumnCompoundValue(hash_key);
+  const DocKey doc_key(hash, {PrimitiveValue::Int32(key_val)}, {});
   add_kv_pair(SubDocKey(doc_key, PrimitiveValue(int_val_col_id)),
               PrimitiveValue::Int32(int_val));
   add_kv_pair(SubDocKey(doc_key, PrimitiveValue(string_val_col_id)),

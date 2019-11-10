@@ -26,7 +26,7 @@ class ServerEvent {
  public:
   virtual ~ServerEvent() {}
   // Serializes the data to be sent out via the RPC framework.
-  virtual void Serialize(std::deque<RefCntBuffer> *output) const = 0;
+  virtual void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) const = 0;
   virtual std::string ToString() const = 0;
 };
 
@@ -38,8 +38,6 @@ class ServerEventList : public OutboundData {
     return false;
   }
 };
-
-typedef std::shared_ptr<ServerEventList> ServerEventListPtr;
 
 }  // namespace rpc
 }  // namespace yb

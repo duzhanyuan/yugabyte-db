@@ -21,9 +21,10 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_COMPARATOR_H
-#define ROCKSDB_INCLUDE_ROCKSDB_COMPARATOR_H
+#ifndef YB_ROCKSDB_COMPARATOR_H
+#define YB_ROCKSDB_COMPARATOR_H
 
+#include <memory>
 #include <string>
 
 #include "yb/util/slice.h"
@@ -81,15 +82,26 @@ class Comparator {
   virtual void FindShortSuccessor(std::string* key) const = 0;
 };
 
+typedef std::shared_ptr<const Comparator> ComparatorPtr;
+
 // Return a builtin comparator that uses lexicographic byte-wise
 // ordering.  The result remains the property of this module and
 // must not be deleted.
 extern const Comparator* BytewiseComparator();
 
+extern const ComparatorPtr& SharedBytewiseComparator();
+
 // Return a builtin comparator that uses reverse lexicographic byte-wise
 // ordering.
 extern const Comparator* ReverseBytewiseComparator();
 
+// Returns a user key comparator that can be used for comparing two uint64_t
+// slices. Instead of comparing slices byte-wise, it compares all the 8 bytes
+// at once. Assumes same endian-ness is used though the database's lifetime.
+// Symantics of comparison would differ from Bytewise comparator in little
+// endian machines.
+extern const Comparator* Uint64Comparator();
+
 }  // namespace rocksdb
 
-#endif // ROCKSDB_INCLUDE_ROCKSDB_COMPARATOR_H
+#endif // YB_ROCKSDB_COMPARATOR_H

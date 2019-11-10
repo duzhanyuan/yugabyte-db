@@ -35,11 +35,14 @@
 
 #include "yb/tserver/remote_bootstrap-test-base.h"
 
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/quorum_util.h"
 #include "yb/gutil/strings/fastmem.h"
+#include "yb/rpc/messenger.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tserver/remote_bootstrap_client.h"
 #include "yb/util/env_util.h"
+#include "yb/util/net/net_util.h"
 
 using std::shared_ptr;
 
@@ -48,15 +51,17 @@ namespace tserver {
 
 using consensus::GetRaftConfigLeader;
 using consensus::RaftPeerPB;
-using tablet::TabletMetadata;
+using tablet::RaftGroupMetadata;
+using tablet::RaftGroupMetadataPtr;
 using tablet::TabletStatusListener;
 
 class RemoteBootstrapClientTest : public RemoteBootstrapTest {
+  typedef enterprise::RemoteBootstrapClient RemoteBootstrapClientClass;
  public:
   explicit RemoteBootstrapClientTest(TableType table_type = DEFAULT_TABLE_TYPE)
       : RemoteBootstrapTest(table_type) {}
 
-  virtual void SetUp() override {
+  void SetUp() override {
     RemoteBootstrapTest::SetUp();
 
     fs_manager_.reset(new FsManager(Env::Default(), GetTestPath("client_tablet"), "tserver_test"));
@@ -64,26 +69,36 @@ class RemoteBootstrapClientTest : public RemoteBootstrapTest {
     ASSERT_OK(fs_manager_->Open());
 
     ASSERT_OK(tablet_peer_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10.0)));
-    ASSERT_OK(rpc::MessengerBuilder(CURRENT_TEST_NAME()).Build().MoveTo(&messenger_));
-    client_.reset(new RemoteBootstrapClient(GetTabletId(),
-                                            fs_manager_.get(),
-                                            messenger_,
-                                            fs_manager_->uuid()));
+    SetUpRemoteBootstrapClient();
+  }
+
+  void TearDown() override {
+    messenger_->Shutdown();
+    RemoteBootstrapTest::TearDown();
+  }
+
+  virtual void SetUpRemoteBootstrapClient() {
+    messenger_ = ASSERT_RESULT(rpc::MessengerBuilder(CURRENT_TEST_NAME()).Build());
+    proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_.get());
+
+    client_.reset(new RemoteBootstrapClientClass(GetTabletId(),
+                                                 fs_manager_.get(),
+                                                 fs_manager_->uuid()));
     ASSERT_OK(GetRaftConfigLeader(tablet_peer_->consensus()
         ->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED), &leader_));
 
-    HostPort host_port;
-    HostPortFromPB(leader_.last_known_addr(), &host_port);
-    ASSERT_OK(client_->Start(leader_.permanent_uuid(), host_port, &meta_));
+    HostPort host_port = HostPortFromPB(leader_.last_known_private_addr()[0]);
+    ASSERT_OK(client_->Start(leader_.permanent_uuid(), proxy_cache_.get(), host_port, &meta_));
   }
 
  protected:
   CHECKED_STATUS CompareFileContents(const string& path1, const string& path2);
 
   gscoped_ptr<FsManager> fs_manager_;
-  shared_ptr<rpc::Messenger> messenger_;
-  gscoped_ptr<RemoteBootstrapClient> client_;
-  scoped_refptr<TabletMetadata> meta_;
+  std::unique_ptr<rpc::Messenger> messenger_;
+  std::unique_ptr<rpc::ProxyCache> proxy_cache_;
+  gscoped_ptr<RemoteBootstrapClientClass> client_;
+  RaftGroupMetadataPtr meta_;
   RaftPeerPB leader_;
 };
 
@@ -92,9 +107,8 @@ Status RemoteBootstrapClientTest::CompareFileContents(const string& path1, const
   RETURN_NOT_OK(env_util::OpenFileForRandom(fs_manager_->env(), path1, &file1));
   RETURN_NOT_OK(env_util::OpenFileForRandom(fs_manager_->env(), path2, &file2));
 
-  uint64_t size1, size2;
-  RETURN_NOT_OK(file1->Size(&size1));
-  RETURN_NOT_OK(file2->Size(&size2));
+  uint64_t size1 = VERIFY_RESULT(file1->Size());
+  uint64_t size2 = VERIFY_RESULT(file2->Size());
   if (size1 != size2) {
     return STATUS(Corruption, "Sizes of files don't match",
                               strings::Substitute("$0 vs $1 bytes", size1, size2));

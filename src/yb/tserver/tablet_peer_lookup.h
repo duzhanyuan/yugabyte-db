@@ -42,6 +42,7 @@ namespace yb {
 
 class HostPort;
 class NodeInstancePB;
+class ServerRegistrationPB;
 
 namespace consensus {
 class StartRemoteBootstrapRequestPB;
@@ -61,10 +62,13 @@ class TabletPeerLookupIf {
  public:
   virtual ~TabletPeerLookupIf() {}
 
-  virtual CHECKED_STATUS GetTabletPeer(const std::string& tablet_id,
-                               scoped_refptr<tablet::TabletPeer>* tablet_peer) const = 0;
+  virtual CHECKED_STATUS GetTabletPeer(
+      const std::string& tablet_id,
+      std::shared_ptr<tablet::TabletPeer>* tablet_peer) const = 0;
 
   virtual const NodeInstancePB& NodeInstance() const = 0;
+
+  virtual CHECKED_STATUS GetRegistration(ServerRegistrationPB* reg) const = 0;
 
   virtual CHECKED_STATUS StartRemoteBootstrap(
       const consensus::StartRemoteBootstrapRequestPB& req) = 0;

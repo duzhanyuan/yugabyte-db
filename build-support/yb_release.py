@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # Copyright (c) YugaByte, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -14,188 +14,237 @@
 
 import argparse
 import atexit
-import glob
-import imp
-import json
 import logging
 import os
+import platform
 import shutil
-import sys
+import subprocess
 import tempfile
+import traceback
+import uuid
 import yaml
 
-from xml.dom import minidom
-from subprocess import call
-from ybops.common.exceptions import YBOpsRuntimeError
-from ybops.release_manager import ReleaseManager
-from ybops.utils import init_env, log_message, RELEASE_EDITION_ALLOWED_VALUES, \
-    RELEASE_EDITION_ENTERPRISE, RELEASE_EDITION_COMMUNITY
 from yb.library_packager import LibraryPackager, add_common_arguments
+from yb.mac_library_packager import MacLibraryPackager, add_common_arguments
+from yb.release_util import ReleaseUtil, check_for_local_changes
+from yb.common_util import init_env, get_build_type_from_build_root, set_thirdparty_dir
 
 YB_SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--build', help='Build type (debug/release)',
-                        default="release",
-                        dest='build_type')
-    parser.add_argument('--build-args',
-                        help='Additional arguments to pass to the build script',
-                        dest='build_args',
-                        default='')
-    parser.add_argument('--publish', action='store_true', help='Publish release to S3.')
+    parser.add_argument('--build', help='Build type (debug/release)', dest='build_type')
+    parser.add_argument('--build_root',
+                        help='The root directory where the code is being built. If the build type '
+                             'is specified, it needs to be consistent with the build root.')
+    parser.add_argument('--build_args', default='',
+                        help='Additional arguments to pass to the build script')
+    parser.add_argument('--build_archive', action='store_true',
+                        help='Whether or not we should build a package. This defaults to '
+                             'false if --build_target is specified, true otherwise.')
     parser.add_argument('--destination', help='Copy release to Destination folder.')
     parser.add_argument('--force', help='Skip prompts', action='store_true')
-    parser.add_argument('--edition', help='Which edition the code is built as.',
-                        default=RELEASE_EDITION_ENTERPRISE,
-                        choices=RELEASE_EDITION_ALLOWED_VALUES)
-    parser.add_argument('--skip-build', help='Skip building the code', action='store_true')
-    parser.add_argument(
-            '--extracted-destination',
-            help='Instead of building a tarball, put the distribution in the given'
-                 'directory. This is equivalent to building and extracting the tarball, but '
-                 'much faster.')
+    parser.add_argument('--commit', help='Custom specify a git commit.')
+    parser.add_argument('--skip_build', help='Skip building the code', action='store_true')
+    parser.add_argument('--build_target',
+                        help='Target directory to put the YugaByte distribution into. This can '
+                             'be used for debugging this script without having to build the '
+                             'tarball. If specified, this directory must either not exist or be '
+                             'empty.')
+    parser.add_argument('--keep_tmp_dir', action='store_true',
+                        help='Keep the temporary directory (for debugging).')
+    parser.add_argument('--save_release_path_to_file',
+                        help='Save the newly built release path to a file with this name. '
+                             'This allows to post-process / upload the newly generated release '
+                             'in an enclosing script.')
+    parser.add_argument('--yw', action='store_true', help='Package YugaWare too.')
     add_common_arguments(parser)
     args = parser.parse_args()
 
-    init_env(logging.DEBUG if args.verbose else logging.INFO)
-    log_message(logging.INFO, "Building YugaByte code: '{}' build".format(args.build_type))
+    init_env(args.verbose)
 
-    tmp_dir = tempfile.mkdtemp(suffix=os.path.basename(__file__))
-    atexit.register(lambda: shutil.rmtree(tmp_dir))
+    if not args.build_target and not args.build_archive:
+        logging.info("Implying --build_archive (build package) because --build_target "
+                     "(a custom directory to put YB distribution files into) is not specified.")
+        args.build_archive = True
 
-    build_desc_path = os.path.join(tmp_dir, 'build_descriptor.yaml')
+    if not args.build_archive and args.save_release_path_to_file:
+        raise RuntimeError('--save_release_path_to_file does not make sense without '
+                           '--build_archive')
+
+    build_root = args.build_root
+    build_type = args.build_type
+
+    tmp_dir = os.path.join(YB_SRC_ROOT, "build", "yb_release_tmp_{}".format(str(uuid.uuid4())))
+    try:
+        os.mkdir(tmp_dir)
+    except OSError as e:
+        logging.error("Could not create directory at '{}'".format(tmp_dir))
+        raise e
+    if not args.keep_tmp_dir:
+        atexit.register(lambda: shutil.rmtree(tmp_dir))
+
     yb_distribution_dir = os.path.join(tmp_dir, 'yb_distribution')
 
     os.chdir(YB_SRC_ROOT)
 
-    # Parse Java project version out of java/pom.xml.
-    java_project_version = minidom.parse('java/pom.xml').getElementsByTagName(
-            'version')[0].firstChild.nodeValue
-    log_message(logging.INFO, "Java project version from pom.xml: {}".format(java_project_version))
+    if not args.force:
+        check_for_local_changes()
 
-    build_edition = "enterprise" if args.edition == RELEASE_EDITION_ENTERPRISE else "community"
+    # This is not a "target" in terms of Make / CMake, but a target directory.
+    build_target = args.build_target
+    if build_target is None:
+        # Use a temporary directory.
+        build_target = os.path.join(tmp_dir, 'tmp_yb_distribution')
+
+    if build_root:
+        build_type_from_build_root = get_build_type_from_build_root(build_root)
+        if build_type:
+            if build_type != build_type_from_build_root:
+                raise RuntimeError(
+                    ("Specified build type ('{}') is inconsistent with the specified build "
+                     "root ('{}')").format(build_type, build_root))
+        else:
+            build_type = build_type_from_build_root
+
+    if not build_type:
+        build_type = 'release'
+
+    logging.info("Building YugaByte DB {} build".format(build_type))
+
+    build_desc_path = os.path.join(tmp_dir, 'build_descriptor.yaml')
     build_cmd_list = [
-        "./yb_build.sh", args.build_type, "--with-assembly",
+        "./yb_build.sh",
         "--write-build-descriptor", build_desc_path,
-        "--edition", build_edition,
+        build_type
+    ]
+
+    if args.force:
+        build_cmd_list.append("--force")
+
+    if build_root:
+        # This will force yb_build.sh to use this build directory, and detect build type,
+        # compiler type, etc. based on that.
+        build_cmd_list += ["--build-root", build_root]
+
+    build_cmd_list += [
         # This will build the exact set of targets that are needed for the release.
         "packaged_targets",
-        args.build_args
-        ]
+        # We do not need java code built for a release package
+        "--skip-java"
+    ]
+    if args.skip_build:
+        build_cmd_list += ["--skip-build"]
+    if args.build_args:
+        # TODO: run with shell=True and append build_args as is.
+        build_cmd_list += args.build_args.strip().split()
 
     build_cmd_line = " ".join(build_cmd_list).strip()
-    log_message(logging.INFO, "Build command line: {}".format(build_cmd_line))
-    if call(build_cmd_line, shell=True) != 0:
-        raise RuntimeError('Build failed')
+    logging.info("Build command line: {}".format(build_cmd_line))
+
+    if not args.skip_build:
+        # TODO: figure out the dependency issues in our CMake build instead.
+        # TODO: move this into yb_build.sh itself.
+        for preliminary_target in ['protoc-gen-insertions', 'bfql_codegen']:
+            preliminary_step_cmd_list = [
+                    arg for arg in build_cmd_list if arg != 'packaged_targets'
+                ] + ['--target', preliminary_target, '--skip-java']
+            logging.info(
+                    "Running a preliminary step to build target %s: %s",
+                    preliminary_target,
+                    " ".join(preliminary_step_cmd_list))
+            subprocess.check_call(preliminary_step_cmd_list)
+
+    subprocess.check_call(build_cmd_list)
+
     if not os.path.exists(build_desc_path):
         raise IOError("The build script failed to generate build descriptor file at '{}'".format(
                 build_desc_path))
+
     with open(build_desc_path) as build_desc_file:
         build_desc = yaml.load(build_desc_file)
 
-    log_message(logging.INFO, "Build descriptor: {}".format(build_desc))
+    logging.info("Build descriptor: {}".format(build_desc))
 
-    if args.extracted_destination and args.publish:
-        raise RuntimeError('--extracted-destination and --publish are incompatible')
+    build_root_from_build_desc = build_desc['build_root']
+    if not build_root:
+        build_root = build_root_from_build_desc
+    build_root = os.path.realpath(build_root)
+    if build_root != os.path.realpath(build_root_from_build_desc):
+        raise RuntimeError(
+            "Build root from the build descriptor file (see above) is inconsistent with that "
+            "specified on the command line ('{}')".format(build_root))
 
-    build_dir = build_desc['build_root']
-    release_manager = ReleaseManager({"repository": YB_SRC_ROOT,
-                                      "name": "yugabyte",
-                                      "type": args.build_type,
-                                      "edition": args.edition,
-                                      "force_yes": args.force})
+    thirdparty_dir = build_desc["thirdparty_dir"]
+    thirdparty_dir_from_env = os.environ.get("YB_THIRDPARTY_DIR", thirdparty_dir)
+    if (thirdparty_dir != thirdparty_dir_from_env and
+            thirdparty_dir_from_env != os.path.join(YB_SRC_ROOT, 'thirdparty')):
+        raise RuntimeError(
+            "Mismatch between non-default valueo of env YB_THIRDPARTY_DIR: '{}' and build desc "
+            "thirdparty_dir: '{}'".format(thirdparty_dir_from_env, thirdparty_dir))
+    # Set the var for in-memory access to it across the other python files.
+    set_thirdparty_dir(thirdparty_dir)
 
     # This points to the release manifest within the release_manager, and we are modifying that
     # directly.
-    release_manifest = release_manager.release_manifest
-    for key, value_list in release_manifest.iteritems():
-        for i in xrange(len(value_list)):
-            new_value = value_list[i].replace('${project.version}', java_project_version)
-            if new_value != value_list[i]:
-                log_message(logging.INFO,
-                            "Substituting Java project version in '{}' -> '{}'".format(
-                                value_list[i], new_value))
-                value_list[i] = new_value
+    release_util = ReleaseUtil(
+            YB_SRC_ROOT, build_type, build_target, args.force, args.commit, build_root)
 
-    library_packager = LibraryPackager(
-            build_dir=build_dir,
-            seed_executable_patterns=release_manifest['bin'],
-            dest_dir=yb_distribution_dir,
-            verbose_mode=args.verbose,
-            include_system_libs=not args.no_system_libs,
-            include_licenses=args.include_licenses)
+    system = platform.system().lower()
+    library_packager_args = dict(
+        build_dir=build_root,
+        seed_executable_patterns=release_util.get_seed_executable_patterns(),
+        dest_dir=yb_distribution_dir,
+        verbose_mode=args.verbose
+    )
+    if system == "linux":
+        library_packager = LibraryPackager(**library_packager_args)
+    elif system == "darwin":
+        library_packager = MacLibraryPackager(**library_packager_args)
+    else:
+        raise RuntimeError("System {} not supported".format(system))
     library_packager.package_binaries()
 
-    for release_subdir in ['bin']:
-        if release_subdir in release_manifest:
-            del release_manifest[release_subdir]
-    for root, dirs, files in os.walk(yb_distribution_dir):
-        release_manifest.setdefault(os.path.relpath(root, yb_distribution_dir), []).extend(
-                [os.path.join(root, f) for f in files])
+    release_util.update_manifest(yb_distribution_dir)
 
-    if args.verbose:
-        log_message(logging.INFO,
-                    "Effective release manifest:\n" +
-                    json.dumps(release_manifest, indent=2, sort_keys=True))
+    logging.info("Generating release distribution")
 
-    log_message(logging.INFO, "Generating release")
+    if os.path.exists(build_target) and os.listdir(build_target):
+        raise RuntimeError("Directory '{}' exists and is non-empty".format(build_target))
+    release_util.create_distribution(build_target)
 
-    if args.extracted_destination:
-        extracted_dest_dir = args.extracted_destination
-        if os.path.exists(extracted_dest_dir) and os.listdir(extracted_dest_dir):
-            raise RuntimeError("Directory '{}' exists and is non-empty".format(extracted_dest_dir))
-        for dir_from_manifest in release_manifest:
-            current_dest_dir = os.path.join(extracted_dest_dir, dir_from_manifest)
-            if os.path.exists(current_dest_dir):
-                if args.verbose:
-                    logging.info("Directory '{}' already exists".format(current_dest_dir))
-            else:
-                os.makedirs(current_dest_dir)
+    if args.yw:
+        managed_dir = os.path.join(YB_SRC_ROOT, "managed")
+        yw_dir = os.path.join(build_target, "ui")
+        if not os.path.exists(yw_dir):
+            os.makedirs(yw_dir)
+        package_yw_cmd = [
+            os.path.join(managed_dir, "yb_release"),
+            "--destination", yw_dir, "--unarchived"
+        ]
+        logging.info("Creating YugaWare package with command: {}".format(package_yw_cmd))
+        try:
+            subprocess.check_call(package_yw_cmd, cwd=managed_dir)
+        except Exception as e:
+            logging.error("Failed to package YugaWare: {}".format(package_yw_cmd))
+            logging.error("Failed to package YugaWare: {}".format(e))
+            traceback.print_exc()
 
-            for elem in release_manifest[dir_from_manifest]:
-                if not elem.startswith('/'):
-                    elem = os.path.join(YB_SRC_ROOT, elem)
-                files = glob.glob(elem)
-                for file_path in files:
-                    if os.path.islink(file_path):
-                        link_path = os.path.join(current_dest_dir, os.path.basename(file_path))
-                        link_target = os.readlink(file_path)
-                        if args.verbose:
-                            log_message(logging.INFO,
-                                        "Creating symlink {} -> {}".format(link_path, link_target))
-                        os.symlink(link_target, link_path)
-                    elif os.path.isdir(file_path):
-                        current_dest_dir = os.path.join(current_dest_dir,
-                                                        os.path.basename(file_path))
-                        if args.verbose:
-                            log_message(logging.INFO,
-                                        "Copying directory {} to {}".format(file_path,
-                                                                            current_dest_dir))
-                        shutil.copytree(file_path, current_dest_dir)
-                    else:
-                        current_dest_dir = os.path.join(extracted_dest_dir, dir_from_manifest)
-                        if args.verbose:
-                            log_message(
-                                    logging.INFO,
-                                    "Copying file {} to directory {}".format(file_path,
-                                                                             current_dest_dir))
-                        shutil.copy(file_path, current_dest_dir)
-        log_message(logging.INFO,
-                    "Creating an non-tar distribution at '{}'".format(extracted_dest_dir))
-    else:
-        # We've already updated the release manifest inside release_manager with the auto-generated
-        # set of executables and libraries to package.
-        release_file = release_manager.generate_release()
+    if args.build_archive:
+        release_file = os.path.realpath(release_util.generate_release())
+        if args.destination:
+            if not os.path.exists(args.destination):
+                raise RuntimeError("Destination {} not a directory.".format(args.destination))
+            shutil.copy(release_file, args.destination)
+        logging.info("Generated a package at '{}'".format(release_file))
 
-    if args.publish:
-        log_message(logging.INFO, "Publishing release")
-        release_manager.publish_release()
-    elif args.destination:
-        if not os.path.exists(args.destination):
-            raise YBOpsRuntimeError("Destination {} not a directory.".format(args.destination))
-        shutil.copy(release_file, args.destination)
+        if args.save_release_path_to_file:
+            with open(args.save_release_path_to_file, 'w') as release_path_file:
+                release_path_file.write(release_file)
+
+            logging.info("Saved package path to '{}'".format(
+                args.save_release_path_to_file))
 
 
 if __name__ == '__main__':

@@ -303,7 +303,7 @@ class TraceBufferVector : public TraceBuffer {
 
   gscoped_ptr<TraceBufferChunk> GetChunk(size_t* index) override {
     // This function may be called when adding normal events or indirectly from
-    // AddMetadataEventsWhileLocked(). We can not DECHECK(!IsFull()) because we
+    // AddMetadataEventsWhileLocked(). We can not DCHECK(!IsFull()) because we
     // have to add the metadata events and flush thread-local buffers even if
     // the buffer is full.
     *index = chunks_.size();
@@ -460,7 +460,7 @@ class TraceLog::OptionalAutoLock {
       lock_->Unlock();
   }
 
-  void EnsureAcquired() {
+  void EnsureAcquired() EXCLUSIVE_LOCK_FUNCTION() {
     if (!locked_) {
       lock_->Lock();
       locked_ = true;
@@ -604,9 +604,11 @@ void TraceEvent::Initialize(
 
   bool arg_is_copy[kTraceMaxNumArgs];
   for (i = 0; i < num_args; ++i) {
-    // No copying of convertable types, we retain ownership.
-    if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE)
+    // No copying of convertible types, we retain ownership.
+    if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE) {
+      arg_is_copy[i] = false;  // Without this, clang analyzer complaisn below.
       continue;
+    }
 
     // We only take a copy of arg_vals if they are of type COPY_STRING.
     arg_is_copy[i] = (arg_types_[i] == TRACE_VALUE_TYPE_COPY_STRING);
@@ -628,8 +630,12 @@ void TraceEvent::Initialize(
     for (i = 0; i < num_args; ++i) {
       if (arg_types_[i] == TRACE_VALUE_TYPE_CONVERTABLE)
         continue;
-      if (arg_is_copy[i])
+      // Without the assignment to arg_is_copy[i] before a continue statement above, clang
+      // analyzer says this here:
+      // warning: Branch condition evaluates to a garbage value
+      if (arg_is_copy[i]) {
         CopyTraceEventParameter(&ptr, &arg_values_[i].as_string, end);
+      }
     }
     DCHECK_EQ(end, ptr) << "Overrun by " << ptr - end;
   }
@@ -653,7 +659,7 @@ void TraceEvent::UpdateDuration(const MicrosecondsInt64& now,
 
 namespace {
 // Escape the given string using JSON rules.
-void JsonEscape(StringPiece s, string* out) {
+void JsonEscape(GStringPiece s, string* out) {
   out->reserve(out->size() + s.size() * 2);
   const char* p_end = s.data() + s.size();
   for (const char* p = s.data(); p != p_end; p++) {
@@ -894,7 +900,7 @@ void TraceResultBuffer::Collect(
     first_ = false;
   } else if (!s->data().empty()) {
     // Sometimes we get sent an empty chunk at the end,
-    // and we don't want to end up with an extra trailing ','
+    // and we don't want to end up with an extra trailing ','.
     json_.append(",\n");
   }
   json_.append(s->data());
@@ -980,6 +986,7 @@ void TraceSamplingThread::DefaultSamplingCallback(
   const char* category_group;
   const char* name;
   ExtractCategoryAndName(combined, &category_group, &name);
+
   TRACE_EVENT_API_ADD_TRACE_EVENT(TRACE_EVENT_PHASE_SAMPLE,
       TraceLog::GetCategoryGroupEnabled(category_group),
       name, 0, 0, nullptr, nullptr, nullptr, nullptr, 0);
@@ -1273,7 +1280,7 @@ const unsigned char* TraceLog::GetCategoryGroupEnabledInternal(
     // category groups with strings not known at compile time (this is
     // required by SetWatchEvent).
     const char* new_group = strdup(category_group);
-    // NOTE: new_group is leaked, but this is a small finite amount of data
+    // NOTE: new_group is leaked, but this is a small finite amount of data.
     g_category_groups[category_index] = new_group;
     DCHECK(!g_category_group_enabled[category_index]);
     // Note that if both included and excluded patterns in the
@@ -1389,7 +1396,7 @@ void TraceLog::SetDisabled() {
   SetDisabledWhileLocked();
 }
 
-void TraceLog::SetDisabledWhileLocked() {
+void NO_THREAD_SAFETY_ANALYSIS TraceLog::SetDisabledWhileLocked() {
   DCHECK(lock_.IsHeld());
 
   if (!IsEnabled())
@@ -1847,7 +1854,7 @@ TraceEventHandle TraceLog::AddTraceEventWithThreadIdAndTimestamp(
         } else {
           // This is a thread id that we've seen before, but potentially with a
           // new name.
-          std::vector<StringPiece> existing_names = strings::Split(existing_name->second, ",");
+          std::vector<GStringPiece> existing_names = strings::Split(existing_name->second, ",");
           bool found = std::find(existing_names.begin(),
                                  existing_names.end(),
                                  new_name) != existing_names.end();
@@ -1918,7 +1925,7 @@ TraceEventHandle TraceLog::AddTraceEventWithThreadIdAndTimestamp(
   return handle;
 }
 
-// May be called when a COMPELETE event ends and the unfinished event has been
+// May be called when a COMPLETE event ends and the unfinished event has been
 // recycled (phase == TRACE_EVENT_PHASE_END and trace_event == NULL).
 std::string TraceLog::EventToConsoleMessage(unsigned char phase,
                                             const MicrosecondsInt64& timestamp,
@@ -2089,7 +2096,7 @@ void TraceLog::AddMetadataEventsWhileLocked() {
 
   if (process_labels_.size() > 0) {
     std::vector<std::string> labels;
-    for(auto& label : process_labels_) {
+    for (auto& label : process_labels_) {
       labels.push_back(label.second);
     }
     InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),
@@ -2099,7 +2106,7 @@ void TraceLog::AddMetadataEventsWhileLocked() {
   }
 
   // Thread sort indices.
-  for(auto& sort_index : thread_sort_indices_) {
+  for (auto& sort_index : thread_sort_indices_) {
     if (sort_index.second == 0)
       continue;
     InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),
@@ -2110,7 +2117,7 @@ void TraceLog::AddMetadataEventsWhileLocked() {
 
   // Thread names.
   SpinLockHolder thread_info_lock(&thread_info_lock_);
-  for(auto& name : thread_names_) {
+  for (auto& name : thread_names_) {
     if (name.second.empty())
       continue;
     InitializeMetadataEvent(AddEventToThreadSharedChunkWhileLocked(nullptr, false),
@@ -2125,8 +2132,8 @@ TraceEvent* TraceLog::GetEventByHandle(TraceEventHandle handle) {
   return GetEventByHandleInternal(handle, nullptr);
 }
 
-TraceEvent* TraceLog::GetEventByHandleInternal(TraceEventHandle handle,
-                                               OptionalAutoLock* lock) {
+TraceEvent* NO_THREAD_SAFETY_ANALYSIS TraceLog::GetEventByHandleInternal(
+    TraceEventHandle handle, OptionalAutoLock* lock) {
   TraceLog::PerThreadInfo* thr_info = TraceLog::thread_local_info_;
 
   if (!handle.chunk_seq)

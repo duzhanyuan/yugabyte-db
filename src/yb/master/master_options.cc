@@ -52,6 +52,10 @@ DEFINE_string(master_addresses, "",
     "b) allow for a master to be restarted gracefully and get its peer list from the "
     "local cmeta file of the last committed config, if local instance file is present.");
 TAG_FLAG(master_addresses, experimental);
+DEFINE_uint64(master_replication_factor, 0,
+    "Number of master replicas. By default it is detected based on master_addresses option, but "
+    "could be specified explicitly together with passing one or more master service domain name and"
+    " port through master_addresses for masters auto-discovery when running on Kubernetes.");
 
 // NOTE: This flag is deprecated.
 DEFINE_bool(create_cluster, false,
@@ -61,35 +65,23 @@ TAG_FLAG(create_cluster, hidden);
 
 const char* MasterOptions::kServerType = "master";
 
-MasterOptions::MasterOptions(server::ServerBaseOptions::addresses_shared_ptr master_addresses) {
+MasterOptions::MasterOptions(server::MasterAddressesPtr master_addresses) {
   server_type = kServerType;
   rpc_opts.default_port = kMasterDefaultPort;
 
   SetMasterAddresses(master_addresses);
 }
 
-MasterOptions::MasterOptions() {
-  server_type = kServerType;
-  rpc_opts.default_port = kMasterDefaultPort;
-  master_addresses_flag = FLAGS_master_addresses;
-  vector<HostPort> master_addresses = std::vector<HostPort>();
-  if (!FLAGS_master_addresses.empty()) {
-    Status s = HostPort::ParseStrings(FLAGS_master_addresses,
-                                      kMasterDefaultPort,
-                                      &master_addresses);
-    if (!s.ok()) {
-      LOG(FATAL) << "Couldn't parse the master_addresses flag ('"
-                 << FLAGS_master_addresses << "'): " << s.ToString();
-    }
-  }
-  SetMasterAddresses(make_shared<vector<HostPort>>(std::move(master_addresses)));
-}
+Result<MasterOptions> MasterOptions::CreateMasterOptions() {
+  server::MasterAddresses master_addresses;
+  std::string master_addresses_resolved_str;
+  RETURN_NOT_OK(server::DetermineMasterAddresses(
+      "master_addresses", FLAGS_master_addresses, FLAGS_master_replication_factor,
+      &master_addresses, &master_addresses_resolved_str));
 
-MasterOptions::MasterOptions(const MasterOptions& other) {
-  SetMasterAddresses(other.GetMasterAddresses());
-  server_type = other.server_type;
-  is_shell_mode_.Store(other.IsShellMode());
-  rpc_opts.default_port = other.rpc_opts.default_port;
+  MasterOptions opts(std::make_shared<server::MasterAddresses>(std::move(master_addresses)));
+  opts.master_addresses_flag = master_addresses_resolved_str;
+  return opts;
 }
 
 } // namespace master

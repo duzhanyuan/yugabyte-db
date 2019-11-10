@@ -91,7 +91,7 @@ Status InMemDocDbState::SetPrimitive(const DocPath& doc_path, const PrimitiveVal
 }
 
 Status InMemDocDbState::DeleteSubDoc(const DocPath &doc_path) {
-  return SetPrimitive(doc_path, PrimitiveValue(ValueType::kTombstone));
+  return SetPrimitive(doc_path, PrimitiveValue::kTombstone);
 }
 
 void InMemDocDbState::SetDocument(const KeyBytes& encoded_doc_key, SubDocument&& doc) {
@@ -110,17 +110,18 @@ const SubDocument* InMemDocDbState::GetSubDocument(const SubDocKey& subdoc_key) 
   return current;
 }
 
-void InMemDocDbState::CaptureAt(rocksdb::DB* rocksdb, HybridTime hybrid_time,
+void InMemDocDbState::CaptureAt(const DocDB& doc_db, HybridTime hybrid_time,
                                 rocksdb::QueryId query_id) {
   // Clear the internal state.
   root_ = SubDocument();
 
-  auto rocksdb_iter = CreateRocksDBIterator(rocksdb, BloomFilterMode::DONT_USE_BLOOM_FILTER,
+  auto rocksdb_iter = CreateRocksDBIterator(
+      doc_db.regular, doc_db.key_bounds, BloomFilterMode::DONT_USE_BLOOM_FILTER,
       boost::none /* user_key_for_filter */, query_id);
-  rocksdb_iter->SeekToFirst();
+  rocksdb_iter.SeekToFirst();
   KeyBytes prev_key;
-  while (rocksdb_iter->Valid()) {
-    const auto key = rocksdb_iter->key();
+  while (rocksdb_iter.Valid()) {
+    const auto key = rocksdb_iter.key();
     CHECK_NE(0, prev_key.CompareTo(key)) << "Infinite loop detected on key " << prev_key.ToString();
     prev_key = KeyBytes(key);
 
@@ -140,12 +141,16 @@ void InMemDocDbState::CaptureAt(rocksdb::DB* rocksdb, HybridTime hybrid_time,
     // transactions write intents resolution during DocDbState capturing.
     // For now passing kNonTransactionalOperationContext in order to fail if there are any intents,
     // since this is not supported.
+    auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();
+    GetSubDocumentData data = { encoded_subdoc_key, &subdoc, &doc_found };
     const Status get_doc_status = yb::docdb::GetSubDocument(
-        rocksdb, subdoc_key, query_id, kNonTransactionalOperationContext, &subdoc, &doc_found,
-        hybrid_time);
+        doc_db, data, query_id, kNonTransactionalOperationContext,
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::SingleTime(hybrid_time));
     if (!get_doc_status.ok()) {
       // This will help with debugging the GetSubDocument failure.
-      LOG(WARNING) << "DocDB state:\n" << DocDBDebugDumpToStr(rocksdb, IncludeBinary::kTrue);
+      LOG(WARNING)
+          << "DocDB state:\n"
+          << DocDBDebugDumpToStr(doc_db.regular, StorageDbType::kRegular, IncludeBinary::kTrue);
     }
     CHECK_OK(get_doc_status);
     // doc_found can be false for deleted documents, and that is perfectly valid.
@@ -153,13 +158,13 @@ void InMemDocDbState::CaptureAt(rocksdb::DB* rocksdb, HybridTime hybrid_time,
       SetDocument(encoded_doc_key, std::move(subdoc));
     }
     // Go to the next top-level document key.
-    ROCKSDB_SEEK(rocksdb_iter.get(), subdoc_key.AdvanceOutOfSubDoc().AsSlice());
+    ROCKSDB_SEEK(&rocksdb_iter, subdoc_key.AdvanceOutOfSubDoc().AsSlice());
 
-    VLOG(4) << "After performing a seek: IsValid=" << rocksdb_iter->Valid();
-    if (VLOG_IS_ON(4) && rocksdb_iter->Valid()) {
-      VLOG(4) << "Next key: " << FormatRocksDBSliceAsStr(rocksdb_iter->key());
+    VLOG(4) << "After performing a seek: IsValid=" << rocksdb_iter.Valid();
+    if (VLOG_IS_ON(4) && rocksdb_iter.Valid()) {
+      VLOG(4) << "Next key: " << FormatSliceAsStr(rocksdb_iter.key());
       SubDocKey tmp_subdoc_key;
-      CHECK_OK(tmp_subdoc_key.FullyDecodeFrom(rocksdb_iter->key()));
+      CHECK_OK(tmp_subdoc_key.FullyDecodeFrom(rocksdb_iter.key()));
       VLOG(4) << "Parsed as SubDocKey: " << tmp_subdoc_key.ToString();
     }
   }
@@ -175,7 +180,7 @@ void InMemDocDbState::CaptureAt(rocksdb::DB* rocksdb, HybridTime hybrid_time,
 }
 
 void InMemDocDbState::SetCaptureHybridTime(HybridTime hybrid_time) {
-  CHECK_NE(hybrid_time, HybridTime::kInvalidHybridTime);
+  CHECK(hybrid_time.is_valid());
   captured_at_ = hybrid_time;
 }
 
@@ -259,7 +264,7 @@ string InMemDocDbState::ToDebugString() const {
 }
 
 HybridTime InMemDocDbState::captured_at() const {
-  CHECK_NE(captured_at_, HybridTime::kInvalidHybridTime);
+  CHECK(captured_at_.is_valid());
   return captured_at_;
 }
 

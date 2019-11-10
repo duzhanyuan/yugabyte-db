@@ -15,10 +15,16 @@
 
 #include "yb/rpc/rpc_with_call_id.h"
 
+#include "yb/rpc/connection.h"
+#include "yb/rpc/reactor.h"
 #include "yb/rpc/rpc_introspection.pb.h"
+
+#include "yb/util/string_util.h"
 
 namespace yb {
 namespace rpc {
+
+ConnectionContextWithCallId::ConnectionContextWithCallId() {}
 
 void ConnectionContextWithCallId::DumpPB(const DumpRunningRpcsRequestPB& req,
                                          RpcConnectionPB* resp) {
@@ -27,8 +33,18 @@ void ConnectionContextWithCallId::DumpPB(const DumpRunningRpcsRequestPB& req,
   }
 }
 
-bool ConnectionContextWithCallId::Idle() {
-  return calls_being_handled_.empty();
+bool ConnectionContextWithCallId::Idle(std::string* reason_not_idle) {
+  if (calls_being_handled_.empty()) {
+    return true;
+  }
+
+  if (reason_not_idle) {
+    AppendWithSeparator(
+        Format("$0 calls being handled: $1", calls_being_handled_.size(), calls_being_handled_),
+        reason_not_idle);
+  }
+
+  return false;
 }
 
 Status ConnectionContextWithCallId::Store(InboundCall* call) {
@@ -41,7 +57,12 @@ Status ConnectionContextWithCallId::Store(InboundCall* call) {
   return Status::OK();
 }
 
+void ConnectionContextWithCallId::Shutdown(const Status& status) {
+}
+
 void ConnectionContextWithCallId::CallProcessed(InboundCall* call) {
+  DCHECK(call->connection()->reactor()->IsCurrentThreadOrStartedClosing());
+
   ++processed_call_count_;
   auto id = ExtractCallId(call);
   auto it = calls_being_handled_.find(id);
@@ -52,6 +73,9 @@ void ConnectionContextWithCallId::CallProcessed(InboundCall* call) {
     return;
   }
   calls_being_handled_.erase(it);
+  if (Idle() && idle_listener_) {
+    idle_listener_();
+  }
 }
 
 void ConnectionContextWithCallId::QueueResponse(const ConnectionPtr& conn,

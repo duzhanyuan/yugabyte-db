@@ -32,16 +32,26 @@
 #ifndef YB_MASTER_TS_MANAGER_H
 #define YB_MASTER_TS_MANAGER_H
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "yb/common/common.pb.h"
+#include "yb/gutil/thread_annotations.h"
 #include "yb/gutil/macros.h"
+
+#include "yb/util/capabilities.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/status.h"
+
+#include "yb/common/common.pb.h"
+
+#include "yb/rpc/rpc_fwd.h"
+
+#include "yb/master/master_fwd.h"
 
 namespace yb {
 
@@ -49,11 +59,8 @@ class NodeInstancePB;
 
 namespace master {
 
-class TSDescriptor;
-class TSRegistrationPB;
-
-typedef std::vector<std::shared_ptr<TSDescriptor> > TSDescriptorVector;
 typedef std::string TabletServerId;
+typedef std::unordered_set<HostPort, HostPortHash> BlacklistSet;
 
 // Tracks the servers that the master has heard from, along with their
 // last heartbeat, etc.
@@ -75,43 +82,68 @@ class TSManager {
   // current instance ID for the TS, then a NotFound status is returned.
   // Otherwise, *desc is set and OK is returned.
   CHECKED_STATUS LookupTS(const NodeInstancePB& instance,
-                  std::shared_ptr<TSDescriptor>* desc);
+                          TSDescriptorPtr* desc);
 
   // Lookup the tablet server descriptor for the given UUID.
   // Returns false if the TS has never registered.
   // Otherwise, *desc is set and returns true.
   bool LookupTSByUUID(const std::string& uuid,
-                        std::shared_ptr<TSDescriptor>* desc);
+                      TSDescriptorPtr* desc);
 
   // Register or re-register a tablet server with the manager.
   //
   // If successful, *desc reset to the registered descriptor.
   CHECKED_STATUS RegisterTS(const NodeInstancePB& instance,
-                    const TSRegistrationPB& registration,
-                    std::shared_ptr<TSDescriptor>* desc);
+                            const TSRegistrationPB& registration,
+                            CloudInfoPB local_cloud_info,
+                            rpc::ProxyCache* proxy_cache);
 
-  // Return all of the currently registered TS descriptors into the provided
-  // list.
-  void GetAllDescriptors(std::vector<std::shared_ptr<TSDescriptor> >* descs) const;
+  // Return all of the currently registered TS descriptors into the provided list.
+  void GetAllDescriptors(TSDescriptorVector* descs) const;
 
   // Return all of the currently registered TS descriptors that have sent a
   // heartbeat recently, indicating that they're alive and well.
-  void GetAllLiveDescriptors(std::vector<std::shared_ptr<TSDescriptor> >* descs) const;
+  // Optionally pass in blacklist as a set of HostPorts to return all live non-blacklisted servers.
+  void GetAllLiveDescriptors(TSDescriptorVector* descs,
+                             const BlacklistSet blacklist = BlacklistSet()) const;
+
+  // Return all of the currently registered TS descriptors that have sent a heartbeat
+  // recently and are in the same 'cluster' with given placement uuid.
+  // Optionally pass in blacklist as a set of HostPorts to return all live non-blacklisted servers.
+  void GetAllLiveDescriptorsInCluster(TSDescriptorVector* descs, string placement_uuid,
+                                      const BlacklistSet blacklist = BlacklistSet(),
+                                      bool primary_cluster = true) const;
+
+  // Return all of the currently registered TS descriptors that have sent a
+  // heartbeat, indicating that they're alive and well, recently and have given
+  // full report of their tablets as well.
+  void GetAllReportedDescriptors(TSDescriptorVector* descs) const;
 
   // Get the TS count.
   int GetCount() const;
 
   // Return the tablet server descriptor running on the given port.
-  const std::shared_ptr<TSDescriptor> GetTSDescriptor(const HostPortPB& host_port) const;
+  const TSDescriptorPtr GetTSDescriptor(const HostPortPB& host_port) const;
+
+  static bool IsTSLive(const TSDescriptorPtr& ts);
+
+  // Check if the placement uuid of the tserver is same as given cluster uuid.
+  static bool IsTsInCluster(const TSDescriptorPtr& ts, string cluster_uuid);
+
+  static bool IsTsBlacklisted(const TSDescriptorPtr& ts,
+                              const BlacklistSet blacklist);
 
  private:
-  bool IsTSLive(const std::shared_ptr<TSDescriptor>& ts) const;
+
+  void GetDescriptors(std::function<bool(const TSDescriptorPtr&)> condition,
+                      TSDescriptorVector* descs) const;
+
+  int GetCountUnlocked() const REQUIRES_SHARED(lock_);
 
   mutable rw_spinlock lock_;
 
-  typedef std::unordered_map<
-    std::string, std::shared_ptr<TSDescriptor> > TSDescriptorMap;
-  TSDescriptorMap servers_by_id_;
+  typedef std::unordered_map<std::string, TSDescriptorPtr> TSDescriptorMap;
+  TSDescriptorMap servers_by_id_ GUARDED_BY(lock_);
 
   DISALLOW_COPY_AND_ASSIGN(TSManager);
 };
@@ -119,4 +151,4 @@ class TSManager {
 } // namespace master
 } // namespace yb
 
-#endif
+#endif // YB_MASTER_TS_MANAGER_H

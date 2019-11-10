@@ -15,8 +15,8 @@
 add_executable(bfql_codegen
                directory.cc
                codegen.cc)
-target_link_libraries(bfql_codegen yb_util)
-
+target_link_libraries(bfql_codegen yb_util yb_common_proto consensus_metadata_proto)
+add_dependencies(bfql_codegen pgsql_protocol_proto)
 # Use ${CMAKE_BINARY_DIR}/bin/bfql_codegen to generate builtin function files.
 SET(BF_GENERATED_FILES
     ${CMAKE_CURRENT_BINARY_DIR}/gen_opcode_table.cc
@@ -39,8 +39,8 @@ set(YB_BFQL_LIBS
     yb_util)
 
 ADD_YB_LIBRARY(yb_bfql
-                       SRCS ${YB_BFQL_SRCS}
-                       DEPS ${YB_BFQL_LIBS})
+               SRCS ${YB_BFQL_SRCS}
+               DEPS ${YB_BFQL_LIBS})
 
 # Make sure code-generator is built before yb_bfql library.
 add_dependencies(yb_bfql bfql_codegen)

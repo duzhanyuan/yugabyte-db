@@ -36,12 +36,17 @@
 
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
+
 #include "yb/util/async_util.h"
+#include "yb/util/result.h"
 #include "yb/util/status.h"
+
 #include "yb/util/net/net_fwd.h"
+#include "yb/util/net/inetaddress.h"
 
 namespace yb {
 
+class Histogram;
 class HostPort;
 class ThreadPool;
 
@@ -74,5 +79,29 @@ class DnsResolver {
   DISALLOW_COPY_AND_ASSIGN(DnsResolver);
 };
 
+class ScopedDnsTracker {
+ public:
+  explicit ScopedDnsTracker(const scoped_refptr<Histogram>& metric);
+  ~ScopedDnsTracker();
+
+  ScopedDnsTracker(const ScopedDnsTracker&) = delete;
+  void operator=(const ScopedDnsTracker&) = delete;
+
+  static Histogram* active_metric();
+ private:
+  Histogram* old_metric_;
+  scoped_refptr<Histogram> metric_;
+};
+
+std::future<Result<InetAddress>> ResolveDnsFuture(const std::string& host, Resolver* resolver);
+
+// Processes result of DNS resolution.
+// Returns failure status if error happened.
+// On success returns first ip v4 address if available, otherwise first ip v6 address is returned.
+Result<InetAddress> PickResolvedAddress(
+    const std::string& host, const boost::system::error_code& error,
+    const ResolverResults& entries);
+
 } // namespace yb
+
 #endif /* YB_UTIL_NET_DNS_RESOLVER_H */

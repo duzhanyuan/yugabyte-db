@@ -34,6 +34,7 @@
 
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol-test-util.h"
+#include "yb/common/ql_protocol_util.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/tablet/local_tablet_writer.h"
@@ -42,61 +43,60 @@
 namespace yb {
 namespace tablet {
 
-class TestTabletMetadata : public YBTabletTest {
+class TestRaftGroupMetadata : public YBTabletTest {
  public:
-  TestTabletMetadata()
+  TestRaftGroupMetadata()
       : YBTabletTest(GetSimpleTestSchema()) {
   }
 
   void SetUp() override {
     YBTabletTest::SetUp();
-    writer_.reset(new LocalTabletWriter(harness_->tablet().get(),
-                                        &client_schema_));
+    writer_.reset(new LocalTabletWriter(harness_->tablet().get()));
   }
 
   void BuildPartialRow(int key, int intval, const char* strval,
-                       gscoped_ptr<YBPartialRow>* row);
+                       QLWriteRequestPB* req);
 
  protected:
   gscoped_ptr<LocalTabletWriter> writer_;
 };
 
-void TestTabletMetadata::BuildPartialRow(int key, int intval, const char* strval,
-                                         gscoped_ptr<YBPartialRow>* row) {
-  row->reset(new YBPartialRow(&client_schema_));
-  CHECK_OK((*row)->SetInt32(0, key));
-  CHECK_OK((*row)->SetInt32(1, intval));
-  CHECK_OK((*row)->SetStringCopy(2, strval));
+void TestRaftGroupMetadata::BuildPartialRow(int key, int intval, const char* strval,
+                                         QLWriteRequestPB* req) {
+  req->Clear();
+  QLAddInt32HashValue(req, key);
+  QLAddInt32ColumnValue(req, kFirstColumnId + 1, intval);
+  QLAddStringColumnValue(req, kFirstColumnId + 2, strval);
 }
 
 // Test that loading & storing the superblock results in an equivalent file.
-TEST_F(TestTabletMetadata, TestLoadFromSuperBlock) {
+TEST_F(TestRaftGroupMetadata, TestLoadFromSuperBlock) {
   // Write some data to the tablet and flush.
-  gscoped_ptr<YBPartialRow> row;
-  BuildPartialRow(0, 0, "foo", &row);
-  ASSERT_OK(writer_->Insert(*row));
+  QLWriteRequestPB req;
+  BuildPartialRow(0, 0, "foo", &req);
+  ASSERT_OK(writer_->Write(&req));
   ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync));
 
   // Create one more row. Write and flush.
-  BuildPartialRow(1, 1, "bar", &row);
-  ASSERT_OK(writer_->Insert(*row));
+  BuildPartialRow(1, 1, "bar", &req);
+  ASSERT_OK(writer_->Write(&req));
   ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync));
 
   // Shut down the tablet.
   harness_->tablet()->Shutdown();
 
-  TabletMetadata* meta = harness_->tablet()->metadata();
+  RaftGroupMetadata* meta = harness_->tablet()->metadata();
 
   // Dump the superblock to a PB. Save the PB to the side.
-  TabletSuperBlockPB superblock_pb_1;
-  ASSERT_OK(meta->ToSuperBlock(&superblock_pb_1));
+  RaftGroupReplicaSuperBlockPB superblock_pb_1;
+  meta->ToSuperBlock(&superblock_pb_1);
 
-  // Load the superblock PB back into the TabletMetadata.
+  // Load the superblock PB back into the RaftGroupMetadata.
   ASSERT_OK(meta->ReplaceSuperBlock(superblock_pb_1));
 
   // Dump the tablet metadata to a superblock PB again, and save it.
-  TabletSuperBlockPB superblock_pb_2;
-  ASSERT_OK(meta->ToSuperBlock(&superblock_pb_2));
+  RaftGroupReplicaSuperBlockPB superblock_pb_2;
+  meta->ToSuperBlock(&superblock_pb_2);
 
   // Compare the 2 dumped superblock PBs.
   ASSERT_EQ(superblock_pb_1.SerializeAsString(),

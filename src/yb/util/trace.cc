@@ -47,6 +47,8 @@
 
 #include "yb/util/memory/arena.h"
 #include "yb/util/memory/memory.h"
+#include "yb/util/object_pool.h"
+#include "yb/util/size_literals.h"
 
 DEFINE_bool(enable_tracing, false, "Flag to enable/disable tracing across the code.");
 
@@ -140,27 +142,26 @@ std::once_flag init_get_current_micros_fast_flag;
 int64_t initial_micros_offset;
 
 void InitGetCurrentMicrosFast() {
-  auto before = MonoTime::FineNow();
+  auto before = MonoTime::Now();
   initial_micros_offset = GetCurrentTimeMicros();
-  auto after = MonoTime::FineNow();
+  auto after = MonoTime::Now();
   auto mid = after.GetDeltaSinceMin().ToMicroseconds();
   mid += before.GetDeltaSinceMin().ToMicroseconds();
   mid /= 2;
   initial_micros_offset -= mid;
 }
 
-int64_t GetCurrentMicrosFast() {
+int64_t GetCurrentMicrosFast(MonoTime now) {
   std::call_once(init_get_current_micros_fast_flag, InitGetCurrentMicrosFast);
-  auto now = MonoTime::FineNow();
   return initial_micros_offset + now.GetDeltaSinceMin().ToMicroseconds();
 }
 
 } // namespace
 
 ScopedAdoptTrace::ScopedAdoptTrace(Trace* t)
-    : old_trace_(Trace::threadlocal_trace_), trace_(t), is_enabled_(FLAGS_enable_tracing) {
+    : old_trace_(Trace::threadlocal_trace_), is_enabled_(GetAtomicFlag(&FLAGS_enable_tracing)) {
   if (is_enabled_) {
-    CHECK(!t || !t->HasOneRef());
+    trace_ = t;
     Trace::threadlocal_trace_ = t;
     DFAKE_SCOPED_LOCK_THREAD_LOCKED(ctor_dtor_);
   }
@@ -169,6 +170,25 @@ ScopedAdoptTrace::ScopedAdoptTrace(Trace* t)
 ScopedAdoptTrace::~ScopedAdoptTrace() {
   if (is_enabled_) {
     Trace::threadlocal_trace_ = old_trace_;
+    // It's critical that we Release() the reference count on 't' only
+    // after we've unset the thread-local variable. Otherwise, we can hit
+    // a nasty interaction with tcmalloc contention profiling. Consider
+    // the following sequence:
+    //
+    //   1. threadlocal_trace_ has refcount = 1
+    //   2. we call threadlocal_trace_->Release() which decrements refcount to 0
+    //   3. this calls 'delete' on the Trace object
+    //   3a. this calls tcmalloc free() on the Trace and various sub-objects
+    //   3b. the free() calls may end up experiencing contention in tcmalloc
+    //   3c. we try to account the contention in threadlocal_trace_'s TraceMetrics,
+    //       but it has already been freed.
+    //
+    // In the best case, we just scribble into some free tcmalloc memory. In the
+    // worst case, tcmalloc would have already re-used this memory for a new
+    // allocation on another thread, and we end up overwriting someone else's memory.
+    //
+    // Waiting to Release() only after 'unpublishing' the trace solves this.
+    trace_.reset();
     DFAKE_SCOPED_LOCK_THREAD_LOCKED(ctor_dtor_);
   }
 }
@@ -183,60 +203,62 @@ struct TraceEntry {
 
   uint32_t message_len;
   TraceEntry* next;
-
-  // The actual trace message follows the entry header.
-  const char* message() const {
-    return EndOfObject(this);
-  }
-
-  char* message() {
-    return EndOfObject(this);
-  }
+  char message[0];
 
   void Dump(std::ostream* out) const {
     *out << const_basename(file_path) << ':' << line_number
          << "] ";
-    out->write(message(), message_len);
+    out->write(message, message_len);
   }
 };
 
-Trace::Trace()
-    : entries_head_(nullptr),
-      entries_tail_(nullptr) {
+Trace::Trace() {
+}
+
+ThreadSafeObjectPool<ThreadSafeArena>& ArenaPool() {
+  static ThreadSafeObjectPool<ThreadSafeArena> result([] {
+    return new ThreadSafeArena(8_KB, 128_KB);
+  });
+  return result;
 }
 
 Trace::~Trace() {
   auto* arena = arena_.load(std::memory_order_acquire);
   if (arena) {
-    delete arena;
+    arena->Reset();
+    ArenaPool().Release(arena);
   }
 }
 
 ThreadSafeArena* Trace::GetAndInitArena() {
   auto* arena = arena_.load(std::memory_order_acquire);
   if (arena == nullptr) {
-    std::lock_guard<simple_spinlock> l(lock_);
-    arena = arena_.load(std::memory_order_relaxed);
-    if (arena == nullptr) {
-      arena = new ThreadSafeArena(1024, 128 * 1024);
-      arena_.store(arena, std::memory_order_release);
+    arena = ArenaPool().Take();
+    ThreadSafeArena* existing_arena = nullptr;
+    if (arena_.compare_exchange_strong(existing_arena, arena, std::memory_order_release)) {
+      return arena;
+    } else {
+      ArenaPool().Release(arena);
+      return existing_arena;
     }
   }
   return arena;
 }
 
-void Trace::SubstituteAndTrace(const char* file_path, int line_number, StringPiece format) {
+void Trace::SubstituteAndTrace(
+    const char* file_path, int line_number, MonoTime now, GStringPiece format) {
   int msg_len = format.size();
   DCHECK_NE(msg_len, 0) << "Bad format specification";
-  TraceEntry* entry = NewEntry(msg_len, file_path, line_number);
+  TraceEntry* entry = NewEntry(msg_len, file_path, line_number, now);
   if (entry == nullptr) return;
-  memcpy(entry->message(), format.data(), msg_len);
+  memcpy(entry->message, format.data(), msg_len);
   AddEntry(entry);
 }
 
 void Trace::SubstituteAndTrace(const char* file_path,
                                int line_number,
-                               StringPiece format,
+                               MonoTime now,
+                               GStringPiece format,
                                const SubstituteArg& arg0, const SubstituteArg& arg1,
                                const SubstituteArg& arg2, const SubstituteArg& arg3,
                                const SubstituteArg& arg4, const SubstituteArg& arg5,
@@ -248,23 +270,23 @@ void Trace::SubstituteAndTrace(const char* file_path,
 
   int msg_len = strings::internal::SubstitutedSize(format, args_array);
   DCHECK_NE(msg_len, 0) << "Bad format specification";
-  TraceEntry* entry = NewEntry(msg_len, file_path, line_number);
+  TraceEntry* entry = NewEntry(msg_len, file_path, line_number, now);
   if (entry == nullptr) return;
-  SubstituteToBuffer(format, args_array, entry->message());
+  SubstituteToBuffer(format, args_array, entry->message);
   AddEntry(entry);
 }
 
-TraceEntry* Trace::NewEntry(int msg_len, const char* file_path, int line_number) {
+TraceEntry* Trace::NewEntry(int msg_len, const char* file_path, int line_number, MonoTime now) {
   auto* arena = GetAndInitArena();
-  int size = sizeof(TraceEntry) + msg_len;
-  uint8_t* dst = static_cast<uint8_t*>(arena->AllocateBytesAligned(size, alignof(TraceEntry)));
+  size_t size = offsetof(TraceEntry, message) + msg_len;
+  void* dst = arena->AllocateBytesAligned(size, alignof(TraceEntry));
   if (dst == nullptr) {
     LOG(ERROR) << "NewEntry(msg_len, " << file_path << ", " << line_number
         << ") received nullptr from AllocateBytes.\n So far:" << DumpToString(true);
     return nullptr;
   }
   TraceEntry* entry = new (dst) TraceEntry;
-  entry->timestamp = MonoTime::Now(MonoTime::FINE);
+  entry->timestamp = now;
   entry->message_len = msg_len;
   entry->file_path = file_path;
   entry->line_number = line_number;
@@ -280,7 +302,7 @@ void Trace::AddEntry(TraceEntry* entry) {
   } else {
     DCHECK(entries_head_ == nullptr);
     entries_head_ = entry;
-    trace_start_time_usec_ = GetCurrentMicrosFast();
+    trace_start_time_usec_ = GetCurrentMicrosFast(entry->timestamp);
   }
   entries_tail_ = entry;
 }
@@ -341,12 +363,12 @@ PlainTrace::PlainTrace() {
 }
 
 void PlainTrace::Trace(const char *file_path, int line_number, const char *message) {
-  auto timestamp = MonoTime::Now(MonoTime::FINE);
+  auto timestamp = MonoTime::Now();
   {
     std::lock_guard<decltype(mutex_)> lock(mutex_);
     if (size_ < kMaxEntries) {
       if (size_ == 0) {
-        trace_start_time_usec_ = GetCurrentMicrosFast();
+        trace_start_time_usec_ = GetCurrentMicrosFast(timestamp);
       }
       entries_[size_] = {file_path, line_number, message, timestamp};
       ++size_;

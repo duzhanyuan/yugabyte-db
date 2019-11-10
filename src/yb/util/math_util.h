@@ -1,3 +1,4 @@
+//
 // Copyright (c) YugaByte, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -14,6 +15,7 @@
 #ifndef YB_UTIL_MATH_UTIL_H_
 #define YB_UTIL_MATH_UTIL_H_
 
+#include <limits>
 #include <vector>
 
 namespace yb {
@@ -29,6 +31,19 @@ constexpr T constexpr_max(const T& lhs, const T& rhs) {
 template <class T1, class T2, class... Args>
 constexpr T1 constexpr_max(const T1& t1, const T2& t2, const Args&&... args) {
   return constexpr_max(t1, constexpr_max(t2, args...));
+}
+
+template <class T>
+constexpr T ceil_div(const T& n, const T& div) {
+  return (n + div - 1) / div;
+}
+
+template <class T>
+T max_if_negative(T value) {
+  if (value < 0) {
+    return std::numeric_limits<T>::max();
+  }
+  return value;
 }
 
 }  // namespace yb

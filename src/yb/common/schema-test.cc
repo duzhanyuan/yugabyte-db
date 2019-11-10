@@ -92,13 +92,15 @@ TEST(TestSchema, TestSchema) {
             empty_schema.memory_footprint_excluding_this());
 
   EXPECT_EQ("Schema [\n"
-            "\tkey[string NOT NULL],\n"
-            "\tuint32val[uint32 NULLABLE],\n"
-            "\tint32val[int32 NOT NULL]\n"
-            "]",
+            "\tkey[string NOT NULL NOT A PARTITION KEY],\n"
+            "\tuint32val[uint32 NULLABLE NOT A PARTITION KEY],\n"
+            "\tint32val[int32 NOT NULL NOT A PARTITION KEY]\n"
+            "]\nproperties: contain_counters: false is_transactional: false "
+            "consistency_level: STRONG "
+            "use_mangled_column_name: false",
             schema.ToString());
-  EXPECT_EQ("key[string NOT NULL]", schema.column(0).ToString());
-  EXPECT_EQ("uint32 NULLABLE", schema.column(1).TypeToString());
+  EXPECT_EQ("key[string NOT NULL NOT A PARTITION KEY]", schema.column(0).ToString());
+  EXPECT_EQ("uint32 NULLABLE NOT A PARTITION KEY", schema.column(1).TypeToString());
 }
 
 TEST(TestSchema, TestSwap) {
@@ -168,7 +170,6 @@ TEST(TestSchema, TestProjectSubset) {
   // Verify the mapping
   ASSERT_EQ(2, row_projector.base_cols_mapping().size());
   ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
-  ASSERT_EQ(0, row_projector.projection_defaults().size());
 
   const vector<RowProjector::ProjectionIdxMapping>& mapping = row_projector.base_cols_mapping();
   ASSERT_EQ(mapping[0].first, 0);  // col3 schema2
@@ -197,39 +198,21 @@ TEST(TestSchema, TestProjectMissingColumn) {
   Schema schema1({ ColumnSchema("key", STRING), ColumnSchema("val", UINT32) }, 1);
   Schema schema2({ ColumnSchema("val", UINT32), ColumnSchema("non_present", STRING) }, 0);
   Schema schema3({ ColumnSchema("val", UINT32), ColumnSchema("non_present", UINT32, true) }, 0);
-  uint32_t default_value = 15;
-  Schema schema4({ ColumnSchema("val", UINT32),
-                   ColumnSchema("non_present", UINT32, false, false, false, false,
-                                ColumnSchema::SortingType::kNotSpecified, &default_value) },
-                 0);
 
   RowProjector row_projector(&schema1, &schema2);
   Status s = row_projector.Init();
   ASSERT_TRUE(s.IsInvalidArgument());
   ASSERT_STR_CONTAINS(s.message().ToString(),
-    "does not exist in the projection, and it does not have a default value or a nullable type");
+    "does not exist in the projection, and it does not have a nullable type");
 
   // Verify Default nullable column with no default value
   ASSERT_OK(row_projector.Reset(&schema1, &schema3));
 
   ASSERT_EQ(1, row_projector.base_cols_mapping().size());
   ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
-  ASSERT_EQ(1, row_projector.projection_defaults().size());
 
   ASSERT_EQ(row_projector.base_cols_mapping()[0].first, 0);  // val schema2
   ASSERT_EQ(row_projector.base_cols_mapping()[0].second, 1); // val schema1
-  ASSERT_EQ(row_projector.projection_defaults()[0], 1);      // non_present schema3
-
-  // Verify Default non nullable column with default value
-  ASSERT_OK(row_projector.Reset(&schema1, &schema4));
-
-  ASSERT_EQ(1, row_projector.base_cols_mapping().size());
-  ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
-  ASSERT_EQ(1, row_projector.projection_defaults().size());
-
-  ASSERT_EQ(row_projector.base_cols_mapping()[0].first, 0);  // val schema4
-  ASSERT_EQ(row_projector.base_cols_mapping()[0].second, 1); // val schema1
-  ASSERT_EQ(row_projector.projection_defaults()[0], 1);      // non_present schema4
 }
 
 // Test projection mapping using IDs.
@@ -251,15 +234,12 @@ TEST(TestSchema, TestProjectRename) {
 
   ASSERT_EQ(2, row_projector.base_cols_mapping().size());
   ASSERT_EQ(0, row_projector.adapter_cols_mapping().size());
-  ASSERT_EQ(1, row_projector.projection_defaults().size());
 
   ASSERT_EQ(row_projector.base_cols_mapping()[0].first, 0);  // key schema2
   ASSERT_EQ(row_projector.base_cols_mapping()[0].second, 0); // key schema1
 
   ASSERT_EQ(row_projector.base_cols_mapping()[1].first, 1);  // val_renamed schema2
   ASSERT_EQ(row_projector.base_cols_mapping()[1].second, 1); // val schema1
-
-  ASSERT_EQ(row_projector.projection_defaults()[0], 2);      // non_present schema2
 }
 
 
@@ -384,19 +364,23 @@ TEST(TestSchema, TestCreateProjection) {
   // By names, without IDs
   ASSERT_OK(schema.CreateProjectionByNames({ "col1", "col2", "col4" }, &partial_schema));
   EXPECT_EQ("Schema [\n"
-            "\tcol1[string NOT NULL],\n"
-            "\tcol2[string NOT NULL],\n"
-            "\tcol4[string NOT NULL]\n"
-            "]",
+            "\tcol1[string NOT NULL NOT A PARTITION KEY],\n"
+            "\tcol2[string NOT NULL NOT A PARTITION KEY],\n"
+            "\tcol4[string NOT NULL NOT A PARTITION KEY]\n"
+            "]\nproperties: contain_counters: false is_transactional: false "
+            "consistency_level: STRONG "
+            "use_mangled_column_name: false",
             partial_schema.ToString());
 
   // By names, with IDS
   ASSERT_OK(schema_with_ids.CreateProjectionByNames({ "col1", "col2", "col4" }, &partial_schema));
   EXPECT_EQ(Substitute("Schema [\n"
-                       "\t$0:col1[string NOT NULL],\n"
-                       "\t$1:col2[string NOT NULL],\n"
-                       "\t$2:col4[string NOT NULL]\n"
-                       "]",
+                       "\t$0:col1[string NOT NULL NOT A PARTITION KEY],\n"
+                       "\t$1:col2[string NOT NULL NOT A PARTITION KEY],\n"
+                       "\t$2:col4[string NOT NULL NOT A PARTITION KEY]\n"
+                       "]\nproperties: contain_counters: false is_transactional: false "
+                       "consistency_level: STRONG "
+                       "use_mangled_column_name: false",
                        schema_with_ids.column_id(0),
                        schema_with_ids.column_id(1),
                        schema_with_ids.column_id(3)),
@@ -413,10 +397,12 @@ TEST(TestSchema, TestCreateProjection) {
                                                                  schema_with_ids.column_id(3) },
                                                                &partial_schema));
   EXPECT_EQ(Substitute("Schema [\n"
-                       "\t$0:col1[string NOT NULL],\n"
-                       "\t$1:col2[string NOT NULL],\n"
-                       "\t$2:col4[string NOT NULL]\n"
-                       "]",
+                       "\t$0:col1[string NOT NULL NOT A PARTITION KEY],\n"
+                       "\t$1:col2[string NOT NULL NOT A PARTITION KEY],\n"
+                       "\t$2:col4[string NOT NULL NOT A PARTITION KEY]\n"
+                       "]\nproperties: contain_counters: false is_transactional: false "
+                       "consistency_level: STRONG "
+                       "use_mangled_column_name: false",
                        schema_with_ids.column_id(0),
                        schema_with_ids.column_id(1),
                        schema_with_ids.column_id(3)),

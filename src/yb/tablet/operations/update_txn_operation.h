@@ -28,11 +28,11 @@ class TransactionCoordinator;
 
 class UpdateTxnOperationState : public OperationState {
  public:
-  UpdateTxnOperationState(TabletPeer* tablet_peer, const tserver::TransactionStatePB* request)
-      : OperationState(tablet_peer), request_(request) {}
+  UpdateTxnOperationState(Tablet* tablet, const tserver::TransactionStatePB* request)
+      : OperationState(tablet), request_(request) {}
 
-  explicit UpdateTxnOperationState(TabletPeer* tablet_peer)
-      : UpdateTxnOperationState(tablet_peer, nullptr) {}
+  explicit UpdateTxnOperationState(Tablet* tablet)
+      : UpdateTxnOperationState(tablet, nullptr) {}
 
   const tserver::TransactionStatePB* request() const override {
     return request_.load(std::memory_order_acquire);
@@ -55,8 +55,8 @@ class UpdateTxnOperationState : public OperationState {
 
 class UpdateTxnOperation : public Operation {
  public:
-  UpdateTxnOperation(std::unique_ptr<UpdateTxnOperationState> state, consensus::DriverType type)
-      : Operation(std::move(state), type, Operation::UPDATE_TRANSACTION_TXN) {}
+  explicit UpdateTxnOperation(std::unique_ptr<UpdateTxnOperationState> state)
+      : Operation(std::move(state), OperationType::kUpdateTransaction) {}
 
   UpdateTxnOperationState* state() override {
     return down_cast<UpdateTxnOperationState*>(Operation::state());
@@ -68,14 +68,13 @@ class UpdateTxnOperation : public Operation {
 
  private:
   TransactionCoordinator& transaction_coordinator() const;
-  ProcessingMode mode() const;
 
   consensus::ReplicateMsgPtr NewReplicateMsg() override;
   CHECKED_STATUS Prepare() override;
-  void Start() override;
-  CHECKED_STATUS Apply(gscoped_ptr<consensus::CommitMsg>* commit_msg) override;
+  void DoStart() override;
+  CHECKED_STATUS DoReplicated(int64_t leader_term, Status* complete_status) override;
+  CHECKED_STATUS DoAborted(const Status& status) override;
   std::string ToString() const override;
-  void Finish(OperationResult result) override;
 };
 
 } // namespace tablet

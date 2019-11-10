@@ -33,14 +33,20 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/session.h"
+#include "yb/client/yb_op.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/master/mini_master.h"
+#include "yb/rpc/messenger.h"
 #include "yb/tools/data_gen_util.h"
 #include "yb/tools/ysck_remote.h"
 #include "yb/util/monotime.h"
 #include "yb/util/random.h"
 #include "yb/util/test_util.h"
+
+using namespace std::literals;
 
 DECLARE_int32(heartbeat_interval_ms);
 
@@ -48,7 +54,6 @@ namespace yb {
 namespace tools {
 
 using client::YBColumnSchema;
-using client::KuduInsert;
 using client::YBSchemaBuilder;
 using client::YBSession;
 using client::YBTable;
@@ -67,7 +72,7 @@ class RemoteYsckTest : public YBTest {
   RemoteYsckTest()
     : random_(SeedRandom()) {
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("key")->Type(INT32)->NotNull()->HashPrimaryKey();
     b.AddColumn("int_val")->Type(INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
   }
@@ -83,30 +88,28 @@ class RemoteYsckTest : public YBTest {
     mini_cluster_.reset(new MiniCluster(env_.get(), opts));
     ASSERT_OK(mini_cluster_->Start());
 
-    master_rpc_addr_ = mini_cluster_->mini_master()->bound_rpc_addr();
+    master_rpc_addr_ = mini_cluster_->GetLeaderMasterBoundRpcAddr();
 
     // Connect to the cluster.
-    ASSERT_OK(client::YBClientBuilder()
-                     .add_master_server_addr(ToString(master_rpc_addr_))
-                     .Build(&client_));
+    client_ = ASSERT_RESULT(mini_cluster_->CreateClient());
 
     // Create one table.
     ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
     gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
                      .schema(&schema_)
-                     .num_replicas(3)
-                     .split_rows(GenerateSplitRows())
+                     .num_tablets(3)
                      .Create());
     // Make sure we can open the table.
     ASSERT_OK(client_->OpenTable(kTableName, &client_table_));
 
-    ASSERT_OK(RemoteYsckMaster::Build(master_rpc_addr_, &master_));
+    ASSERT_OK(RemoteYsckMaster::Build(HostPort(master_rpc_addr_), &master_));
     cluster_.reset(new YsckCluster(master_));
     ysck_.reset(new Ysck(cluster_));
   }
 
   void TearDown() override {
+    client_.reset();
     if (mini_cluster_) {
       mini_cluster_->Shutdown();
       mini_cluster_.reset();
@@ -121,28 +124,21 @@ class RemoteYsckTest : public YBTest {
                              const AtomicBool& continue_writing,
                              Promise<Status>* promise) {
     shared_ptr<YBTable> table;
-    Status status;
-    status = client_->OpenTable(kTableName, &table);
+    Status status = client_->OpenTable(kTableName, &table);
     if (!status.ok()) {
       promise->Set(status);
+      return;
     }
     shared_ptr<YBSession> session(client_->NewSession());
-    session->SetTimeoutMillis(10000);
-    status = session->SetFlushMode(YBSession::MANUAL_FLUSH);
-    if (!status.ok()) {
-      promise->Set(status);
-    }
+    session->SetTimeout(10s);
 
     for (uint64_t i = 0; continue_writing.Load(); i++) {
-      shared_ptr<KuduInsert> insert(table->NewInsert());
-      GenerateDataForRow(table->schema(), i, &random_, insert->mutable_row());
-      status = session->Apply(insert);
+      std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert());
+      GenerateDataForRow(table->schema(), i, &random_, insert->mutable_request());
+      status = session->ApplyAndFlush(insert);
       if (!status.ok()) {
         promise->Set(status);
-      }
-      status = session->Flush();
-      if (!status.ok()) {
-        promise->Set(status);
+        return;
       }
       started_writing->CountDown(1);
     }
@@ -151,27 +147,15 @@ class RemoteYsckTest : public YBTest {
 
  protected:
   // Generate a set of split rows for tablets used in this test.
-  vector<const YBPartialRow*> GenerateSplitRows() {
-    vector<const YBPartialRow*> split_rows;
-    vector<int> split_nums = { 33, 66 };
-    for (int i : split_nums) {
-      YBPartialRow* row = schema_.NewRow();
-      CHECK_OK(row->SetInt32(0, i));
-      split_rows.push_back(row);
-    }
-    return split_rows;
-  }
-
   Status GenerateRowWrites(uint64_t num_rows) {
     shared_ptr<YBTable> table;
     RETURN_NOT_OK(client_->OpenTable(kTableName, &table));
     shared_ptr<YBSession> session(client_->NewSession());
-    session->SetTimeoutMillis(10000);
-    RETURN_NOT_OK(session->SetFlushMode(YBSession::MANUAL_FLUSH));
+    session->SetTimeout(10s);
     for (uint64_t i = 0; i < num_rows; i++) {
       VLOG(1) << "Generating write for row id " << i;
-      shared_ptr<KuduInsert> insert(table->NewInsert());
-      GenerateDataForRow(table->schema(), i, &random_, insert->mutable_row());
+      std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert());
+      GenerateDataForRow(table->schema(), i, &random_, insert->mutable_request());
       RETURN_NOT_OK(session->Apply(insert));
 
       if (i > 0 && i % 1000 == 0) {
@@ -183,10 +167,10 @@ class RemoteYsckTest : public YBTest {
   }
 
   std::shared_ptr<Ysck> ysck_;
-  shared_ptr<client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
 
  private:
-  Endpoint master_rpc_addr_;
+  HostPort master_rpc_addr_;
   std::shared_ptr<MiniCluster> mini_cluster_;
   client::YBSchema schema_;
   shared_ptr<client::YBTable> client_table_;
@@ -207,10 +191,10 @@ TEST_F(RemoteYsckTest, TestTabletServersOk) {
 }
 
 TEST_F(RemoteYsckTest, TestTableConsistency) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
+  MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(MonoDelta::FromSeconds(30));
   Status s;
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  while (MonoTime::Now().ComesBefore(deadline)) {
     ASSERT_OK(ysck_->FetchTableAndTabletInfo());
     s = ysck_->CheckTablesConsistency();
     if (s.ok()) {
@@ -226,14 +210,14 @@ TEST_F(RemoteYsckTest, TestChecksum) {
   LOG(INFO) << "Generating row writes...";
   ASSERT_OK(GenerateRowWrites(num_writes));
 
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
+  MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(MonoDelta::FromSeconds(30));
   Status s;
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  while (MonoTime::Now().ComesBefore(deadline)) {
     ASSERT_OK(ysck_->FetchTableAndTabletInfo());
     s = ysck_->ChecksumData(vector<string>(),
                             vector<string>(),
-                            ChecksumOptions(MonoDelta::FromSeconds(1), 16, false, 0));
+                            ChecksumOptions(MonoDelta::FromSeconds(1), 16));
     if (s.ok()) {
       break;
     }
@@ -250,7 +234,7 @@ TEST_F(RemoteYsckTest, TestChecksumTimeout) {
   // Use an impossibly low timeout value of zero!
   Status s = ysck_->ChecksumData(vector<string>(),
                                  vector<string>(),
-                                 ChecksumOptions(MonoDelta::FromNanoseconds(0), 16, false, 0));
+                                 ChecksumOptions(MonoDelta::FromNanoseconds(0), 16));
   ASSERT_TRUE(s.IsTimedOut()) << "Expected TimedOut Status, got: " << s.ToString();
 }
 
@@ -272,7 +256,7 @@ TEST_F(RemoteYsckTest, TestChecksumSnapshot) {
   CHECK(started_writing.WaitFor(MonoDelta::FromSeconds(30)));
 
   uint64_t ts = client_->GetLatestObservedHybridTime();
-  MonoTime start(MonoTime::Now(MonoTime::FINE));
+  MonoTime start(MonoTime::Now());
   MonoTime deadline = start;
   deadline.AddDelta(MonoDelta::FromSeconds(30));
   Status s;
@@ -281,15 +265,15 @@ TEST_F(RemoteYsckTest, TestChecksumSnapshot) {
   while (true) {
     ASSERT_OK(ysck_->FetchTableAndTabletInfo());
     Status s = ysck_->ChecksumData(vector<string>(), vector<string>(),
-                                   ChecksumOptions(MonoDelta::FromSeconds(10), 16, true, ts));
+                                   ChecksumOptions(MonoDelta::FromSeconds(10), 16));
     if (s.ok()) break;
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (deadline.ComesBefore(MonoTime::Now())) break;
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
   if (!s.ok()) {
     LOG(WARNING) << Substitute("Timed out after $0 waiting for ysck to become consistent on TS $1. "
                                "Status: $2",
-                               MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).ToString(),
+                               MonoTime::Now().GetDeltaSince(start).ToString(),
                                ts, s.ToString());
     EXPECT_OK(s); // To avoid ASAN complaints due to thread reading the CountDownLatch.
   }
@@ -319,8 +303,7 @@ TEST_F(RemoteYsckTest, DISABLED_TestChecksumSnapshotCurrentHybridTime) {
 
   ASSERT_OK(ysck_->FetchTableAndTabletInfo());
   ASSERT_OK(ysck_->ChecksumData(vector<string>(), vector<string>(),
-                                ChecksumOptions(MonoDelta::FromSeconds(10), 16, true,
-                                                ChecksumOptions::kCurrentHybridTime)));
+                                ChecksumOptions(MonoDelta::FromSeconds(10), 16)));
   continue_writing.Store(false);
   ASSERT_OK(promise.Get());
   writer_thread->Join();

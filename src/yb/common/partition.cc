@@ -38,13 +38,12 @@
 #include "yb/common/crc16.h"
 #include "yb/common/partial_row.h"
 #include "yb/common/row_key-util.h"
-#include "yb/common/scan_predicate.h"
 #include "yb/common/wire_protocol.pb.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/hash/hash.h"
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/redisserver/redis_constants.h"
+#include "yb/yql/redis/redisserver/redis_constants.h"
 #include "yb/common/ql_value.h"
 
 namespace yb {
@@ -143,19 +142,23 @@ Status PartitionSchema::FromPB(const PartitionSchemaPB& pb,
                                PartitionSchema* partition_schema) {
   partition_schema->Clear();
 
-  switch (pb.hash_schema()) {
-    case PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA:
-      VLOG(3) << "Using multi-column hash value for partitioning";
-      partition_schema->hash_schema_ = YBHashSchema::kMultiColumnHash;
-      return Status::OK();
+  if (pb.has_hash_schema()) {
+    switch (pb.hash_schema()) {
+      case PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA:
+        VLOG(3) << "Using multi-column hash value for partitioning";
+        partition_schema->hash_schema_ = YBHashSchema::kMultiColumnHash;
+        return Status::OK();
 
-    case PartitionSchemaPB::REDIS_HASH_SCHEMA:
-      VLOG(3) << "Using redis hash schema for partitioning";
-      partition_schema->hash_schema_ = YBHashSchema::kRedisHash;
-      return Status::OK();
+      case PartitionSchemaPB::REDIS_HASH_SCHEMA:
+        VLOG(3) << "Using redis hash schema for partitioning";
+        partition_schema->hash_schema_ = YBHashSchema::kRedisHash;
+        return Status::OK();
 
-    case PartitionSchemaPB::KUDU_HASH_SCHEMA:
-      break;
+      case PartitionSchemaPB::PGSQL_HASH_SCHEMA:
+        VLOG(3) << "Using pgsql hash schema for partitioning";
+        partition_schema->hash_schema_ = YBHashSchema::kPgsqlHash;
+        return Status::OK();
+    }
   }
 
   for (const PartitionSchemaPB_HashBucketSchemaPB& hash_bucket_pb : pb.hash_bucket_schemas()) {
@@ -192,16 +195,18 @@ Status PartitionSchema::FromPB(const PartitionSchemaPB& pb,
 void PartitionSchema::ToPB(PartitionSchemaPB* pb) const {
   pb->Clear();
 
-  switch (hash_schema_) {
-    case YBHashSchema::kMultiColumnHash:
-      pb->set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
-      break;
-    case YBHashSchema::kRedisHash:
-      pb->set_hash_schema(PartitionSchemaPB::REDIS_HASH_SCHEMA);
-      break;
-    case  YBHashSchema::kKuduHashSchema:
-      pb->set_hash_schema(PartitionSchemaPB::KUDU_HASH_SCHEMA);
-      break;
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kMultiColumnHash:
+        pb->set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
+        break;
+      case YBHashSchema::kRedisHash:
+        pb->set_hash_schema(PartitionSchemaPB::REDIS_HASH_SCHEMA);
+        break;
+      case YBHashSchema::kPgsqlHash:
+        pb->set_hash_schema(PartitionSchemaPB::PGSQL_HASH_SCHEMA);
+        break;
+    }
   }
 
   pb->mutable_hash_bucket_schemas()->Reserve(hash_bucket_schemas_.size());
@@ -250,19 +255,56 @@ Status PartitionSchema::EncodeRedisKey(const Slice& slice, string* buf) const {
 
 Status PartitionSchema::EncodeKey(const RepeatedPtrField<QLExpressionPB>& hash_col_values,
                                   string* buf) const {
+  if (!hash_schema_) {
+    return Status::OK();
+  }
 
-  switch (hash_schema_) {
+  switch (*hash_schema_) {
     case YBHashSchema::kMultiColumnHash: {
       string tmp;
       for (const auto &col_expr_pb : hash_col_values) {
-        RETURN_NOT_OK(QLValue::AppendToKeyBytes(col_expr_pb.value(), &tmp));
+        AppendToKey(col_expr_pb.value(), &tmp);
       }
       const uint16_t hash_value = YBPartition::HashColumnCompoundValue(tmp);
       *buf = EncodeMultiColumnHashValue(hash_value);
       return Status::OK();
     }
-    case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;
-    case YBHashSchema::kKuduHashSchema:
+    case YBHashSchema::kPgsqlHash:
+      DLOG(FATAL) << "Illegal code path. PGSQL hash cannot be computed from CQL expression";
+      break;
+    case YBHashSchema::kRedisHash:
+      DLOG(FATAL) << "Illegal code path. REDIS hash cannot be computed from CQL expression";
+      break;
+  }
+
+  return STATUS(InvalidArgument, "Unsupported Partition Schema Type.");
+}
+
+Status PartitionSchema::EncodeKey(const RepeatedPtrField<PgsqlExpressionPB>& hash_col_values,
+                                  string* buf) const {
+  if (!hash_schema_) {
+    return Status::OK();
+  }
+
+  switch (*hash_schema_) {
+    case YBHashSchema::kPgsqlHash: {
+      // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.
+      // For now, let's not doing anything. Just borrow code from multi column hashing style.
+      string tmp;
+      for (const auto &col_expr_pb : hash_col_values) {
+        AppendToKey(col_expr_pb.value(), &tmp);
+      }
+      const uint16_t hash_value = YBPartition::HashColumnCompoundValue(tmp);
+      *buf = EncodeMultiColumnHashValue(hash_value);
+      return Status::OK();
+    }
+
+    case YBHashSchema::kMultiColumnHash:
+      DLOG(FATAL) << "Illegal code path. CQL hash cannot be computed from PGSQL expression";
+      break;
+
+    case YBHashSchema::kRedisHash:
+      DLOG(FATAL) << "Illegal code path. REDIS hash cannot be computed from PGSQL expression";
       break;
   }
 
@@ -271,13 +313,17 @@ Status PartitionSchema::EncodeKey(const RepeatedPtrField<QLExpressionPB>& hash_c
 
 Status PartitionSchema::EncodeKey(const YBPartialRow& row, string* buf) const {
 
-  switch (hash_schema_) {
-    case YBHashSchema::kMultiColumnHash:
-      return EncodeColumns(row, buf);
-    case YBHashSchema::kRedisHash:
-      return EncodeRedisKey(row, buf);
-    case YBHashSchema::kKuduHashSchema:
-      break;
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kPgsqlHash:
+        // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.
+        // For now, let's not doing anything. Just borrow code from multi column hashing style.
+        FALLTHROUGH_INTENDED;
+      case YBHashSchema::kMultiColumnHash:
+        return EncodeColumns(row, buf);
+      case YBHashSchema::kRedisHash:
+        return EncodeRedisKey(row, buf);
+    }
   }
 
   const KeyEncoder<string>& hash_encoder = GetKeyEncoder<string>(GetTypeInfo(UINT32));
@@ -292,13 +338,17 @@ Status PartitionSchema::EncodeKey(const YBPartialRow& row, string* buf) const {
 }
 
 Status PartitionSchema::EncodeKey(const ConstContiguousRow& row, string* buf) const {
-  switch (hash_schema_) {
-    case YBHashSchema::kRedisHash:
-      LOG(FATAL) << "Invalid hash schema kRedisHash passed to EncodeKey";
-    case YBHashSchema::kMultiColumnHash:
-      return EncodeColumns(row, buf);
-    case YBHashSchema::kKuduHashSchema:
-      break;
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kRedisHash:
+        LOG(FATAL) << "Invalid hash schema kRedisHash passed to EncodeKey";
+      case YBHashSchema::kPgsqlHash:
+        // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.
+        // For now, let's not doing anything. Just borrow code from multi column hashing style.
+        FALLTHROUGH_INTENDED;
+      case YBHashSchema::kMultiColumnHash:
+        return EncodeColumns(row, buf);
+    }
   }
 
   const KeyEncoder<string>& hash_encoder = GetKeyEncoder<string>(GetTypeInfo(UINT32));
@@ -328,7 +378,21 @@ Status PartitionSchema::CreatePartitions(int32_t num_tablets,
                                          vector<Partition> *partitions,
                                          int32_t max_partition_key) const {
   DCHECK_GT(max_partition_key, 0);
-  DCHECK_LE(max_partition_key, std::numeric_limits<uint16_t>::max());
+  DCHECK_LE(max_partition_key, kMaxPartitionKey);
+
+  if (max_partition_key <= 0 || max_partition_key > kMaxPartitionKey) {
+    return STATUS_SUBSTITUTE(InvalidArgument, "max_partition_key $0 should be in ($1, $2].",
+                             0, kMaxPartitionKey);
+  }
+
+  LOG(INFO) << "Creating partitions with num_tablets: " << num_tablets;
+
+  // May be also add an upper bound? TODO.
+  if (num_tablets <= 0) {
+    return STATUS_SUBSTITUTE(InvalidArgument, "num_tablets should be greater than 0. Client "
+                             "would need to wait for master leader get heartbeats from tserver.");
+  }
+
   // Allocate the partitions.
   partitions->resize(num_tablets);
   const uint16_t partition_interval = max_partition_key / num_tablets;
@@ -498,16 +562,19 @@ Status PartitionSchema::PartitionContainsRowImpl(const Partition& partition,
   }
 
   string partition_key;
-  switch (hash_schema_) {
-    case YBHashSchema::kKuduHashSchema:
-      RETURN_NOT_OK(EncodeColumns(row, range_schema_.column_ids, &partition_key));
-      break;
-    case YBHashSchema::kMultiColumnHash:
-      RETURN_NOT_OK(EncodeColumns(row, &partition_key));
-      break;
-    case YBHashSchema::kRedisHash:
-      RETURN_NOT_OK(EncodeRedisKey(row, &partition_key));
-      break;
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kPgsqlHash:
+        // TODO(neil) Discussion is needed. PGSQL hash should be done appropriately.
+        // For now, let's not doing anything. Just borrow code from multi column hashing style.
+        FALLTHROUGH_INTENDED;
+      case YBHashSchema::kMultiColumnHash:
+        RETURN_NOT_OK(EncodeColumns(row, &partition_key));
+        break;
+      case YBHashSchema::kRedisHash:
+        RETURN_NOT_OK(EncodeRedisKey(row, &partition_key));
+        break;
+    }
   }
 
   // If all of the hash buckets match, then the row is contained in the
@@ -590,30 +657,32 @@ string PartitionSchema::PartitionDebugString(const Partition& partition,
                                              const Schema& schema) const {
   string s;
 
-  switch(hash_schema_) {
-    case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;
-    case YBHashSchema::kMultiColumnHash: {
-      const string& pstart = partition.partition_key_start();
-      uint16_t hash_start = !pstart.empty() ? DecodeMultiColumnHashValue(pstart) : 0;
-      const string& pend = partition.partition_key_end();
-      if (!pend.empty()) {
-        uint16 hash_end = DecodeMultiColumnHashValue(pend);
-        if (pstart.empty()) {
-          s.append(Substitute("hash_split: [<start>, $1)", hash_start, hash_end));
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;
+      case YBHashSchema::kMultiColumnHash: {
+        const string& pstart = partition.partition_key_start();
+        uint16_t hash_start = !pstart.empty() ? DecodeMultiColumnHashValue(pstart) : 0;
+        const string& pend = partition.partition_key_end();
+        if (!pend.empty()) {
+          uint16 hash_end = DecodeMultiColumnHashValue(pend);
+          if (pstart.empty()) {
+            s.append(Substitute("hash_split: [<start>, $1)", hash_start, hash_end));
+          } else {
+            s.append(Substitute("hash_split: [$0, $1)", hash_start, hash_end));
+          }
         } else {
-          s.append(Substitute("hash_split: [$0, $1)", hash_start, hash_end));
+          if (pstart.empty()) {
+            s.append(Substitute("hash_split: [<start>, <end>)"));
+          } else {
+            s.append(Substitute("hash_split: [$0, <end>)", hash_start));
+          }
         }
-      } else {
-        if (pstart.empty()) {
-          s.append(Substitute("hash_split: [<start>, <end>)"));
-        } else {
-          s.append(Substitute("hash_split: [$0, <end>)", hash_start));
-        }
+        return s;
       }
-      return s;
+      case YBHashSchema::kPgsqlHash:
+        return "Pgsql Hash";
     }
-    case YBHashSchema::kKuduHashSchema:
-      break;
   }
 
   if (!partition.hash_buckets().empty()) {
@@ -665,7 +734,7 @@ string PartitionSchema::PartitionDebugString(const Partition& partition,
 }
 
 void PartitionSchema::AppendRangeDebugStringComponentsOrString(const YBPartialRow& row,
-                                                               const StringPiece default_string,
+                                                               const GStringPiece default_string,
                                                                vector<string>* components) const {
   ConstContiguousRow const_row(row.schema(), row.row_data_);
 
@@ -765,16 +834,18 @@ string PartitionSchema::PartitionKeyDebugString(const string& key, const Schema&
 
   vector<string> components;
 
-  switch (hash_schema_) {
-    case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;
-    case YBHashSchema::kMultiColumnHash:
-      if (key.empty()) {
-        return "hash_code: NaN";
-      } else {
-        return Substitute("hash_code: $0", DecodeMultiColumnHashValue(key));
-      }
-    case YBHashSchema::kKuduHashSchema:
-      break;
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kRedisHash: FALLTHROUGH_INTENDED;
+      case YBHashSchema::kMultiColumnHash:
+        if (key.empty()) {
+          return "hash_code: NaN";
+        } else {
+          return Substitute("hash_code: $0", DecodeMultiColumnHashValue(key));
+        }
+      case YBHashSchema::kPgsqlHash:
+        return "Pgsql Hash";
+    }
   }
 
   if (!hash_bucket_schemas_.empty()) {
@@ -820,20 +891,22 @@ string ColumnIdsToColumnNames(const Schema& schema,
 string PartitionSchema::DebugString(const Schema& schema) const {
   vector<string> component_types;
 
-  switch (hash_schema_) {
-    case YBHashSchema::kRedisHash:
-      return "Redis Hash Partition";
-    case YBHashSchema::kMultiColumnHash: {
-      string component = "Multi Column Hash Partition. Partition columns: ";
-      const std::vector<ColumnSchema>& cols = schema.columns();
-      for (int idx = 0; idx < schema.num_hash_key_columns(); idx++) {
-        component.append(Substitute("$0($1)  ", cols[idx].name(), cols[idx].type_info()->name()));
+  if (hash_schema_) {
+    switch (*hash_schema_) {
+      case YBHashSchema::kRedisHash:
+        return "Redis Hash Partition";
+      case YBHashSchema::kMultiColumnHash: {
+        string component = "Multi Column Hash Partition. Partition columns: ";
+        const std::vector<ColumnSchema>& cols = schema.columns();
+        for (int idx = 0; idx < schema.num_hash_key_columns(); idx++) {
+          component.append(Substitute("$0($1)  ", cols[idx].name(), cols[idx].type_info()->name()));
+        }
+        component_types.push_back(component);
+        break;
       }
-      component_types.push_back(component);
-      break;
+      case YBHashSchema::kPgsqlHash:
+        return "Pgsql Hash Partition";
     }
-    case YBHashSchema::kKuduHashSchema:
-      break;
   }
 
   if (!hash_bucket_schemas_.empty()) {
@@ -863,7 +936,8 @@ bool PartitionSchema::Equals(const PartitionSchema& other) const {
   if (this == &other) return true;
 
   // Compare if both partitions schema are using a hash based scheme.
-  if (hash_schema_ != other.hash_schema_) {
+  if ((hash_schema_ != other.hash_schema_) ||
+      (hash_schema_ && other.hash_schema_ && *hash_schema_ != *other.hash_schema_)) {
     return false;
   }
 
@@ -878,28 +952,6 @@ bool PartitionSchema::Equals(const PartitionSchema& other) const {
         != other.hash_bucket_schemas_[i].num_buckets) return false;
     if (hash_bucket_schemas_[i].column_ids
         != other.hash_bucket_schemas_[i].column_ids) return false;
-  }
-
-  return true;
-}
-
-bool PartitionSchema::IsSimplePKRangePartitioning(const Schema& schema) const {
-  // If we are using hash based splitting, then we consider this case also as a simple range based
-  // partitioning scheme to leverage most of the tablet location logic.
-  switch (hash_schema_) {
-    case YBHashSchema::kRedisHash:
-      return true;
-    case YBHashSchema::kMultiColumnHash:
-      return true;
-    case YBHashSchema::kKuduHashSchema:
-      break;
-  }
-
-  if (!hash_bucket_schemas_.empty()) return false;
-  if (range_schema_.column_ids.size() != schema.num_key_columns()) return false;
-
-  for (int i = 0; i < schema.num_key_columns(); i++) {
-    if (range_schema_.column_ids[i] != schema.column_id(i)) return false;
   }
 
   return true;
@@ -1024,7 +1076,7 @@ Status PartitionSchema::BucketForRow(const ConstContiguousRow& row,
 void PartitionSchema::Clear() {
   hash_bucket_schemas_.clear();
   range_schema_.column_ids.clear();
-  hash_schema_ = YBHashSchema::kKuduHashSchema;
+  hash_schema_ = boost::none;
 }
 
 Status PartitionSchema::Validate(const Schema& schema) const {

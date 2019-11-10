@@ -61,6 +61,10 @@ class InetAddress {
   // object. If size_hint is specified, it indicates the number of bytes to decode from the slice.
   CHECKED_STATUS FromSlice(const Slice& slice, size_t size_hint = 0);
 
+  const boost::asio::ip::address& address() const {
+    return boost_addr_;
+  }
+
   bool isV4() const {
     CHECK(!boost_addr_.is_unspecified());
     return boost_addr_.is_v4();
@@ -80,7 +84,11 @@ class InetAddress {
   }
 
   bool operator<(const InetAddress& other) const {
-    return (boost_addr_ < other.boost_addr_);
+    string this_bytes, other_bytes;
+    Status s = ToBytes(&this_bytes);
+    Status t = other.ToBytes(&other_bytes);
+    DCHECK(s.ok() && t.ok());
+    return this_bytes < other_bytes;
   }
 
   bool operator>(const InetAddress& other) const {

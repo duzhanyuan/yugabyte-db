@@ -30,6 +30,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+syntax = "proto2";
 
 package yb.consensus;
 
@@ -39,8 +40,6 @@ import "yb/common/common.proto";
 import "yb/common/wire_protocol.proto";
 import "yb/consensus/metadata.proto";
 import "yb/util/opid.proto";
-import "yb/tablet/metadata.proto";
-import "yb/tablet/tablet.proto";
 import "yb/tserver/backup.proto";
 import "yb/tserver/tserver_admin.proto";
 import "yb/tserver/tserver.proto";
@@ -107,10 +106,11 @@ enum OperationType {
   UNKNOWN_OP = 0;
   NO_OP = 1;
   WRITE_OP = 3;
-  ALTER_SCHEMA_OP = 4;
+  CHANGE_METADATA_OP = 4;
   CHANGE_CONFIG_OP = 5;
   UPDATE_TRANSACTION_OP = 6;
   SNAPSHOT_OP = 7;
+  TRUNCATE_OP = 8;
 }
 
 // The transaction driver type: indicates whether a transaction is
@@ -158,7 +158,8 @@ message ChangeConfigRequestPB {
 
   // The peer to add or remove.
   // When 'type' == ADD_SERVER, both the permanent_uuid and last_known_addr
-  // fields must be set. Otherwise, only the permanent_uuid field is required.
+  // fields must be set. For REMOVE_SERVER, either the permanent_uuid field or
+  // last_known_addr should be set - 'use_host' is for using the latter.
   optional RaftPeerPB server = 3;
 
   // The OpId index of the committed config to replace.
@@ -167,6 +168,11 @@ message ChangeConfigRequestPB {
   // parameter is specified and the committed config does not have a matching
   // opid_index. See also the definition of RaftConfigPB.
   optional int64 cas_config_opid_index = 5;
+
+  // For REMOVE case, when this is set, we assume that the peer is dead and will not
+  // affect the quorum anymore. So we skip checking/using its server uuid and remove
+  // it based on the ip/port info from 'server'.
+  optional bool use_host = 6 [default = false];
 }
 
 // The configuration change response. If any immediate error occurred
@@ -193,12 +199,12 @@ message ReplicateMsg {
   // A counter that is forever increasing in a tablet (like hybrid time). Used for list indexing.
   optional int64 monotonic_counter = 9;
 
-  // optional ExternalConsistencyMode external_consistency_mode = 3 [default = NO_CONSISTENCY];
   required OperationType op_type = 4;
   optional tserver.WriteRequestPB write_request = 5;
-  optional tserver.AlterSchemaRequestPB alter_schema_request = 6;
+  optional tserver.ChangeMetadataRequestPB change_metadata_request = 6;
   optional tserver.TransactionStatePB transaction_state = 10;
-  optional tserver.CreateTabletSnapshotRequestPB snapshot_request = 11;
+  optional tserver.TabletSnapshotOpRequestPB snapshot_request = 11;
+  optional tserver.TruncateRequestPB truncate_request = 12;
   optional ChangeConfigRecordPB change_config_record = 7;
 
   // The Raft operation ID known to the leader to be committed at the time this message was sent.
@@ -206,18 +212,6 @@ message ReplicateMsg {
   optional OpIdPB committed_op_id = 8;
 
   optional NoOpRequestPB noop_request = 999;
-}
-
-// A commit message for a previous operation.
-// This is a commit in the consensus sense and may abort/commit any operation
-// that required a consensus round.
-// This is not being used for RocksDB-backed tables.
-message CommitMsg {
-  required OperationType op_type = 1;
-  // the id of the message this commit pertains to
-  optional OpIdPB commited_op_id = 2;
-  // The operations that were applied and/or failed in this transaction.
-  optional tablet.TxResultPB result = 3;
 }
 
 // ===========================================================================
@@ -302,6 +296,9 @@ message VoteRequestPB {
   // for example to force a faster leader hand-off rather than waiting for
   // the election timer to expire.
   optional bool ignore_live_leader = 5 [ default = false ];
+
+  // true if it is pre-election request and state of voter should not be changed.
+  optional bool preelection = 7;
 }
 
 // A response from a replica to a leader election request.
@@ -320,10 +317,19 @@ message VoteResponsePB {
   // before it can start serving read and write requests.
   optional int32 remaining_leader_lease_duration_ms = 4;
 
+  // UUID of node that has lease.
+  optional bytes leader_lease_uuid = 7;
+
   // An upper bound on the deadline of the old hybrid time leader's lease that the new leader has
   // to wait out before it can start serving read and write requests.
   // Contains only physical part of hybrid time.
   optional fixed64 leader_ht_lease_expiration = 5;
+
+  // UUID of node that has ht lease.
+  optional bytes leader_ht_lease_uuid = 8;
+
+  // true if it is response to pre-election request.
+  optional bool preelection = 6;
 
   // TODO: Migrate ConsensusService to the AppStatusPB RPC style and merge these errors.
   // Error message from the consensus implementation.
@@ -382,6 +388,12 @@ message ConsensusRequestPB {
   // Leader lease expiration, physical part of hybrid time. A new leader cannot add new
   // entries to RAFT log until hybrid time passes this expiration.
   optional fixed64 ht_lease_expiration = 9;
+
+  // Safe time measured on the leader at the time this request was generated.
+  optional fixed64 propagated_safe_time = 10;
+
+  // Hybrid time on the leader when this request was generated.
+  optional fixed64 propagated_hybrid_time = 11;
 }
 
 message ConsensusResponsePB {
@@ -399,6 +411,9 @@ message ConsensusResponsePB {
   // A generic error message (such as tablet not found), per operation
   // error messages are sent along with the consensus status.
   optional tserver.TabletServerErrorPB error = 999;
+
+  // Number of SST files in this follower regular db.
+  optional int64 num_sst_files = 5;
 }
 
 // A message reflecting the status of an in-flight transaction.
@@ -419,7 +434,8 @@ message GetNodeInstanceRequestPB {
 }
 
 message GetNodeInstanceResponsePB {
-  required NodeInstancePB node_instance = 1;
+  optional NodeInstancePB node_instance = 1;
+  optional ServerRegistrationPB registration = 2;
 }
 
 // Message that makes the local peer run leader election to be elected leader.
@@ -440,6 +456,8 @@ message RunLeaderElectionRequestPB {
   // If we lost election, we would notify originator about this fact.
   // So it would reset its withold timeout and try to become a leader again.
   optional bytes originator_uuid = 4;
+
+  optional bool suppress_vote_request = 5;
 }
 
 message RunLeaderElectionResponsePB {
@@ -473,6 +491,9 @@ message LeaderStepDownRequestPB {
 
   // UUID of the server that should run the election to become the new leader.
   optional bytes new_leader_uuid = 3;
+
+  // Used in tests to ignore check for new leader conditions.
+  optional bool force_step_down = 4;
 }
 
 message LeaderStepDownResponsePB {
@@ -545,7 +566,9 @@ message StartRemoteBootstrapRequestPB {
   // Identification for the host we are bootstrapping from.
   // TODO: Consider renaming these to bootstrap_source_*.
   required bytes bootstrap_peer_uuid = 2;
-  required HostPortPB bootstrap_peer_addr = 3;
+  repeated HostPortPB source_private_addr = 3;
+  repeated HostPortPB source_broadcast_addr = 6;
+  optional CloudInfoPB source_cloud_info = 7;
 
   // The caller's term. In the case that the target of this request has a
   // TOMBSTONED replica with a term higher than this one, the request will fail.

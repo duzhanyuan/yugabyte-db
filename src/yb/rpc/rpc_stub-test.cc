@@ -42,8 +42,11 @@
 #include "yb/rpc/rtest.proxy.h"
 #include "yb/rpc/rtest.service.h"
 #include "yb/rpc/rpc-test-base.h"
+#include "yb/rpc/yb_rpc.h"
+
 #include "yb/util/countdown_latch.h"
 #include "yb/util/metrics.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/test_util.h"
 #include "yb/util/tostring.h"
@@ -53,6 +56,7 @@
 DEFINE_bool(is_panic_test_child, false, "Used by TestRpcPanic");
 DECLARE_bool(socket_inject_short_recvs);
 DECLARE_int32(rpc_slow_query_threshold_ms);
+DECLARE_int32(TEST_delay_connect_ms);
 
 using namespace std::chrono_literals;
 
@@ -90,12 +94,14 @@ class RpcStubTest : public RpcTestBase {
  public:
   void SetUp() override {
     RpcTestBase::SetUp();
-    StartTestServerWithGeneratedCode(&server_endpoint_);
-    client_messenger_ = CreateMessenger("Client");
+    StartTestServerWithGeneratedCode(&server_hostport_);
+    client_messenger_ = CreateAutoShutdownMessengerHolder("Client");
+    proxy_cache_ = std::make_unique<ProxyCache>(client_messenger_.get());
   }
+
  protected:
   void SendSimpleCall() {
-    CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+    CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
     RpcController controller;
     AddRequestPB req;
@@ -106,31 +112,102 @@ class RpcStubTest : public RpcTestBase {
     ASSERT_EQ(30, resp.result());
   }
 
-  TestServer StartTestServer(const std::string& name, const IpAddress& address) {
-    std::unique_ptr<ServiceIf> service(CreateCalculatorService(metric_entity(), name));
-    TestServerOptions options;
-    options.endpoint = Endpoint(address, 0);
-    return TestServer(std::move(service), metric_entity(), options);
-  }
+  template <class T>
+  struct ProxyWithMessenger {
+    AutoShutdownMessengerHolder messenger;
+    std::unique_ptr<T> proxy;
+  };
 
-  std::unique_ptr<CalculatorServiceProxy> CreateCalculatorProxy(const Endpoint& remote) {
-    auto messenger = CreateMessenger("Client");
+  ProxyWithMessenger<CalculatorServiceProxy> CreateCalculatorProxyHolder(const Endpoint& remote) {
+    auto messenger = CreateAutoShutdownMessengerHolder("Client");
     IpAddress local_address = remote.address().is_v6()
         ? IpAddress(boost::asio::ip::address_v6::loopback())
         : IpAddress(boost::asio::ip::address_v4::loopback());
     // To have outbound calls with appropriate address
-    EXPECT_OK(messenger->ListenAddress(Endpoint(local_address, 0)));
+    EXPECT_OK(messenger->ListenAddress(
+        CreateConnectionContextFactory<YBInboundConnectionContext>(),
+        Endpoint(local_address, 0)));
     EXPECT_OK(messenger->StartAcceptor());
-    std::unique_ptr<CalculatorServiceProxy> result(new CalculatorServiceProxy(messenger, remote));
-    return result;
+    EXPECT_FALSE(messenger->io_service().stopped());
+    ProxyCache proxy_cache(messenger.get());
+    return { move(messenger),
+        std::make_unique<CalculatorServiceProxy>(&proxy_cache, HostPort(remote)) };
   }
 
-  Endpoint server_endpoint_;
-  shared_ptr<Messenger> client_messenger_;
+  HostPort server_hostport_;
+  AutoShutdownMessengerHolder client_messenger_;
+  std::unique_ptr<ProxyCache> proxy_cache_;
 };
 
 TEST_F(RpcStubTest, TestSimpleCall) {
   SendSimpleCall();
+}
+
+TEST_F(RpcStubTest, ConnectTimeout) {
+  FLAGS_TEST_delay_connect_ms = 5000;
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
+  const MonoDelta kWaitTime = 1s;
+  const MonoDelta kAllowedError = 100ms;
+
+  RpcController controller;
+  controller.set_timeout(kWaitTime);
+  AddRequestPB req;
+  req.set_x(10);
+  req.set_y(20);
+  AddResponsePB resp;
+  auto start = MonoTime::Now();
+  auto status = p.Add(req, &resp, &controller);
+  auto passed = MonoTime::Now() - start;
+  ASSERT_TRUE(status.IsTimedOut()) << "Status: " << status;
+  ASSERT_GE(passed, kWaitTime - kAllowedError);
+  ASSERT_LE(passed, kWaitTime + kAllowedError);
+
+  SendSimpleCall();
+}
+
+TEST_F(RpcStubTest, RandomTimeout) {
+  const size_t kTotalCalls = 1000;
+  const MonoDelta kMaxTimeout = 2s;
+
+  FLAGS_TEST_delay_connect_ms = kMaxTimeout.ToMilliseconds() / 2;
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
+
+  struct CallData {
+    RpcController controller;
+    AddRequestPB req;
+    AddResponsePB resp;
+  };
+  std::vector<CallData> calls(kTotalCalls);
+  CountDownLatch latch(kTotalCalls);
+
+  for (auto& call : calls) {
+    auto timeout = MonoDelta::FromMilliseconds(
+        RandomUniformInt<int>(0, kMaxTimeout.ToMilliseconds()));
+    call.controller.set_timeout(timeout);
+    call.req.set_x(RandomUniformInt(-1000, 1000));
+    call.req.set_y(RandomUniformInt(-1000, 1000));
+    p.AddAsync(call.req, &call.resp, &call.controller, [&latch] {
+      latch.CountDown();
+    });
+  }
+
+  ASSERT_TRUE(latch.WaitFor(kMaxTimeout));
+
+  size_t timed_out = 0;
+  for (auto& call : calls) {
+    if (call.controller.status().IsTimedOut()) {
+      ++timed_out;
+    } else {
+      ASSERT_OK(call.controller.status());
+      ASSERT_EQ(call.req.x() + call.req.y(), call.resp.result());
+    }
+  }
+
+  LOG(INFO) << "Timed out calls: " << timed_out;
+
+  // About half of calls should expire, so we do a bit more relaxed checks.
+  ASSERT_GT(timed_out, kTotalCalls / 4);
+  ASSERT_LT(timed_out, kTotalCalls * 3 / 4);
 }
 
 // Regression test for a bug in which we would not properly parse a call
@@ -140,7 +217,7 @@ TEST_F(RpcStubTest, TestShortRecvs) {
   google::FlagSaver saver;
   FLAGS_socket_inject_short_recvs = true;
 
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   for (int i = 0; i < 100; i++) {
     ASSERT_NO_FATALS(SendSimpleCall());
@@ -175,26 +252,30 @@ TEST_F(RpcStubTest, TestIncoherence) {
   static const std::string kServer2Name = "Server2";
 
   auto server1 = StartTestServer(kServer1Name, IpAddress::from_string("127.0.0.11"));
-  auto proxy1ptr = CreateCalculatorProxy(server1.bound_endpoint());
-  auto& proxy1 = *proxy1ptr;
+  auto proxy1holder = CreateCalculatorProxyHolder(server1.bound_endpoint());
+  auto& proxy1 = *proxy1holder.proxy;
   auto server2 = StartTestServer(kServer2Name, IpAddress::from_string("127.0.0.12"));
-  auto proxy2ptr = CreateCalculatorProxy(server2.bound_endpoint());
-  auto& proxy2 = *proxy2ptr;
+  auto proxy2holder = CreateCalculatorProxyHolder(server2.bound_endpoint());
+  auto& proxy2 = *proxy2holder.proxy;
 
-  CheckForward(&proxy1, server2.bound_endpoint(), kServer2Name);
-  CheckForward(&proxy2, server1.bound_endpoint(), kServer1Name);
+  ASSERT_NO_FATALS(CheckForward(&proxy1, server2.bound_endpoint(), kServer2Name));
+  ASSERT_NO_FATALS(CheckForward(&proxy2, server1.bound_endpoint(), kServer1Name));
 
-  server2.messenger().BreakConnectivityWith(server1.bound_endpoint().address());
+  server2.messenger()->BreakConnectivityWith(server1.bound_endpoint().address());
 
   LOG(INFO) << "Checking connectivity";
-  CheckForward(&proxy1, server2.bound_endpoint(), std::string()); // No connection between servers.
-  CheckForward(&proxy1, Endpoint(), kServer1Name); // We could connect to server1.
-  CheckForward(&proxy2, server1.bound_endpoint(), std::string()); // No connection between servers.
-  CheckForward(&proxy2, Endpoint(), kServer2Name); // We could connect to server2.
+  // No connection between servers.
+  ASSERT_NO_FATALS(CheckForward(&proxy1, server2.bound_endpoint(), std::string()));
+  // We could connect to server1.
+  ASSERT_NO_FATALS(CheckForward(&proxy1, Endpoint(), kServer1Name));
+  // No connection between servers.
+  ASSERT_NO_FATALS(CheckForward(&proxy2, server1.bound_endpoint(), std::string()));
+  // We could connect to server2.
+  ASSERT_NO_FATALS(CheckForward(&proxy2, Endpoint(), kServer2Name));
 
-  server2.messenger().RestoreConnectivityWith(server1.bound_endpoint().address());
-  CheckForward(&proxy1, server2.bound_endpoint(), kServer2Name);
-  CheckForward(&proxy2, server1.bound_endpoint(), kServer1Name);
+  server2.messenger()->RestoreConnectivityWith(server1.bound_endpoint().address());
+  ASSERT_NO_FATALS(CheckForward(&proxy1, server2.bound_endpoint(), kServer2Name));
+  ASSERT_NO_FATALS(CheckForward(&proxy2, server1.bound_endpoint(), kServer1Name));
 }
 
 // Test calls which are rather large.
@@ -203,23 +284,22 @@ TEST_F(RpcStubTest, TestIncoherence) {
 // IO threads can deal with read/write calls that don't succeed
 // in sending the entire data in one go.
 TEST_F(RpcStubTest, TestBigCallData) {
-  const int kNumSentAtOnce = 20;
-  const size_t kMessageSize = 32 * 1024 * 1024;
-  string data;
-  data.resize(kMessageSize);
+  constexpr int kNumSentAtOnce = 1;
+  constexpr size_t kMessageSize = NonTsanVsTsan(32_MB, 4_MB);
 
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   EchoRequestPB req;
-  req.set_data(data);
+  req.set_data(RandomHumanReadableString(kMessageSize));
 
-  vector<EchoResponsePB> resps(kNumSentAtOnce);
-  vector<RpcController> controllers(kNumSentAtOnce);
+  std::vector<EchoResponsePB> resps(kNumSentAtOnce);
+  std::vector<RpcController> controllers(kNumSentAtOnce);
 
   CountDownLatch latch(kNumSentAtOnce);
   for (int i = 0; i < kNumSentAtOnce; i++) {
     auto resp = &resps[i];
     auto controller = &controllers[i];
+    controller->set_timeout(60s);
 
     p.EchoAsync(req, resp, controller, [&latch]() { latch.CountDown(); });
   }
@@ -229,10 +309,14 @@ TEST_F(RpcStubTest, TestBigCallData) {
   for (RpcController &c : controllers) {
     EXPECT_OK(c.status());
   }
+
+  for (auto& resp : resps) {
+    ASSERT_EQ(resp.data(), req.data());
+  }
 }
 
 TEST_F(RpcStubTest, TestRespondDeferred) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   RpcController controller;
   SleepRequestPB req;
@@ -244,7 +328,7 @@ TEST_F(RpcStubTest, TestRespondDeferred) {
 
 // Test that the default user credentials are propagated to the server.
 TEST_F(RpcStubTest, TestDefaultCredentialsPropagated) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   string expected;
   ASSERT_OK(GetLoggedInUser(&expected));
@@ -257,7 +341,7 @@ TEST_F(RpcStubTest, TestDefaultCredentialsPropagated) {
 
 // Test that the user can specify other credentials.
 TEST_F(RpcStubTest, TestCustomCredentialsPropagated) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   RpcController controller;
   WhoAmIRequestPB req;
@@ -267,7 +351,7 @@ TEST_F(RpcStubTest, TestCustomCredentialsPropagated) {
 
 // Test that the user's remote address is accessible to the server.
 TEST_F(RpcStubTest, TestRemoteAddress) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   RpcController controller;
   WhoAmIRequestPB req;
@@ -283,9 +367,7 @@ TEST_F(RpcStubTest, TestRemoteAddress) {
 // Test sending a PB parameter with a missing field, where the client
 // thinks it has sent a full PB. (eg due to version mismatch)
 TEST_F(RpcStubTest, TestCallWithInvalidParam) {
-  Proxy p(client_messenger_,
-          server_endpoint_,
-          yb::rpc_test::CalculatorServiceIf::static_service_name());
+  Proxy p(client_messenger_.get(), server_hostport_);
 
   AddRequestPartialPB req;
   unsigned int seed = time(nullptr);
@@ -293,7 +375,7 @@ TEST_F(RpcStubTest, TestCallWithInvalidParam) {
   // AddRequestPartialPB is missing the 'y' field.
   AddResponsePB resp;
   RpcController controller;
-  Status s = p.SyncRequest("Add", req, &resp, &controller);
+  Status s = p.SyncRequest(CalculatorServiceMethods::AddMethod(), req, &resp, &controller);
   ASSERT_TRUE(s.IsRemoteError()) << "Bad status: " << s.ToString();
   // Remote error messages always contain file name and line number.
   ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument (");
@@ -311,7 +393,7 @@ static void DoIncrement(Atomic32* count) {
 // This also ensures that the async callback is only called once
 // (regression test for a previously-encountered bug).
 TEST_F(RpcStubTest, TestCallWithMissingPBFieldClientSide) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   RpcController controller;
   AddRequestPB req;
@@ -331,17 +413,16 @@ TEST_F(RpcStubTest, TestCallWithMissingPBFieldClientSide) {
 
 // Test sending a call which isn't implemented by the server.
 TEST_F(RpcStubTest, TestCallMissingMethod) {
-  Proxy p(client_messenger_,
-          server_endpoint_,
-          yb::rpc_test::CalculatorServiceIf::static_service_name());
+  Proxy proxy(client_messenger_.get(), server_hostport_);
 
-  Status s = DoTestSyncCall(p, "DoesNotExist");
+  RemoteMethod method(yb::rpc_test::CalculatorServiceIf::static_service_name(), "DoesNotExist");
+  Status s = DoTestSyncCall(&proxy, &method);
   ASSERT_TRUE(s.IsRemoteError()) << "Bad status: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "with an invalid method name: DoesNotExist");
 }
 
 TEST_F(RpcStubTest, TestApplicationError) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   RpcController controller;
   SleepRequestPB req;
@@ -377,15 +458,12 @@ TEST_F(RpcStubTest, TestRpcPanic) {
     PCHECK(in);
 
     // Search for string "Test method panicking!" somewhere in stderr
+    std::string error_message;
     char buf[1024];
-    bool found_string = false;
     while (fgets(buf, sizeof(buf), in)) {
-      if (strstr(buf, "Test method panicking!")) {
-        found_string = true;
-        break;
-      }
+      error_message += buf;
     }
-    CHECK(found_string);
+    ASSERT_STR_CONTAINS(error_message, "Test method panicking!");
 
     // Check return status
     int wait_status = 0;
@@ -405,7 +483,7 @@ TEST_F(RpcStubTest, TestRpcPanic) {
     CHECK_OK(env_->DeleteRecursively(GetTestDataDirectory()));
 
     // Make an RPC which causes the server to abort.
-    CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+    CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
     RpcController controller;
     PanicRequestPB req;
     PanicResponsePB resp;
@@ -420,7 +498,7 @@ struct AsyncSleep {
 };
 
 TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
   vector<AsyncSleep*> sleeps;
   ElementDeleter d(&sleeps);
 
@@ -429,8 +507,8 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
   CountDownLatch latch(count);
   for (size_t i = 0; i < count; i++) {
     gscoped_ptr<AsyncSleep> sleep(new AsyncSleep);
-    sleep->rpc.set_timeout(MonoDelta::FromSeconds(1));
-    sleep->req.set_sleep_micros(100*1000); // 100ms
+    sleep->rpc.set_timeout(10s);
+    sleep->req.set_sleep_micros(500 * 1000); // 100ms
     p.SleepAsync(sleep->req, &sleep->resp, &sleep->rpc, [&latch]() { latch.CountDown(); });
     sleeps.push_back(sleep.release());
   }
@@ -441,7 +519,7 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
   SleepRequestPB req;
   SleepResponsePB resp;
   req.set_sleep_micros(1000);
-  rpc.set_timeout(MonoDelta::FromMilliseconds(1));
+  rpc.set_timeout(250ms);
   Status s = p.Sleep(req, &resp, &rpc);
   ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
 
@@ -454,9 +532,9 @@ TEST_F(RpcStubTest, TestDontHandleTimedOutCalls) {
 
 TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   CountDownLatch latch(1);
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
   AsyncSleep sleep;
-  sleep.req.set_sleep_micros(100 * 1000); // 100ms
+  sleep.req.set_sleep_micros(1000 * 1000); // 100ms
   p.SleepAsync(sleep.req, &sleep.resp, &sleep.rpc, [&latch]() { latch.CountDown(); });
 
   // Check the running RPC status on the client messenger.
@@ -464,6 +542,7 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   DumpRunningRpcsResponsePB dump_resp;
   dump_req.set_include_traces(true);
 
+  std::this_thread::sleep_for(10ms);
   ASSERT_OK(client_messenger_->DumpRunningRpcs(dump_req, &dump_resp));
   LOG(INFO) << "client messenger: " << dump_resp.DebugString();
   ASSERT_EQ(1, dump_resp.outbound_connections_size());
@@ -477,7 +556,7 @@ TEST_F(RpcStubTest, TestDumpCallsInFlight) {
   // asynchronously off of the main thread (ie the server may not be handling it yet)
   for (int i = 0; i < 100; i++) {
     dump_resp.Clear();
-    ASSERT_OK(server_messenger().DumpRunningRpcs(dump_req, &dump_resp));
+    ASSERT_OK(server_messenger()->DumpRunningRpcs(dump_req, &dump_resp));
     if (dump_resp.inbound_connections_size() > 0 &&
         dump_resp.inbound_connections(0).calls_in_flight_size() > 0) {
       break;
@@ -512,7 +591,7 @@ void MyTestCallback(CountDownLatch* latch, scoped_refptr<RefCountedTest> my_refp
 // is held. This is important when the callback holds a refcounted ptr,
 // since we expect to be able to release that pointer when the call is done.
 TEST_F(RpcStubTest, TestCallbackClearedAfterRunning) {
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   CountDownLatch latch(1);
   scoped_refptr<RefCountedTest> my_refptr(new RefCountedTest);
@@ -553,7 +632,7 @@ class PingTestHelper {
   void Launch(size_t id) {
     PingRequestPB req;
     auto& call = calls_[id];
-    call.start_time = MonoTime::Now(MonoTime::FINE);
+    call.start_time = MonoTime::Now();
     req.set_id(id);
     call.handle_time = MonoTime::Max();
     call.reply_time = MonoTime::Max();
@@ -573,27 +652,21 @@ class PingTestHelper {
   void Done(size_t idx) {
     auto& call = calls_[idx];
     call.handle_time = MonoTime::FromUint64(call.response.time());
-    call.reply_time = MonoTime::Now(MonoTime::FINE);
+    call.reply_time = MonoTime::Now();
     call.controller.Reset();
     LaunchNext();
-    if (++done_calls_ == calls_.size()) {
+    auto calls_size = calls_.size();
+    if (++done_calls_ == calls_size) {
       LOG(INFO) << "Calls done";
       std::unique_lock<std::mutex> lock(mutex_);
-      cond_.notify_one();
       finished_ = true;
+      cond_.notify_one();
     }
   }
 
   void Wait() {
-    {
-      std::unique_lock<std::mutex> lock(mutex_);
-      while (done_calls_ < calls_.size()) {
-        cond_.wait(lock);
-      }
-    }
-    while (!finished_) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    cond_.wait(lock, [this] { return finished_; });
   }
 
   const std::vector<PingCall>& calls() const {
@@ -607,7 +680,7 @@ class PingTestHelper {
   std::vector<PingCall> calls_;
   std::mutex mutex_;
   std::condition_variable cond_;
-  std::atomic<bool> finished_ = {false};
+  bool finished_ = false;
 };
 
 DEFINE_uint64(test_rpc_concurrency, 20, "Number of concurrent RPC requests");
@@ -618,14 +691,16 @@ TEST_F(RpcStubTest, TestRpcPerformance) {
 
   MessengerOptions messenger_options = kDefaultClientMessengerOptions;
   messenger_options.n_reactors = 4;
-  client_messenger_ = CreateMessenger("Client", messenger_options);
-  CalculatorServiceProxy p(client_messenger_, server_endpoint_);
+  proxy_cache_.reset();
+  client_messenger_ = CreateAutoShutdownMessengerHolder("Client", messenger_options);
+  proxy_cache_ = std::make_unique<ProxyCache>(client_messenger_.get());
+  CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   const size_t kWarmupCalls = 50;
   const size_t concurrent = FLAGS_test_rpc_concurrency;
   const size_t total_calls = kWarmupCalls + FLAGS_test_rpc_count;
 
-  auto start = MonoTime::Now(MonoTime::FINE);
+  auto start = MonoTime::Now();
   PingTestHelper helper(&p, total_calls);
   {
     for (uint64_t id = 0; id != concurrent; ++id) {
@@ -634,7 +709,7 @@ TEST_F(RpcStubTest, TestRpcPerformance) {
     LOG(INFO) << "Warmup done, Calls left: " << total_calls - kWarmupCalls;
     helper.Wait();
   }
-  auto finish = MonoTime::Now(MonoTime::FINE);
+  auto finish = MonoTime::Now();
 
 #ifndef NDEBUG
   const int kTimeMultiplier = 5;
@@ -700,17 +775,47 @@ TEST_F(RpcStubTest, IPv6) {
   ASSERT_FALSE(server_address.is_unspecified());
   auto server = StartTestServer("Server", server_address);
   ASSERT_TRUE(server.bound_endpoint().address().is_v6());
-  auto proxyptr = CreateCalculatorProxy(server.bound_endpoint());
-  auto& proxy = *proxyptr;
+  auto proxy_holder = CreateCalculatorProxyHolder(server.bound_endpoint());
+  auto& proxy = *proxy_holder.proxy;
 
   WhoAmIRequestPB req;
   WhoAmIResponsePB resp;
   RpcController controller;
   proxy.WhoAmI(req, &resp, &controller);
+  ASSERT_OK(controller.status());
   LOG(INFO) << "I'm " << resp.address();
   auto parsed = ParseEndpoint(resp.address(), 0);
   ASSERT_TRUE(parsed.ok());
   ASSERT_TRUE(parsed->address().is_v6());
+}
+
+TEST_F(RpcStubTest, ExpireInQueue) {
+  CalculatorServiceProxy proxy(proxy_cache_.get(), server_hostport_);
+
+  struct Entry {
+    EchoRequestPB req;
+    boost::optional<EchoResponsePB> resp;
+    RpcController controller;
+  };
+
+  std::vector<Entry> entries(10000);
+
+  CountDownLatch latch(entries.size());
+
+  for (size_t i = 0; i != entries.size(); ++i) {
+    auto& entry = entries[i];
+    entry.req.set_data(std::string(100_KB, 'X'));
+    entry.resp.emplace();
+    entry.controller.set_timeout(1ms);
+    proxy.EchoAsync(entry.req, entry.resp.get_ptr(), &entry.controller, [&entry, &latch] {
+      auto ptr = entry.resp.get_ptr();
+      entry.resp.reset();
+      memset(static_cast<void*>(ptr), 'X', sizeof(*ptr));
+      latch.CountDown();
+    });
+  }
+
+  latch.Wait();
 }
 
 } // namespace rpc

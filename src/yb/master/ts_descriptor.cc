@@ -44,26 +44,28 @@
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/shared_lock.h"
 
 namespace yb {
 namespace master {
 
-Status TSDescriptor::RegisterNew(const NodeInstancePB& instance,
-                                 const TSRegistrationPB& registration,
-                                 gscoped_ptr<TSDescriptor>* desc) {
-  gscoped_ptr<TSDescriptor> ret(new TSDescriptor(instance.permanent_uuid()));
-  RETURN_NOT_OK(ret->Register(instance, registration));
-  desc->swap(ret);
-  return Status::OK();
+Result<TSDescriptorPtr> TSDescriptor::RegisterNew(
+    const NodeInstancePB& instance,
+    const TSRegistrationPB& registration,
+    CloudInfoPB local_cloud_info,
+    rpc::ProxyCache* proxy_cache) {
+  auto result = std::make_shared<enterprise::TSDescriptor>(
+      instance.permanent_uuid());
+  RETURN_NOT_OK(result->Register(instance, registration, std::move(local_cloud_info), proxy_cache));
+  return std::move(result);
 }
 
 TSDescriptor::TSDescriptor(std::string perm_id)
     : permanent_uuid_(std::move(perm_id)),
-      latest_seqno_(-1),
-      last_heartbeat_(MonoTime::Now(MonoTime::FINE)),
+      last_heartbeat_(MonoTime::Now()),
       has_tablet_report_(false),
       recent_replica_creations_(0),
-      last_replica_creations_decay_(MonoTime::Now(MonoTime::FINE)),
+      last_replica_creations_decay_(MonoTime::Now()),
       num_live_replicas_(0) {
 }
 
@@ -71,33 +73,62 @@ TSDescriptor::~TSDescriptor() {
 }
 
 Status TSDescriptor::Register(const NodeInstancePB& instance,
-                              const TSRegistrationPB& registration) {
-  std::lock_guard<simple_spinlock> l(lock_);
+                              const TSRegistrationPB& registration,
+                              CloudInfoPB local_cloud_info,
+                              rpc::ProxyCache* proxy_cache) {
+  std::lock_guard<decltype(lock_)> l(lock_);
+  return RegisterUnlocked(instance, registration, std::move(local_cloud_info), proxy_cache);
+}
+
+Status TSDescriptor::RegisterUnlocked(
+    const NodeInstancePB& instance,
+    const TSRegistrationPB& registration,
+    CloudInfoPB local_cloud_info,
+    rpc::ProxyCache* proxy_cache) {
   CHECK_EQ(instance.permanent_uuid(), permanent_uuid_);
 
-  if (instance.instance_seqno() < latest_seqno_) {
+  int64_t latest_seqno = ts_information_
+      ? ts_information_->tserver_instance().instance_seqno()
+      : -1;
+  if (instance.instance_seqno() < latest_seqno) {
     return STATUS(AlreadyPresent,
       strings::Substitute("Cannot register with sequence number $0:"
                           " Already have a registration from sequence number $1",
                           instance.instance_seqno(),
-                          latest_seqno_));
-  } else if (instance.instance_seqno() == latest_seqno_) {
+                          latest_seqno));
+  } else if (instance.instance_seqno() == latest_seqno) {
     // It's possible that the TS registered, but our response back to it
     // got lost, so it's trying to register again with the same sequence
     // number. That's fine.
     LOG(INFO) << "Processing retry of TS registration from " << instance.ShortDebugString();
   }
 
-  latest_seqno_ = instance.instance_seqno();
+  latest_seqno = instance.instance_seqno();
   // After re-registering, make the TS re-report its tablets.
   has_tablet_report_ = false;
 
-  registration_.reset(new TSRegistrationPB(registration));
+  ts_information_ = std::make_shared<TSInformationPB>();
+  ts_information_->mutable_registration()->CopyFrom(registration);
+  ts_information_->mutable_tserver_instance()->set_permanent_uuid(permanent_uuid_);
+  ts_information_->mutable_tserver_instance()->set_instance_seqno(latest_seqno);
+
   placement_id_ = generate_placement_id(registration.common().cloud_info());
 
   proxies_.reset();
 
+  placement_uuid_ = "";
+  if (registration.common().has_placement_uuid()) {
+    placement_uuid_ = registration.common().placement_uuid();
+  }
+  local_cloud_info_ = std::move(local_cloud_info);
+  proxy_cache_ = proxy_cache;
+
   return Status::OK();
+}
+
+std::string TSDescriptor::placement_uuid() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return placement_uuid_;
 }
 
 std::string TSDescriptor::generate_placement_id(const CloudInfoPB& ci) {
@@ -106,33 +137,33 @@ std::string TSDescriptor::generate_placement_id(const CloudInfoPB& ci) {
 }
 
 std::string TSDescriptor::placement_id() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  SharedLock<decltype(lock_)> l(lock_);
   return placement_id_;
 }
 
 void TSDescriptor::UpdateHeartbeatTime() {
-  std::lock_guard<simple_spinlock> l(lock_);
-  last_heartbeat_ = MonoTime::Now(MonoTime::FINE);
+  std::lock_guard<decltype(lock_)> l(lock_);
+  last_heartbeat_ = MonoTime::Now();
 }
 
 MonoDelta TSDescriptor::TimeSinceHeartbeat() const {
-  MonoTime now(MonoTime::Now(MonoTime::FINE));
-  std::lock_guard<simple_spinlock> l(lock_);
+  MonoTime now(MonoTime::Now());
+  SharedLock<decltype(lock_)> l(lock_);
   return now.GetDeltaSince(last_heartbeat_);
 }
 
 int64_t TSDescriptor::latest_seqno() const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  return latest_seqno_;
+  SharedLock<decltype(lock_)> l(lock_);
+  return ts_information_->tserver_instance().instance_seqno();
 }
 
 bool TSDescriptor::has_tablet_report() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  SharedLock<decltype(lock_)> l(lock_);
   return has_tablet_report_;
 }
 
 void TSDescriptor::set_has_tablet_report(bool has_report) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<decltype(lock_)> l(lock_);
   has_tablet_report_ = has_report;
 }
 
@@ -142,7 +173,7 @@ void TSDescriptor::DecayRecentReplicaCreationsUnlocked() {
   if (recent_replica_creations_ == 0) return;
 
   const double kHalflifeSecs = 60;
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
+  MonoTime now = MonoTime::Now();
   double secs_since_last_decay = now.GetDeltaSince(last_replica_creations_decay_).ToSeconds();
   recent_replica_creations_ *= pow(0.5, secs_since_last_decay / kHalflifeSecs);
 
@@ -154,31 +185,31 @@ void TSDescriptor::DecayRecentReplicaCreationsUnlocked() {
 }
 
 void TSDescriptor::IncrementRecentReplicaCreations() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<decltype(lock_)> l(lock_);
   DecayRecentReplicaCreationsUnlocked();
   recent_replica_creations_ += 1;
 }
 
 double TSDescriptor::RecentReplicaCreations() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<decltype(lock_)> l(lock_);
   DecayRecentReplicaCreationsUnlocked();
   return recent_replica_creations_;
 }
 
-void TSDescriptor::GetRegistration(TSRegistrationPB* reg) const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  CHECK(registration_) << "No registration";
-  CHECK_NOTNULL(reg)->CopyFrom(*registration_);
+TSRegistrationPB TSDescriptor::GetRegistration() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return ts_information_->registration();
 }
 
-void TSDescriptor::GetTSInformationPB(TSInformationPB* ts_info) const {
-  GetRegistration(ts_info->mutable_registration());
-  GetNodeInstancePB(ts_info->mutable_tserver_instance());
+const std::shared_ptr<TSInformationPB> TSDescriptor::GetTSInformationPB() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  CHECK(ts_information_) << "No stored information";
+  return ts_information_;
 }
 
 bool TSDescriptor::MatchesCloudInfo(const CloudInfoPB& cloud_info) const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  const auto& ci = registration_->common().cloud_info();
+  SharedLock<decltype(lock_)> l(lock_);
+  const auto& ci = ts_information_->registration().common().cloud_info();
 
   return cloud_info.placement_cloud() == ci.placement_cloud() &&
          cloud_info.placement_region() == ci.placement_region() &&
@@ -186,73 +217,82 @@ bool TSDescriptor::MatchesCloudInfo(const CloudInfoPB& cloud_info) const {
 }
 
 bool TSDescriptor::IsRunningOn(const HostPortPB& hp) const {
-  TSRegistrationPB reg;
-  GetRegistration(&reg);
-  for (const auto& rpc_hp : reg.common().rpc_addresses()) {
-    if (hp.host() == rpc_hp.host() && hp.port() == rpc_hp.port()) {
-      return true;
-    }
+  TSRegistrationPB reg = GetRegistration();
+  auto predicate = [&hp](const HostPortPB& rhs) {
+    return rhs.host() == hp.host() && rhs.port() == hp.port();
+  };
+  if (std::find_if(reg.common().private_rpc_addresses().begin(),
+                   reg.common().private_rpc_addresses().end(),
+                   predicate) != reg.common().private_rpc_addresses().end()) {
+    return true;
+  }
+  if (std::find_if(reg.common().broadcast_addresses().begin(),
+                   reg.common().broadcast_addresses().end(),
+                   predicate) != reg.common().broadcast_addresses().end()) {
+    return true;
   }
   return false;
 }
 
-void TSDescriptor::GetNodeInstancePB(NodeInstancePB* instance_pb) const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  instance_pb->set_permanent_uuid(permanent_uuid_);
-  instance_pb->set_instance_seqno(latest_seqno_);
+Result<HostPort> TSDescriptor::GetHostPortUnlocked() const {
+  const auto& addr = DesiredHostPort(ts_information_->registration().common(), local_cloud_info_);
+  if (addr.host().empty()) {
+    return STATUS_FORMAT(NetworkError, "Unable to find the TS address for $0: $1",
+                         permanent_uuid_, ts_information_->registration().ShortDebugString());
+  }
+
+  return HostPortFromPB(addr);
 }
 
-Status TSDescriptor::ResolveEndpoint(Endpoint* addr) const {
-  vector<HostPort> hostports;
-  {
-    std::lock_guard<simple_spinlock> l(lock_);
-    for (const HostPortPB& addr : registration_->common().rpc_addresses()) {
-      hostports.emplace_back(addr.host(), addr.port());
-    }
-  }
+bool TSDescriptor::IsAcceptingLeaderLoad(const ReplicationInfoPB& replication_info) const {
+  return true;
+}
 
-  // Resolve DNS outside the lock.
-  HostPort last_hostport;
-  std::vector<Endpoint> addrs;
-  for (const HostPort& hostport : hostports) {
-    RETURN_NOT_OK(hostport.ResolveAddresses(&addrs));
-    if (!addrs.empty()) {
-      last_hostport = hostport;
-      break;
-    }
-  }
-
-  if (addrs.size() == 0) {
-    return STATUS(NetworkError, "Unable to find the TS address: ", registration_->DebugString());
-  }
-
-  if (addrs.size() > 1) {
-    LOG(WARNING) << "TS address " << last_hostport.ToString()
-                  << " resolves to " << addrs.size() << " different addresses. Using "
-                  << addrs[0];
-  }
-  *addr = addrs[0];
-  return Status::OK();
+void TSDescriptor::UpdateMetrics(const TServerMetricsPB& metrics) {
+  std::lock_guard<decltype(lock_)> l(lock_);
+  ts_metrics_.total_memory_usage = metrics.total_ram_usage();
+  ts_metrics_.total_sst_file_size = metrics.total_sst_file_size();
+  ts_metrics_.uncompressed_sst_file_size = metrics.uncompressed_sst_file_size();
+  ts_metrics_.num_sst_files = metrics.num_sst_files();
+  ts_metrics_.read_ops_per_sec = metrics.read_ops_per_sec();
+  ts_metrics_.write_ops_per_sec = metrics.write_ops_per_sec();
+  ts_metrics_.uptime_seconds = metrics.uptime_seconds();
 }
 
 bool TSDescriptor::HasTabletDeletePending() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  SharedLock<decltype(lock_)> l(lock_);
   return !tablets_pending_delete_.empty();
 }
 
 bool TSDescriptor::IsTabletDeletePending(const std::string& tablet_id) const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  SharedLock<decltype(lock_)> l(lock_);
   return tablets_pending_delete_.count(tablet_id);
 }
 
+std::string TSDescriptor::PendingTabletDeleteToString() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return yb::ToString(tablets_pending_delete_);
+}
+
 void TSDescriptor::AddPendingTabletDelete(const std::string& tablet_id) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<decltype(lock_)> l(lock_);
   tablets_pending_delete_.insert(tablet_id);
 }
 
 void TSDescriptor::ClearPendingTabletDelete(const std::string& tablet_id) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<decltype(lock_)> l(lock_);
   tablets_pending_delete_.erase(tablet_id);
+}
+
+std::size_t TSDescriptor::NumTasks() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return tablets_pending_delete_.size();
+}
+
+std::string TSDescriptor::ToString() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return Format("{ permanent_uuid: $0 registration: $1 placement_id: $2 }",
+                permanent_uuid_, ts_information_->registration(), placement_id_);
 }
 
 } // namespace master

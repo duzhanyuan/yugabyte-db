@@ -32,7 +32,6 @@
 #ifndef YB_UTIL_DEBUG_LEAKCHECK_DISABLER_H_
 #define YB_UTIL_DEBUG_LEAKCHECK_DISABLER_H_
 
-#include <gperftools/heap-checker.h>
 #include "yb/gutil/macros.h"
 #include "yb/util/debug/leak_annotations.h"
 
@@ -55,6 +54,15 @@ class ScopedLeakCheckDisabler {
 
   DISALLOW_COPY_AND_ASSIGN(ScopedLeakCheckDisabler);
 };
+
+#if defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define DISABLE_ASAN __attribute__((no_sanitize("address")))
+  #endif
+#endif
+#ifndef DISABLE_ASAN
+#define DISABLE_ASAN
+#endif
 
 } // namespace debug
 } // namespace yb

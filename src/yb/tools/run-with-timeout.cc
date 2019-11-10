@@ -24,8 +24,15 @@
 #include "yb/util/subprocess.h"
 #include "yb/util/logging.h"
 #include "yb/util/status.h"
+#include "yb/util/result.h"
+#include "yb/util/net/net_util.h"
 
-constexpr int kWaitSecBeforeSIGKILL = 5;
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
+constexpr int kWaitSecAfterSigQuit = 10;
+constexpr int kWaitSecAfterSigSegv = 10;
 
 using std::cerr;
 using std::condition_variable;
@@ -43,6 +50,32 @@ using std::chrono::milliseconds;
 
 using yb::Subprocess;
 using yb::Status;
+using yb::Result;
+using yb::GetHostname;
+
+bool SendSignalAndWait(Subprocess* subprocess, int signal, const string& signal_str, int wait_sec) {
+  LOG(ERROR) << "Timeout reached, trying to stop the child process with " << signal_str;
+  const Status signal_status = subprocess->KillNoCheckIfRunning(signal);
+  if (!signal_status.ok()) {
+    LOG(ERROR) << "Failed to send " << signal_str << " to child process: " << signal_status;
+  }
+
+  if (wait_sec > 0) {
+    int sleep_ms = 5;
+    auto second_wait_until = steady_clock::now() + std::chrono::seconds(wait_sec);
+    while (subprocess->IsRunning() && steady_clock::now() < second_wait_until) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+      // Sleep for 5 ms, 10 ms, 15 ms, etc. capped at 100 ms.
+      sleep_ms = std::min(sleep_ms + 5, 100);
+    }
+  }
+
+  bool is_running = subprocess->IsRunning();
+  if (!is_running) {
+    LOG(INFO) << "Child process terminated after we sent " << signal_str;
+  }
+  return !is_running;
+}
 
 int main(int argc, char** argv) {
   yb::InitGoogleLoggingSafeBasic(argv[0]);
@@ -55,7 +88,7 @@ int main(int argc, char** argv) {
     cerr << "Runs the given program with the given timeout. If the program is still" << endl;
     cerr << "running after the given amount of time, it gets sent the SIGQUIT signal" << endl;
     cerr << "to make it create a core dump and terminate. If it is still running after" << endl;
-    cerr << "that, it is killed with a SIGKILL." << endl;
+    cerr << "that, we send SIGSEGV, and finally a SIGKILL." << endl;
     cerr << endl;
     cerr << "A timeout value of 0 means no timeout." << endl;
     return EXIT_FAILURE;
@@ -75,6 +108,37 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
   const string program = args[1];
+
+#ifdef __linux__
+  struct rlimit64 core_limits;
+  if (getrlimit64(RLIMIT_CORE, &core_limits) == 0) {
+    if (core_limits.rlim_cur != RLIM_INFINITY || core_limits.rlim_max != RLIM_INFINITY) {
+      // Only print the debug message if core file limits are not infinite already.
+      LOG(INFO) << "Core file size limits set by parent process: "
+                << "current=" << core_limits.rlim_cur
+                << ", max=" << core_limits.rlim_max << ". Trying to set both to infinity.";
+    }
+  } else {
+    perror("getrlimit64 failed");
+  }
+  core_limits.rlim_cur = RLIM_INFINITY;
+  core_limits.rlim_max = RLIM_INFINITY;
+  if (setrlimit64(RLIMIT_CORE, &core_limits) != 0) {
+    perror("setrlimit64 failed");
+  }
+#endif
+
+  {
+    auto host_name = GetHostname();
+    if (host_name.ok()) {
+      LOG(INFO) << "Running on host " << *host_name;
+    } else {
+      LOG(WARNING) << "Failed to get current host name: " << host_name.status();
+    }
+  }
+
+  const char* path_env_var = getenv("PATH");
+  LOG(INFO) << "PATH environment variable: " << (path_env_var != NULL ? path_env_var : "N/A");
 
   // Arguments include the program name, so we only erase the first argument from our own args: the
   // timeout value.
@@ -119,28 +183,10 @@ int main(int argc, char** argv) {
 
     if (!finished_local && subprocess_is_running) {
       timed_out = true;
-      LOG(ERROR) << "Timeout reached, trying to stop the child process with SIGQUIT";
-      const Status sigquit_status = subprocess.KillNoCheckIfRunning(SIGQUIT);
-      if (!sigquit_status.ok()) {
-        LOG(ERROR) << "Failed to send SIGQUIT to child process: " << sigquit_status.ToString();
-      }
-      int sleep_ms = 5;
-      auto second_wait_until = steady_clock::now() + std::chrono::seconds(kWaitSecBeforeSIGKILL);
-      while (subprocess.IsRunning() && steady_clock::now() < second_wait_until) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-        // Sleep for 5 ms, 10 ms, 15 ms, etc. capped at 100 ms.
-        sleep_ms = std::min(sleep_ms + 5, 100);
-      }
-
-      if (subprocess.IsRunning()) {
-        LOG(ERROR) << "The process is still running after waiting for " << kWaitSecBeforeSIGKILL
-                   << " seconds, using SIGKILL";
-        const Status sigkill_status = subprocess.KillNoCheckIfRunning(SIGKILL);
-        if (!sigkill_status.ok()) {
-          LOG(ERROR) << "Failed to send SIGKILL to child process: " << sigkill_status.ToString();
-        }
-      } else {
-        LOG(INFO) << "Child process terminated after we sent SIGQUIT";
+      if (!SendSignalAndWait(&subprocess, SIGQUIT, "SIGQUIT", kWaitSecAfterSigQuit) &&
+          !SendSignalAndWait(&subprocess, SIGSEGV, "SIGSEGV", kWaitSecAfterSigSegv) &&
+          !SendSignalAndWait(&subprocess, SIGKILL, "SIGKILL", /* wait_sec */ 0)) {
+        LOG(ERROR) << "Failed to kill the process with SIGKILL (should not happen).";
       }
     }
   });
@@ -159,15 +205,21 @@ int main(int argc, char** argv) {
   int exit_code = WIFEXITED(waitpid_ret_val) ? WEXITSTATUS(waitpid_ret_val) : 0;
   int term_sig = WIFSIGNALED(waitpid_ret_val) ? WTERMSIG(waitpid_ret_val) : 0;
   LOG(INFO) << "Child process returned exit code " << exit_code;
-  if (exit_code == 0 && timed_out) {
-    LOG(ERROR) << "Child process timed out and we had to kill it";
-  }
-  if (exit_code == 0 && term_sig != 0) {
+  if (timed_out) {
+    if (exit_code == 0) {
+      LOG(ERROR) << "Child process timed out and we had to kill it";
+    }
     exit_code = EXIT_FAILURE;
-    LOG(ERROR) << "Child process terminated due to signal " << term_sig
-               << ", returning exit code " << exit_code;
   }
 
+  if (term_sig != 0) {
+    if (exit_code == 0) {
+      exit_code = EXIT_FAILURE;
+    }
+    LOG(ERROR) << "Child process terminated due to signal " << term_sig;
+  }
+
+  LOG(INFO) << "Returning exit code " << exit_code;
   auto duration_ms = duration_cast<milliseconds>(steady_clock::now() - start_time).count();
   LOG(INFO) << "Total time taken: " << StringPrintf("%.3f", duration_ms / 1000.0) << " sec";
   return exit_code;

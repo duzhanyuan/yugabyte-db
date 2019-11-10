@@ -37,26 +37,31 @@
 
 #include <boost/optional.hpp>
 
-#include "yb/common/row_operations.h"
 #include "yb/common/wire_protocol.h"
+#include "yb/consensus/consensus.h"
+#include "yb/docdb/cql_operation.h"
+#include "yb/docdb/pgsql_operation.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/walltime.h"
 #include "yb/rpc/rpc_context.h"
 #include "yb/server/hybrid_clock.h"
-#include "yb/tablet/row_op.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tserver/tserver.pb.h"
 #include "yb/util/debug/trace_event.h"
+#include "yb/util/debug-util.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/locks.h"
 #include "yb/util/trace.h"
 
 DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,
                  "How much latency to inject when a write operation is applied.");
+DEFINE_test_flag(bool, tablet_pause_apply_write_ops, false,
+                 "Pause applying of write operations.");
 TAG_FLAG(tablet_inject_latency_on_apply_write_txn_ms, runtime);
+TAG_FLAG(tablet_pause_apply_write_ops, runtime);
 
 namespace yb {
 namespace tablet {
@@ -65,7 +70,6 @@ using std::lock_guard;
 using std::mutex;
 using std::unique_ptr;
 using consensus::ReplicateMsg;
-using consensus::CommitMsg;
 using consensus::DriverType;
 using consensus::WRITE_OP;
 using tserver::TabletServerErrorPB;
@@ -73,9 +77,14 @@ using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
 using strings::Substitute;
 
-WriteOperation::WriteOperation(std::unique_ptr<WriteOperationState> state, DriverType type)
-  : Operation(std::move(state), type, Operation::WRITE_TXN),
-    start_time_(MonoTime::FineNow()) {
+WriteOperation::WriteOperation(
+    std::unique_ptr<WriteOperationState> state, int64_t term, CoarseTimePoint deadline,
+    WriteOperationContext* context)
+    : Operation(std::move(state), OperationType::kWrite),
+      context_(*context), term_(term), deadline_(deadline), start_time_(MonoTime::Now()),
+      // If term is unknown, it means that we are creating operation at replica.
+      // So it was already submitted at leader.
+      submitted_(term == yb::OpId::kUnknownTerm) {
 }
 
 consensus::ReplicateMsgPtr WriteOperation::NewReplicateMsg() {
@@ -87,262 +96,135 @@ consensus::ReplicateMsgPtr WriteOperation::NewReplicateMsg() {
 
 Status WriteOperation::Prepare() {
   TRACE_EVENT0("txn", "WriteOperation::Prepare");
-  TRACE("PREPARE: Starting");
-
-  // Decode everything first so that we give up if something major is wrong.
-  Schema client_schema;
-  RETURN_NOT_OK_PREPEND(SchemaFromPB(state()->request()->schema(), &client_schema),
-                        "Cannot decode client schema");
-  if (client_schema.has_column_ids()) {
-    // TODO: we have this kind of code a lot - add a new SchemaFromPB variant which
-    // does this check inline.
-    Status s = STATUS(InvalidArgument, "User requests should not have Column IDs");
-    state()->completion_callback()->set_error(s, TabletServerErrorPB::INVALID_SCHEMA);
-    return s;
-  }
-
-  auto* tablet = tablet_peer()->tablet();
-
-  Status s = tablet->DecodeWriteOperations(&client_schema, state());
-  if (!s.ok()) {
-    // TODO: is MISMATCHED_SCHEMA always right here? probably not.
-    state()->completion_callback()->set_error(s, TabletServerErrorPB::MISMATCHED_SCHEMA);
-    return s;
-  }
-
-  // Acquire Kudu row locks. This is Kudu-specific and has no effect for YB tables.
-  RETURN_NOT_OK(tablet->AcquireKuduRowLocks(state()));
-
-  TRACE("PREPARE: finished.");
   return Status::OK();
 }
 
-void WriteOperation::Start() {
+void WriteOperation::DoStart() {
   TRACE("Start()");
-  state()->tablet_peer()->tablet()->StartOperation(state());
+  state()->tablet()->StartOperation(state());
+}
+
+Status WriteOperation::DoAborted(const Status& status) {
+  TRACE("FINISH: aborting operation");
+  state()->Abort();
+  return status;
 }
 
 // FIXME: Since this is called as a void in a thread-pool callback,
 // it seems pointless to return a Status!
-Status WriteOperation::Apply(gscoped_ptr<CommitMsg>* commit_msg) {
-  TRACE_EVENT0("txn", "WriteOperation::Apply");
+Status WriteOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
+  TRACE_EVENT0("txn", "WriteOperation::Complete");
   TRACE("APPLY: Starting");
 
   if (PREDICT_FALSE(
           ANNOTATE_UNPROTECTED_READ(FLAGS_tablet_inject_latency_on_apply_write_txn_ms) > 0)) {
-    TRACE("Injecting $0ms of latency due to --tablet_inject_latency_on_apply_write_txn_ms",
-          FLAGS_tablet_inject_latency_on_apply_write_txn_ms);
-    SleepFor(MonoDelta::FromMilliseconds(FLAGS_tablet_inject_latency_on_apply_write_txn_ms));
-  }
-
-  Tablet* tablet = state()->tablet_peer()->tablet();
-
-  tablet->ApplyRowOperations(state());
-
-  if (tablet->table_type() == TableType::KUDU_COLUMNAR_TABLE_TYPE) {
-    // Add per-row errors to the result, update metrics.
-    int i = 0;
-    for (const RowOp* op : state()->row_ops()) {
-     if (state()->response() != nullptr && op->result->has_failed_status()) {
-       // Replicas disregard the per row errors, for now
-       // TODO check the per-row errors against the leader's, at least in debug mode
-       WriteResponsePB::PerRowErrorPB* error = state()->response()->add_per_row_errors();
-       error->set_row_index(i);
-       error->mutable_error()->CopyFrom(op->result->failed_status());
-      }
-
-      state()->UpdateMetricsForOp(*op);
-      i++;
-    }
-
-    // Create the Commit message
-    commit_msg->reset(new CommitMsg());
-    state()->ReleaseTxResultPB((*commit_msg)->mutable_result());
-    (*commit_msg)->set_op_type(WRITE_OP);
+      TRACE("Injecting $0ms of latency due to --tablet_inject_latency_on_apply_write_txn_ms",
+            FLAGS_tablet_inject_latency_on_apply_write_txn_ms);
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_tablet_inject_latency_on_apply_write_txn_ms));
   } else {
-    // We don't use COMMIT messages for non-Kudu tables.
-    commit_msg->reset(nullptr);
+    TEST_PAUSE_IF_FLAG(tablet_pause_apply_write_ops);
   }
 
-  return Status::OK();
-}
+  *complete_status = state()->tablet()->ApplyRowOperations(state());
+  // Failure is regular case, since could happen because transaction was aborted, while
+  // replicating it's intents.
+  LOG_IF(INFO, !complete_status->ok()) << "Apply operation failed: " << *complete_status;
 
-void WriteOperation::PreCommit() {
-  TRACE_EVENT0("txn", "WriteOperation::PreCommit");
-  TRACE("PRECOMMIT: Releasing row and schema locks");
-  // Perform early lock release after we've applied all changes
-  state()->ReleaseDocDbLocks(tablet_peer()->tablet());
-  state()->ReleaseSchemaLock();
-}
-
-void WriteOperation::Finish(OperationResult result) {
-  TRACE_EVENT0("txn", "WriteOperation::Finish");
-  if (PREDICT_FALSE(result == Operation::ABORTED)) {
-    TRACE("FINISH: aborting operation");
-    state()->Abort();
-    return;
-  }
-
-  DCHECK_EQ(result, Operation::COMMITTED);
   // Now that all of the changes have been applied and the commit is durable
   // make the changes visible to readers.
   TRACE("FINISH: making edits visible");
   state()->Commit();
 
-  TabletMetrics* metrics = state()->tablet_peer()->tablet()->metrics();
-  if (metrics) {
-    // TODO: should we change this so it's actually incremented by the
-    // Tablet code itself instead of this wrapper code?
-    metrics->rows_inserted->IncrementBy(state()->metrics().successful_inserts);
-    metrics->rows_updated->IncrementBy(state()->metrics().successful_updates);
-    metrics->rows_deleted->IncrementBy(state()->metrics().successful_deletes);
-
-    if (type() == consensus::LEADER) {
-      if (state()->external_consistency_mode() == COMMIT_WAIT) {
-        metrics->commit_wait_duration->Increment(state()->metrics().commit_wait_duration_usec);
-      }
-      uint64_t op_duration_usec =
-          MonoTime::Now(MonoTime::FINE).GetDeltaSince(start_time_).ToMicroseconds();
-      switch (state()->external_consistency_mode()) {
-        case CLIENT_PROPAGATED:
-          metrics->write_op_duration_client_propagated_consistency->Increment(op_duration_usec);
-          break;
-        case COMMIT_WAIT:
-          metrics->write_op_duration_commit_wait_consistency->Increment(op_duration_usec);
-          break;
-        case UNKNOWN_EXTERNAL_CONSISTENCY_MODE:
-          break;
-      }
-    }
+  TabletMetrics* metrics = tablet()->metrics();
+  if (metrics && state()->has_completion_callback()) {
+    auto op_duration_usec = MonoTime::Now().GetDeltaSince(start_time_).ToMicroseconds();
+    metrics->write_op_duration_client_propagated_consistency->Increment(op_duration_usec);
   }
+
+  return Status::OK();
 }
 
 string WriteOperation::ToString() const {
-  MonoTime now(MonoTime::Now(MonoTime::FINE));
+  MonoTime now(MonoTime::Now());
   MonoDelta d = now.GetDeltaSince(start_time_);
   WallTime abs_time = WallTime_Now() - d.ToSeconds();
   string abs_time_formatted;
   StringAppendStrftime(&abs_time_formatted, "%Y-%m-%d %H:%M:%S", (time_t)abs_time, true);
-  return Substitute("WriteOperation [type=$0, start_time=$1, state=$2]",
-                    DriverType_Name(type()), abs_time_formatted, state()->ToString());
+  return Substitute("WriteOperation { start_time: $0 state: $1 }",
+                    abs_time_formatted, state()->ToString());
 }
 
-WriteOperationState::WriteOperationState(TabletPeer* tablet_peer,
+WriteOperation::~WriteOperation() {
+  // If operation was submitted, then it's lifetime is controlled by operation tracker and we
+  // don't have to do it here.
+  if (!submitted_) {
+    context_.Aborted(this);
+  }
+}
+
+void WriteOperation::DoStartSynchronization(const Status& status) {
+  std::unique_ptr<WriteOperation> self(this);
+  // If a restart read is required, then we return this fact to caller and don't perform the write
+  // operation.
+  if (restart_read_ht_.is_valid()) {
+    auto restart_time = state()->response()->mutable_restart_read_time();
+    restart_time->set_read_ht(restart_read_ht_.ToUint64());
+    auto local_limit = context_.ReportReadRestart();
+    restart_time->set_local_limit_ht(local_limit.ToUint64());
+    // Global limit is ignored by caller, so we don't set it.
+    state()->CompleteWithStatus(Status::OK());
+    return;
+  }
+
+  if (!status.ok()) {
+    state()->CompleteWithStatus(status);
+    return;
+  }
+
+  self->submitted_ = true;
+  context_.Submit(std::move(self), term_);
+}
+
+WriteOperationState::WriteOperationState(Tablet* tablet,
                                          const tserver::WriteRequestPB *request,
-                                         tserver::WriteResponsePB *response)
-    : OperationState(tablet_peer),
+                                         tserver::WriteResponsePB *response,
+                                         docdb::OperationKind kind)
+    : OperationState(tablet),
       // We need to copy over the request from the RPC layer, as we're modifying it in the tablet
       // layer.
       request_(request ? new WriteRequestPB(*request) : nullptr),
       response_(response),
-      mvcc_tx_(nullptr),
-      schema_at_decode_time_(nullptr) {
-  if (request) {
-    external_consistency_mode_ = request->external_consistency_mode();
-  } else {
-    external_consistency_mode_ = CLIENT_PROPAGATED;
-  }
-}
-
-void WriteOperationState::SetMvccTxAndHybridTime(std::unique_ptr<ScopedWriteOperation> mvcc_tx) {
-  DCHECK(!mvcc_tx_) << "Mvcc operation already started/set.";
-  if (has_hybrid_time()) {
-    DCHECK_EQ(hybrid_time(), mvcc_tx->hybrid_time());
-  } else {
-    set_hybrid_time(mvcc_tx->hybrid_time());
-  }
-
-  lock_guard<mutex> lock(mvcc_tx_mutex_);
-  mvcc_tx_ = std::move(mvcc_tx);
-}
-
-void WriteOperationState::set_tablet_components(
-    const scoped_refptr<const TabletComponents>& components) {
-  DCHECK(!tablet_components_) << "Already set";
-  DCHECK(components);
-  tablet_components_ = components;
-}
-
-void WriteOperationState::AcquireSchemaLock(rw_semaphore* schema_lock) {
-  TRACE("Acquiring schema lock in shared mode");
-  shared_lock<rw_semaphore> temp(*schema_lock);
-  schema_lock_.swap(temp);
-  TRACE("Acquired schema lock");
-}
-
-void WriteOperationState::ReleaseSchemaLock() {
-  shared_lock<rw_semaphore> temp;
-  schema_lock_.swap(temp);
-  TRACE("Released schema lock");
-}
-
-void WriteOperationState::StartApplying() {
-  lock_guard<mutex> lock(mvcc_tx_mutex_);
-  if (!mvcc_tx_) {
-    LOG(INFO) << "mvcc_tx is nullptr for hybrid_time " << hybrid_time() << ":\n" << GetStackTrace();
-  }
-  CHECK_NOTNULL(mvcc_tx_.get())->StartApplying();
+      kind_(kind) {
 }
 
 void WriteOperationState::Abort() {
-  ResetMvccTx([](ScopedWriteOperation* mvcc_tx) { mvcc_tx->Abort(); });
+  if (hybrid_time_.is_valid()) {
+    tablet()->mvcc_manager()->Aborted(hybrid_time_);
+  }
 
-  ReleaseDocDbLocks(tablet_peer()->tablet());
-  ReleaseSchemaLock();
+  ReleaseDocDbLocks();
 
   // After aborting, we may respond to the RPC and delete the
   // original request, so null them out here.
   ResetRpcFields();
 }
 
+void WriteOperationState::UpdateRequestFromConsensusRound() {
+  request_ = consensus_round()->replicate_msg()->mutable_write_request();
+}
+
 void WriteOperationState::Commit() {
-  ResetMvccTx([](ScopedWriteOperation* mvcc_tx) { mvcc_tx->Commit(); });
+  tablet()->mvcc_manager()->Replicated(hybrid_time_);
+  ReleaseDocDbLocks();
 
   // After committing, we may respond to the RPC and delete the
   // original request, so null them out here.
   ResetRpcFields();
 }
 
-void WriteOperationState::ReleaseTxResultPB(TxResultPB* result) const {
-  result->Clear();
-  result->mutable_ops()->Reserve(row_ops_.size());
-  for (RowOp* op : row_ops_) {
-    result->mutable_ops()->AddAllocated(CHECK_NOTNULL(op->result.release()));
-  }
-}
-
-void WriteOperationState::UpdateMetricsForOp(const RowOp& op) {
-  if (op.result->has_failed_status()) {
-    return;
-  }
-  switch (op.decoded_op.type) {
-    case RowOperationsPB::INSERT:
-      tx_metrics_.successful_inserts++;
-      break;
-    case RowOperationsPB::UPDATE:
-      tx_metrics_.successful_updates++;
-      break;
-    case RowOperationsPB::DELETE:
-      tx_metrics_.successful_deletes++;
-      break;
-    case RowOperationsPB::UNKNOWN:
-    case RowOperationsPB::SPLIT_ROW:
-      break;
-  }
-}
-
-void WriteOperationState::ReleaseDocDbLocks(Tablet* tablet) {
+void WriteOperationState::ReleaseDocDbLocks() {
   // Free DocDB multi-level locks.
   docdb_locks_.Reset();
-
-  if (tablet->table_type() == TableType::KUDU_COLUMNAR_TABLE_TYPE) {
-    // The code below is kudu-only and will be removed, along with the tablet parameter.
-    for (RowOp *op : row_ops_) {
-      op->row_lock.Release();
-    }
-  } else {
-    CHECK(row_ops_.empty());
-  }
 }
 
 WriteOperationState::~WriteOperationState() {
@@ -354,27 +236,12 @@ WriteOperationState::~WriteOperationState() {
 }
 
 void WriteOperationState::Reset() {
-  // We likely shouldn't Commit() here. See KUDU-625.
-  Commit();
-  tx_metrics_.Reset();
-  hybrid_time_ = HybridTime::kInvalidHybridTime;
-  tablet_components_ = nullptr;
-  schema_at_decode_time_ = nullptr;
+  hybrid_time_ = HybridTime::kInvalid;
 }
 
 void WriteOperationState::ResetRpcFields() {
-  std::lock_guard<simple_spinlock> l(txn_state_lock_);
+  std::lock_guard<simple_spinlock> l(mutex_);
   response_ = nullptr;
-  STLDeleteElements(&row_ops_);
-}
-
-void WriteOperationState::ResetMvccTx(std::function<void(ScopedWriteOperation*)> txn_action) {
-  lock_guard<mutex> lock(mvcc_tx_mutex_);
-  if (mvcc_tx_.get() != nullptr) {
-    // Abort the operation.
-    txn_action(mvcc_tx_.get());
-  }
-  mvcc_tx_.reset();
 }
 
 string WriteOperationState::ToString() const {
@@ -385,30 +252,10 @@ string WriteOperationState::ToString() const {
     ts_str = "<unassigned>";
   }
 
-  // Stringify the actual row operations (eg INSERT/UPDATE/etc)
-  // NOTE: we'll eventually need to gate this by some flag if we want to avoid
-  // user data escaping into the log. See KUDU-387.
-  string row_ops_str = "[";
-  {
-    std::lock_guard<simple_spinlock> l(txn_state_lock_);
-    const size_t kMaxToStringify = 3;
-    for (int i = 0; i < std::min(row_ops_.size(), kMaxToStringify); i++) {
-      if (i > 0) {
-        row_ops_str.append(", ");
-      }
-      row_ops_str.append(row_ops_[i]->ToString(*DCHECK_NOTNULL(schema_at_decode_time_)));
-    }
-    if (row_ops_.size() > kMaxToStringify) {
-      row_ops_str.append(", ...");
-    }
-    row_ops_str.append("]");
-  }
-
-  return Substitute("WriteOperationState $0 [op_id=($1), ts=$2, rows=$3]",
+  return Substitute("WriteOperationState $0 [op_id=($1), ts=$2]",
                     this,
                     op_id().ShortDebugString(),
-                    ts_str,
-                    row_ops_str);
+                    ts_str);
 }
 
 }  // namespace tablet

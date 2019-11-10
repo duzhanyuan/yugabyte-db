@@ -84,7 +84,7 @@ class BlockingQueue {
         << "BlockingQueue holds bare pointers at destruction time";
   }
 
-  // Get an element from the queue.  Returns false if we were shut down prior to
+  // Get an element from the queue. Returns false if we were shut down prior to
   // getting the element.
   bool BlockingGet(T *out) {
     MutexLock l(lock_);
@@ -103,7 +103,7 @@ class BlockingQueue {
     }
   }
 
-  // Get an element from the queue.  Returns false if the queue is empty and
+  // Get an element from the queue. Returns false if the queue is empty and
   // we were shut down prior to getting the element.
   bool BlockingGet(gscoped_ptr<T_VAL> *out) {
     T t = NULL;
@@ -118,6 +118,10 @@ class BlockingQueue {
   // Get all elements from the queue and append them to a
   // vector. Returns false if shutdown prior to getting the elements.
   bool BlockingDrainTo(std::vector<T>* out) {
+    return BlockingDrainTo(out, MonoTime::kMax);
+  }
+
+  bool BlockingDrainTo(std::vector<T>* out, const MonoTime& wait_timeout_deadline) {
     MutexLock l(lock_);
     while (true) {
       if (!list_.empty()) {
@@ -133,7 +137,9 @@ class BlockingQueue {
       if (shutdown_) {
         return false;
       }
-      not_empty_.Wait();
+      if (!not_empty_.WaitUntil(wait_timeout_deadline)) {
+        return true;
+      }
     }
   }
 

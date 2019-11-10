@@ -16,6 +16,7 @@
 #include "yb/client/transaction_rpc.h"
 
 #include "yb/client/client.h"
+#include "yb/client/meta_cache.h"
 #include "yb/client/tablet_rpc.h"
 
 #include "yb/rpc/rpc.h"
@@ -32,12 +33,13 @@ namespace {
 
 class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
  public:
-  TransactionRpcBase(const MonoTime& deadline,
+  TransactionRpcBase(CoarseTimePoint deadline,
                      internal::RemoteTablet* tablet,
                      YBClient* client)
-      : rpc::Rpc(deadline, client->messenger()),
+      : rpc::Rpc(deadline, client->messenger(), &client->proxy_cache()),
         trace_(new Trace),
-        invoker_(false /* consistent_prefix */,
+        invoker_(false /* local_tserver_only */,
+                 false /* consistent_prefix */,
                  client,
                  this,
                  this,
@@ -52,7 +54,7 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
     invoker_.Execute(tablet_id());
   }
 
-  void SendRpcCb(const Status& status) override {
+  void Finished(const Status& status) override {
     Status new_status = status;
     if (invoker_.Done(&new_status)) {
       auto retain_self = shared_from_this();
@@ -70,8 +72,8 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
  private:
   void SendRpcToTserver() override {
     InvokeAsync(invoker_.proxy().get(),
-                mutable_retrier()->mutable_controller(),
-                std::bind(&TransactionRpcBase::SendRpcCb, this, Status::OK()));
+                PrepareController(),
+                std::bind(&TransactionRpcBase::Finished, this, Status::OK()));
   }
 
   virtual void InvokeCallback(const Status& status) = 0;
@@ -88,7 +90,7 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
 template <class Traits>
 class TransactionRpc : public TransactionRpcBase {
  public:
-  TransactionRpc(const MonoTime& deadline,
+  TransactionRpc(CoarseTimePoint deadline,
                  internal::RemoteTablet* tablet,
                  YBClient* client,
                  typename Traits::Request* req,
@@ -110,7 +112,7 @@ class TransactionRpc : public TransactionRpcBase {
   }
 
   std::string ToString() const override {
-    return Format("$0: $1", Traits::kName, req_);
+    return Format("$0: $1, retrier: $2", Traits::kName, req_, retrier());
   }
 
   void InvokeCallback(const Status& status) override {
@@ -200,7 +202,7 @@ constexpr const char* AbortTransactionTraits::kName;
 } // namespace
 
 rpc::RpcCommandPtr UpdateTransaction(
-    const MonoTime& deadline,
+    CoarseTimePoint deadline,
     internal::RemoteTablet* tablet,
     YBClient* client,
     tserver::UpdateTransactionRequestPB* req,
@@ -210,7 +212,7 @@ rpc::RpcCommandPtr UpdateTransaction(
 }
 
 rpc::RpcCommandPtr GetTransactionStatus(
-    const MonoTime& deadline,
+    CoarseTimePoint deadline,
     internal::RemoteTablet* tablet,
     YBClient* client,
     tserver::GetTransactionStatusRequestPB* req,
@@ -220,7 +222,7 @@ rpc::RpcCommandPtr GetTransactionStatus(
 }
 
 rpc::RpcCommandPtr AbortTransaction(
-    const MonoTime& deadline,
+    CoarseTimePoint deadline,
     internal::RemoteTablet* tablet,
     YBClient* client,
     tserver::AbortTransactionRequestPB* req,

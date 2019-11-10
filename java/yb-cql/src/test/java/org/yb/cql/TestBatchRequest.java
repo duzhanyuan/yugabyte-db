@@ -14,7 +14,6 @@ package org.yb.cql;
 
 import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.PreparedStatement;
-import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 
@@ -23,21 +22,30 @@ import org.yb.minicluster.MiniYBDaemon;
 
 import org.junit.Test;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.fail;
 
-import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Map;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestBatchRequest extends BaseCQLTest {
+
+  @Override
+  public int getTestMethodTimeoutSec() {
+    // No need to adjust for TSAN vs. non-TSAN here, it will be done automatically.
+    return 180;
+  }
 
   @Test
   public void testPreparedStatement() throws Exception {
-    // Setup table.
+    LOG.info("Setup table.");
     setupTable("t", 0 /* num_rows */);
 
-    // Test batch of prepared statements.
+    LOG.info("Test batch of prepared statements.");
     PreparedStatement stmt = session.prepare("INSERT INTO t (h1, h2, r1, r2, v1, v2) " +
                                              "VALUES (?, ?, ?, ?, ?, ?);");
     BatchStatement batch = new BatchStatement();
@@ -48,25 +56,25 @@ public class TestBatchRequest extends BaseCQLTest {
     }
     session.execute(batch);
 
-    assertQuery("SELECT * FROM t",
-                new HashSet<String>(Arrays.asList("Row[1, h1, 1, r1, 1, v1]",
-                                                  "Row[2, h2, 2, r2, 2, v2]",
-                                                  "Row[3, h3, 3, r3, 3, v3]",
-                                                  "Row[4, h4, 4, r4, 4, v4]",
-                                                  "Row[5, h5, 5, r5, 5, v5]",
-                                                  "Row[6, h6, 6, r6, 6, v6]",
-                                                  "Row[7, h7, 7, r7, 7, v7]",
-                                                  "Row[8, h8, 8, r8, 8, v8]",
-                                                  "Row[9, h9, 9, r9, 9, v9]",
-                                                  "Row[10, h10, 10, r10, 10, v10]")));
+    assertQueryRowsUnordered("SELECT * FROM t",
+        "Row[1, h1, 1, r1, 1, v1]",
+        "Row[2, h2, 2, r2, 2, v2]",
+        "Row[3, h3, 3, r3, 3, v3]",
+        "Row[4, h4, 4, r4, 4, v4]",
+        "Row[5, h5, 5, r5, 5, v5]",
+        "Row[6, h6, 6, r6, 6, v6]",
+        "Row[7, h7, 7, r7, 7, v7]",
+        "Row[8, h8, 8, r8, 8, v8]",
+        "Row[9, h9, 9, r9, 9, v9]",
+        "Row[10, h10, 10, r10, 10, v10]");
   }
 
   @Test
   public void testSimpleStatement() throws Exception {
-    // Setup table.
+    LOG.info("Setup table.");
     setupTable("t", 0 /* num_rows */);
 
-    // Test batch of regular statements.
+    LOG.info("Test batch of regular statements.");
     BatchStatement batch = new BatchStatement();
     for (int i = 1; i <= 10; i++) {
       batch.add(new SimpleStatement(String.format("INSERT INTO t (h1, h2, r1, r2, v1, v2) " +
@@ -75,25 +83,25 @@ public class TestBatchRequest extends BaseCQLTest {
     }
     session.execute(batch);
 
-    assertQuery("SELECT * FROM t",
-                new HashSet<String>(Arrays.asList("Row[1, h1, 1, r1, 1, v1]",
-                                                  "Row[2, h2, 2, r2, 2, v2]",
-                                                  "Row[3, h3, 3, r3, 3, v3]",
-                                                  "Row[4, h4, 4, r4, 4, v4]",
-                                                  "Row[5, h5, 5, r5, 5, v5]",
-                                                  "Row[6, h6, 6, r6, 6, v6]",
-                                                  "Row[7, h7, 7, r7, 7, v7]",
-                                                  "Row[8, h8, 8, r8, 8, v8]",
-                                                  "Row[9, h9, 9, r9, 9, v9]",
-                                                  "Row[10, h10, 10, r10, 10, v10]")));
+    assertQueryRowsUnordered("SELECT * FROM t",
+        "Row[1, h1, 1, r1, 1, v1]",
+        "Row[2, h2, 2, r2, 2, v2]",
+        "Row[3, h3, 3, r3, 3, v3]",
+        "Row[4, h4, 4, r4, 4, v4]",
+        "Row[5, h5, 5, r5, 5, v5]",
+        "Row[6, h6, 6, r6, 6, v6]",
+        "Row[7, h7, 7, r7, 7, v7]",
+        "Row[8, h8, 8, r8, 8, v8]",
+        "Row[9, h9, 9, r9, 9, v9]",
+        "Row[10, h10, 10, r10, 10, v10]");
   }
 
   @Test
   public void testMixedStatements() throws Exception {
-    // Setup table.
+    LOG.info("Setup table.");
     setupTable("t", 0 /* num_rows */);
 
-    // Test batch of mixed statements.
+    LOG.info("Test batch of mixed statements.");
     PreparedStatement ins1 = session.prepare("INSERT INTO t (h1, h2, r1, r2, v1, v2) " +
                                              "VALUES (?, ?, ?, ?, ?, ?);");
     PreparedStatement ins2 = session.prepare("INSERT INTO t (h1, h2, r1, r2) " +
@@ -109,30 +117,30 @@ public class TestBatchRequest extends BaseCQLTest {
     }
     session.execute(batch);
 
-    assertQuery("SELECT * FROM t",
-                new HashSet<String>(Arrays.asList("Row[1, h1, 1, r1, 1, v1]",
-                                                  "Row[1, h1, 2, r2, NULL, NULL]",
-                                                  "Row[1, h1, 3, r3, 3, v3]",
-                                                  "Row[2, h2, 1, r1, 1, v1]",
-                                                  "Row[2, h2, 2, r2, NULL, NULL]",
-                                                  "Row[2, h2, 3, r3, 3, v3]",
-                                                  "Row[3, h3, 1, r1, 1, v1]",
-                                                  "Row[3, h3, 2, r2, NULL, NULL]",
-                                                  "Row[3, h3, 3, r3, 3, v3]",
-                                                  "Row[4, h4, 1, r1, 1, v1]",
-                                                  "Row[4, h4, 2, r2, NULL, NULL]",
-                                                  "Row[4, h4, 3, r3, 3, v3]",
-                                                  "Row[5, h5, 1, r1, 1, v1]",
-                                                  "Row[5, h5, 2, r2, NULL, NULL]",
-                                                  "Row[5, h5, 3, r3, 3, v3]")));
+    assertQueryRowsUnordered("SELECT * FROM t",
+        "Row[1, h1, 1, r1, 1, v1]",
+        "Row[1, h1, 2, r2, NULL, NULL]",
+        "Row[1, h1, 3, r3, 3, v3]",
+        "Row[2, h2, 1, r1, 1, v1]",
+        "Row[2, h2, 2, r2, NULL, NULL]",
+        "Row[2, h2, 3, r3, 3, v3]",
+        "Row[3, h3, 1, r1, 1, v1]",
+        "Row[3, h3, 2, r2, NULL, NULL]",
+        "Row[3, h3, 3, r3, 3, v3]",
+        "Row[4, h4, 1, r1, 1, v1]",
+        "Row[4, h4, 2, r2, NULL, NULL]",
+        "Row[4, h4, 3, r3, 3, v3]",
+        "Row[5, h5, 1, r1, 1, v1]",
+        "Row[5, h5, 2, r2, NULL, NULL]",
+        "Row[5, h5, 3, r3, 3, v3]");
   }
 
   @Test
   public void testInvalidStatement() throws Exception {
-    // Setup table.
+    LOG.info("Setup table.");
     setupTable("t", 0 /* num_rows */);
 
-    // Test mix of valid and invalid statements. Expect error.
+    LOG.info("Test mix of valid and invalid statements. Expect error.");
     BatchStatement batch = new BatchStatement();
     batch.add(new SimpleStatement("INSERT INTO t (h1, h2, r1, r2, v1, v2) " +
                                   "VALUES (1, 'h1', 1, 'r1', 1, 'v1');"));
@@ -140,21 +148,21 @@ public class TestBatchRequest extends BaseCQLTest {
                                   "VALUES (1, 'h1', 1, 'v1');"));
     runInvalidStmt(batch);
 
-    // Batch statement guarantees either all statements are executed or none is.
-    // Should return no rows.
-    // TODO: add test for batch writes across hash keys.
+    LOG.info("Batch statement guarantees either all statements are executed or none is.");
+    LOG.info("Should return no rows.");
+    LOG.info("TODO: add test for batch writes across hash keys.");
     assertQuery("SELECT * from t", "");
   }
 
   @Test
   public void testHashKeyBatch() throws Exception {
-    // Setup table.
+    LOG.info("Setup table.");
     setupTable("t", 0 /* num_rows */);
 
-    // Get the initial metrics.
+    LOG.info("Get the initial metrics.");
     Map<MiniYBDaemon, IOMetrics> initialMetrics = getTSMetrics();
 
-    // Test batch of prepared statements.
+    LOG.info("Test batch of prepared statements.");
     PreparedStatement stmt = session.prepare("INSERT INTO t (h1, h2, r1, r2, v1, v2) " +
                                              "VALUES (?, ?, ?, ?, ?, ?);");
     BatchStatement batch = new BatchStatement();
@@ -168,37 +176,40 @@ public class TestBatchRequest extends BaseCQLTest {
     }
     session.execute(batch);
 
-    // Check the metrics again.
+    LOG.info("Check the metrics again.");
     IOMetrics totalMetrics = getCombinedMetrics(initialMetrics);
 
-    // Verify writes are batched by the hash keyes. So the total writes should equal just the no.
-    // of hash keys, not no. of rows inserted.
-    assertEquals(NUM_HASH_KEYS, totalMetrics.localWriteCount + totalMetrics.remoteWriteCount);
+    LOG.info("Verify writes are batched by the hash keys. So the total writes should equal just ");
+    LOG.info("the number of hash keys, not number of rows inserted.");
+    LOG.info("localWriteCount=" + totalMetrics.localWriteCount);
+    LOG.info("remoteWriteCount=" + totalMetrics.remoteWriteCount);
+    assertEquals(miniCluster.getNumShardsPerTserver(),
+                 totalMetrics.localWriteCount + totalMetrics.remoteWriteCount);
 
-    // Verify the rows are inserted.
-    assertQuery("SELECT * FROM t",
-                new HashSet<String>(Arrays.asList("Row[1, h1, 1, r1, 1, v1]",
-                                                  "Row[1, h1, 2, r2, 2, v2]",
-                                                  "Row[1, h1, 3, r3, 3, v3]",
-                                                  "Row[1, h1, 4, r4, 4, v4]",
-                                                  "Row[1, h1, 5, r5, 5, v5]",
-                                                  "Row[3, h3, 1, r1, 1, v1]",
-                                                  "Row[3, h3, 2, r2, 2, v2]",
-                                                  "Row[3, h3, 3, r3, 3, v3]",
-                                                  "Row[3, h3, 4, r4, 4, v4]",
-                                                  "Row[3, h3, 5, r5, 5, v5]",
-                                                  "Row[2, h2, 1, r1, 1, v1]",
-                                                  "Row[2, h2, 2, r2, 2, v2]",
-                                                  "Row[2, h2, 3, r3, 3, v3]",
-                                                  "Row[2, h2, 4, r4, 4, v4]",
-                                                  "Row[2, h2, 5, r5, 5, v5]")));
+    LOG.info("Verify the rows are inserted.");
+    assertQueryRowsUnordered("SELECT * FROM t",
+        "Row[1, h1, 1, r1, 1, v1]",
+        "Row[1, h1, 2, r2, 2, v2]",
+        "Row[1, h1, 3, r3, 3, v3]",
+        "Row[1, h1, 4, r4, 4, v4]",
+        "Row[1, h1, 5, r5, 5, v5]",
+        "Row[3, h3, 1, r1, 1, v1]",
+        "Row[3, h3, 2, r2, 2, v2]",
+        "Row[3, h3, 3, r3, 3, v3]",
+        "Row[3, h3, 4, r4, 4, v4]",
+        "Row[3, h3, 5, r5, 5, v5]",
+        "Row[2, h2, 1, r1, 1, v1]",
+        "Row[2, h2, 2, r2, 2, v2]",
+        "Row[2, h2, 3, r3, 3, v3]",
+        "Row[2, h2, 4, r4, 4, v4]",
+        "Row[2, h2, 5, r5, 5, v5]");
   }
 
   @Test
-  public void testRecreateTable() throws Exception {
+  public void testRecreateTable1() throws Exception {
 
-    // Test executing batch statements with recreated tables to verify metadata cache is flushed to
-    // handle new table definition.
+    LOG.info("Test executing batch statements with recreated tables to verify metadata cache is");
+    LOG.info("flushed to handle new table definition.");
     for (int t = 0; t < 3; t++) {
 
       // Create test table.
@@ -215,27 +226,30 @@ public class TestBatchRequest extends BaseCQLTest {
       session.execute(batch);
 
       // Verify the rows are inserted.
-      assertQuery("SELECT * FROM test_batch",
-                  new HashSet<String>(Arrays.asList("Row[2, r1]",
-                                                    "Row[2, r2]",
-                                                    "Row[2, r3]",
-                                                    "Row[2, r4]",
-                                                    "Row[2, r5]",
-                                                    "Row[3, r1]",
-                                                    "Row[3, r2]",
-                                                    "Row[3, r3]",
-                                                    "Row[3, r4]",
-                                                    "Row[3, r5]",
-                                                    "Row[1, r1]",
-                                                    "Row[1, r2]",
-                                                    "Row[1, r3]",
-                                                    "Row[1, r4]",
-                                                    "Row[1, r5]")));
+      assertQueryRowsUnordered("SELECT * FROM test_batch",
+          "Row[2, r1]",
+          "Row[2, r2]",
+          "Row[2, r3]",
+          "Row[2, r4]",
+          "Row[2, r5]",
+          "Row[3, r1]",
+          "Row[3, r2]",
+          "Row[3, r3]",
+          "Row[3, r4]",
+          "Row[3, r5]",
+          "Row[1, r1]",
+          "Row[1, r2]",
+          "Row[1, r3]",
+          "Row[1, r4]",
+          "Row[1, r5]");
 
       // Drop test table.
       session.execute("DROP TABLE test_batch;");
     }
+  }
 
+  @Test
+  public void testRecreateTable2() throws Exception {
     for (int t = 0; t < 3; t++) {
       {
         // Create test table.
@@ -253,22 +267,22 @@ public class TestBatchRequest extends BaseCQLTest {
         session.execute(batch);
 
         // Verify the rows are inserted.
-        assertQuery("SELECT * FROM test_batch",
-                    new HashSet<String>(Arrays.asList("Row[2, 1]",
-                                                      "Row[2, 2]",
-                                                      "Row[2, 3]",
-                                                      "Row[2, 4]",
-                                                      "Row[2, 5]",
-                                                      "Row[3, 1]",
-                                                      "Row[3, 2]",
-                                                      "Row[3, 3]",
-                                                      "Row[3, 4]",
-                                                      "Row[3, 5]",
-                                                      "Row[1, 1]",
-                                                      "Row[1, 2]",
-                                                      "Row[1, 3]",
-                                                      "Row[1, 4]",
-                                                      "Row[1, 5]")));
+        assertQueryRowsUnordered("SELECT * FROM test_batch",
+            "Row[2, 1]",
+            "Row[2, 2]",
+            "Row[2, 3]",
+            "Row[2, 4]",
+            "Row[2, 5]",
+            "Row[3, 1]",
+            "Row[3, 2]",
+            "Row[3, 3]",
+            "Row[3, 4]",
+            "Row[3, 5]",
+            "Row[1, 1]",
+            "Row[1, 2]",
+            "Row[1, 3]",
+            "Row[1, 4]",
+            "Row[1, 5]");
 
         // Drop test table.
         session.execute("DROP TABLE test_batch;");
@@ -290,22 +304,21 @@ public class TestBatchRequest extends BaseCQLTest {
         session.execute(batch);
 
         // Verify the rows are inserted.
-        assertQuery("SELECT * FROM test_batch",
-                    new HashSet<String>(Arrays.asList("Row[2, R1]",
-                                                      "Row[2, R2]",
-                                                      "Row[2, R3]",
-                                                      "Row[2, R4]",
-                                                      "Row[2, R5]",
-                                                      "Row[3, R1]",
-                                                      "Row[3, R2]",
-                                                      "Row[3, R3]",
-                                                      "Row[3, R4]",
-                                                      "Row[3, R5]",
-                                                      "Row[1, R1]",
-                                                      "Row[1, R2]",
-                                                      "Row[1, R3]",
-                                                      "Row[1, R4]",
-                                                      "Row[1, R5]")));
+        assertQueryRowsUnordered("SELECT * FROM test_batch","Row[2, R1]",
+            "Row[2, R2]",
+            "Row[2, R3]",
+            "Row[2, R4]",
+            "Row[2, R5]",
+            "Row[3, R1]",
+            "Row[3, R2]",
+            "Row[3, R3]",
+            "Row[3, R4]",
+            "Row[3, R5]",
+            "Row[1, R1]",
+            "Row[1, R2]",
+            "Row[1, R3]",
+            "Row[1, R4]",
+            "Row[1, R5]");
 
         // Drop test table.
         session.execute("DROP TABLE test_batch;");
@@ -328,22 +341,22 @@ public class TestBatchRequest extends BaseCQLTest {
         session.execute(batch);
 
         // Verify the rows are inserted.
-        assertQuery("SELECT * FROM test_batch",
-                    new HashSet<String>(Arrays.asList("Row[2, 1]",
-                                                      "Row[2, 2]",
-                                                      "Row[2, 3]",
-                                                      "Row[2, 4]",
-                                                      "Row[2, 5]",
-                                                      "Row[3, 1]",
-                                                      "Row[3, 2]",
-                                                      "Row[3, 3]",
-                                                      "Row[3, 4]",
-                                                      "Row[3, 5]",
-                                                      "Row[1, 1]",
-                                                      "Row[1, 2]",
-                                                      "Row[1, 3]",
-                                                      "Row[1, 4]",
-                                                      "Row[1, 5]")));
+        assertQueryRowsUnordered("SELECT * FROM test_batch",
+            "Row[2, 1]",
+            "Row[2, 2]",
+            "Row[2, 3]",
+            "Row[2, 4]",
+            "Row[2, 5]",
+            "Row[3, 1]",
+            "Row[3, 2]",
+            "Row[3, 3]",
+            "Row[3, 4]",
+            "Row[3, 5]",
+            "Row[1, 1]",
+            "Row[1, 2]",
+            "Row[1, 3]",
+            "Row[1, 4]",
+            "Row[1, 5]");
 
         // Drop test table.
         session.execute("DROP TABLE test_batch;");
@@ -381,22 +394,22 @@ public class TestBatchRequest extends BaseCQLTest {
       session.execute(batch);
 
       // Verify the rows are inserted.
-      assertQuery("SELECT * FROM test_batch_error",
-                  new HashSet<String>(Arrays.asList("Row[2, 1]",
-                                                    "Row[2, 2]",
-                                                    "Row[2, 3]",
-                                                    "Row[2, 4]",
-                                                    "Row[2, 5]",
-                                                    "Row[3, 1]",
-                                                    "Row[3, 2]",
-                                                    "Row[3, 3]",
-                                                    "Row[3, 4]",
-                                                    "Row[3, 5]",
-                                                    "Row[1, 1]",
-                                                    "Row[1, 2]",
-                                                    "Row[1, 3]",
-                                                    "Row[1, 4]",
-                                                    "Row[1, 5]")));
+      assertQueryRowsUnordered("SELECT * FROM test_batch_error",
+          "Row[2, 1]",
+          "Row[2, 2]",
+          "Row[2, 3]",
+          "Row[2, 4]",
+          "Row[2, 5]",
+          "Row[3, 1]",
+          "Row[3, 2]",
+          "Row[3, 3]",
+          "Row[3, 4]",
+          "Row[3, 5]",
+          "Row[1, 1]",
+          "Row[1, 2]",
+          "Row[1, 3]",
+          "Row[1, 4]",
+          "Row[1, 5]");
 
       // Drop test table.
       session.execute("DROP TABLE test_batch_error;");
@@ -422,22 +435,22 @@ public class TestBatchRequest extends BaseCQLTest {
       session.execute(batch);
 
       // Verify the rows are inserted.
-      assertQuery("SELECT * FROM test_batch_error",
-                  new HashSet<String>(Arrays.asList("Row[2, 1]",
-                                                    "Row[2, 2]",
-                                                    "Row[2, 3]",
-                                                    "Row[2, 4]",
-                                                    "Row[2, 5]",
-                                                    "Row[3, 1]",
-                                                    "Row[3, 2]",
-                                                    "Row[3, 3]",
-                                                    "Row[3, 4]",
-                                                    "Row[3, 5]",
-                                                    "Row[1, 1]",
-                                                    "Row[1, 2]",
-                                                    "Row[1, 3]",
-                                                    "Row[1, 4]",
-                                                    "Row[1, 5]")));
+      assertQueryRowsUnordered("SELECT * FROM test_batch_error",
+          "Row[2, 1]",
+          "Row[2, 2]",
+          "Row[2, 3]",
+          "Row[2, 4]",
+          "Row[2, 5]",
+          "Row[3, 1]",
+          "Row[3, 2]",
+          "Row[3, 3]",
+          "Row[3, 4]",
+          "Row[3, 5]",
+          "Row[1, 1]",
+          "Row[1, 2]",
+          "Row[1, 3]",
+          "Row[1, 4]",
+          "Row[1, 5]");
 
       // Drop test table.
       session.execute("DROP TABLE test_batch_error;");
@@ -445,5 +458,51 @@ public class TestBatchRequest extends BaseCQLTest {
       // Rerun the batch. Verify that error is raised.
       runInvalidStmt(batch);
     }
+  }
+
+  @Test
+  public void testReadWriteSameRow() throws Exception {
+
+    LOG.info("Create test table.");
+    session.execute("CREATE TABLE test_batch (h INT, r TEXT, v INT, PRIMARY KEY ((h), r));");
+
+    LOG.info("Test writing to the same row twice.");
+    BatchStatement batch = new BatchStatement();
+    batch.add(new SimpleStatement("INSERT INTO test_batch (h, r, v) VALUES (1, 'r1', 11);"));
+    batch.add(new SimpleStatement("INSERT INTO test_batch (h, r, v) VALUES (1, 'r2', 12);"));
+    batch.add(new SimpleStatement("INSERT INTO test_batch (h, r, v) VALUES (1, 'r2', 13);"));
+    session.execute(batch);
+
+
+    LOG.info("Create test table with counter.");
+    session.execute("CREATE TABLE test_counter (h INT, r TEXT, c COUNTER, PRIMARY KEY ((h), r));");
+
+    LOG.info("Test reading and writing different rows are allowed in the same batch.");
+    batch.clear();
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 1 WHERE h = 1 and r = 'r1';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 1 WHERE h = 1 and r = 'r2';"));
+    session.execute(batch);
+
+    LOG.info("Verify the rows are inserted.");
+    assertQueryRowsUnordered("SELECT * FROM test_counter",
+        "Row[1, r1, 1]",
+        "Row[1, r2, 1]");
+
+    LOG.info("Test reading and writing the same rows (new and existing).");
+    batch.clear();
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 2 WHERE h = 1 and r = 'r1';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 3 WHERE h = 1 and r = 'r1';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 4 WHERE h = 1 and r = 'r2';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 5 WHERE h = 1 and r = 'r1';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 6 WHERE h = 1 and r = 'r3';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 7 WHERE h = 1 and r = 'r2';"));
+    batch.add(new SimpleStatement("UPDATE test_counter SET c = c + 8 WHERE h = 1 and r = 'r3';"));
+    session.execute(batch);
+
+    LOG.info("Verify the counter columns are updated properly.");
+    assertQueryRowsUnordered("SELECT * FROM test_counter",
+        "Row[1, r1, 11]",
+        "Row[1, r2, 12]",
+        "Row[1, r3, 14]");
   }
 }

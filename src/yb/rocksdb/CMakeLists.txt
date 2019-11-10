@@ -13,8 +13,6 @@
 
 # RocksDB build.
 
-include(PrecompiledHeader)
-
 PROTOBUF_GENERATE_CPP(
   ROCKSDB_PROTO_SRCS ROCKSDB_PROTO_HDRS ROCKSDB_PROTO_TGTS
   SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
@@ -46,6 +44,7 @@ set(ROCKSDB_SRCS
     db/experimental.cc
     db/event_helpers.cc
     db/file_indexer.cc
+    db/file_numbers.cc
     db/filename.cc
     db/flush_job.cc
     db/flush_scheduler.cc
@@ -59,6 +58,7 @@ set(ROCKSDB_SRCS
     db/memtable_list.cc
     db/merge_helper.cc
     db/merge_operator.cc
+    db/metadata.cc
     db/repair.cc
     db/snapshot_impl.cc
     db/table_cache.cc
@@ -99,6 +99,7 @@ set(ROCKSDB_SRCS
     table/full_filter_block.cc
     table/get_context.cc
     table/index_builder.cc
+    table/index_reader.cc
     table/iterator.cc
     table/merger.cc
     table/meta_blocks.cc
@@ -133,7 +134,7 @@ set(ROCKSDB_SRCS
     util/hash.cc
     util/histogram.cc
     util/instrumented_mutex.cc
-    util/iostats_context.cc
+    util/timeout_error.cc
     utilities/backupable/backupable_db.cc
     utilities/convenience/info_log_finder.cc
     utilities/checkpoint/checkpoint.cc
@@ -177,12 +178,10 @@ set(ROCKSDB_SRCS
     util/options_parser.cc
     util/options_sanity_check.cc
     util/perf_context.cc
-    util/perf_level.cc
     util/random.cc
     util/rate_limiter.cc
     util/slice_transform.cc
     util/statistics.cc
-    util/string_util.cc
     util/sync_point.cc
     util/thread_local.cc
     util/thread_status_impl.cc
@@ -196,7 +195,7 @@ set(ROCKSDB_SRCS
 )
 
 set(CMAKE_CXX_FLAGS
-  "${CMAKE_CXX_FLAGS} -DROCKSDB_LIB_IO_POSIX -DBZIP2 -DSNAPPY -DZLIB \
+  "${CMAKE_CXX_FLAGS} \
    -Wextra -Wsign-compare -Wshadow -Woverloaded-virtual \
    -Wno-missing-field-initializers -Wno-unused-parameter -Wno-unused-variable")
 
@@ -206,7 +205,7 @@ if (IS_CLANG)
 endif()
 
 if (NOT APPLE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOS_LINUX -DROCKSDB_FALLOCATE_PRESENT")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_FALLOCATE_PRESENT")
 endif()
 
 if (${YB_USE_TSAN})
@@ -219,7 +218,7 @@ endif()
 
 add_library(rocksdb ${ROCKSDB_SRCS})
 cotire(rocksdb)
-target_link_libraries(rocksdb gflags gutil snappy bz2 z yb_util opid_proto boost_filesystem)
+target_link_libraries(rocksdb gflags gutil snappy bz2 z yb_common yb_util opid_proto)
 
 add_library(rocksdb_tools
   tools/ldb_cmd.cc
@@ -244,9 +243,11 @@ if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
 endif()
 
 add_library(rocksdb_test_util ${ROCKSDB_TEST_UTIL_SRCS})
-target_link_libraries(rocksdb_test_util gmock rocksdb rocksdb_tools)
+target_link_libraries(rocksdb_test_util gmock rocksdb)
 
 ADD_YB_ROCKSDB_TOOL(sst_dump)
+add_executable(db_bench tools/db_bench.cc tools/db_bench_tool.cc)
+target_link_libraries(db_bench rocksdb)
 ADD_YB_ROCKSDB_TOOL(db_sanity_test)
 ADD_YB_ROCKSDB_TOOL(db_stress)
 ADD_YB_ROCKSDB_TOOL(write_stress)
@@ -302,7 +303,6 @@ ADD_YB_TEST(util/env_test)
 ADD_YB_TEST(util/event_logger_test)
 ADD_YB_TEST(util/filelock_test)
 ADD_YB_TEST(util/histogram_test)
-ADD_YB_TEST(util/iostats_context_test)
 ADD_YB_TEST(util/memenv_test)
 ADD_YB_TEST(util/mock_env_test)
 ADD_YB_TEST(util/options_test)
@@ -321,6 +321,10 @@ ADD_YB_TEST(utilities/transactions/optimistic_transaction_test)
 ADD_YB_TEST(utilities/ttl/ttl_test)
 ADD_YB_TEST(utilities/write_batch_with_index/write_batch_with_index_test)
 
+if(NOT NO_TESTS)
+  target_link_libraries(sst_dump_test rocksdb_tools)
+endif()
+
 if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
 ADD_YB_TEST(db/auto_roll_logger_test)
 ADD_YB_TEST(db/column_family_test)
@@ -337,11 +341,13 @@ ADD_YB_TEST(db/db_inplace_update_test)
 ADD_YB_TEST(db/db_iter_test)
 ADD_YB_TEST(db/db_log_iter_test)
 ADD_YB_TEST(db/db_properties_test)
+ADD_YB_TEST(db/db_sst_test)
 ADD_YB_TEST(db/db_table_properties_test)
 ADD_YB_TEST(db/db_tailing_iter_test)
 ADD_YB_TEST(db/db_test)
 ADD_YB_TEST(db/db_test2)
 ADD_YB_TEST(db/db_universal_compaction_test)
+ADD_YB_TEST(db/db_universal_compaction_deletion_test)
 ADD_YB_TEST(db/db_wal_test)
 ADD_YB_TEST(db/deletefile_test)
 ADD_YB_TEST(db/fault_injection_test)
@@ -358,4 +364,9 @@ ADD_YB_TEST(utilities/backupable/backupable_db_test)
 ADD_YB_TEST(utilities/checkpoint/checkpoint_test)
 ADD_YB_TEST(utilities/memory/memory_test)
 ADD_YB_TEST(utilities/transactions/transaction_test)
+
+if(NOT NO_TESTS)
+  target_link_libraries(reduce_levels_test rocksdb_tools)
+endif()
+
 endif()

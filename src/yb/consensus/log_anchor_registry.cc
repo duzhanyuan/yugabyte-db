@@ -31,10 +31,11 @@
 //
 
 #include "yb/consensus/log_anchor_registry.h"
-#include "yb/consensus/opid_util.h"
 
 #include <mutex>
 #include <string>
+
+#include "yb/consensus/opid_util.h"
 
 #include "yb/gutil/strings/substitute.h"
 
@@ -62,12 +63,11 @@ void LogAnchorRegistry::Register(int64_t log_index,
 }
 
 Status LogAnchorRegistry::UpdateRegistration(int64_t log_index,
-                                             const std::string& owner,
                                              LogAnchor* anchor) {
   std::lock_guard<simple_spinlock> l(lock_);
   RETURN_NOT_OK_PREPEND(UnregisterUnlocked(anchor),
                         "Unable to swap registration, anchor not registered")
-  RegisterUnlocked(log_index, owner, anchor);
+  RegisterUnlocked(log_index, std::string(), anchor);
   return Status::OK();
 }
 
@@ -86,7 +86,8 @@ Status LogAnchorRegistry::GetEarliestRegisteredLogIndex(int64_t* log_index) {
   std::lock_guard<simple_spinlock> l(lock_);
   auto iter = anchors_.begin();
   if (iter == anchors_.end()) {
-    return STATUS(NotFound, "No anchors in registry");
+    static Status no_anchors_status = STATUS(NotFound, "No anchors in registry");
+    return no_anchors_status;
   }
 
   // Since this is a sorted map, the first element is the one we want.
@@ -102,7 +103,7 @@ size_t LogAnchorRegistry::GetAnchorCountForTests() const {
 std::string LogAnchorRegistry::DumpAnchorInfo() const {
   string buf;
   std::lock_guard<simple_spinlock> l(lock_);
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
+  MonoTime now = MonoTime::Now();
   for (const AnchorMultiMap::value_type& entry : anchors_) {
     const LogAnchor* anchor = entry.second;
     DCHECK(anchor->is_registered);
@@ -122,9 +123,11 @@ void LogAnchorRegistry::RegisterUnlocked(int64_t log_index,
   DCHECK(!anchor->is_registered);
 
   anchor->log_index = log_index;
-  anchor->owner.assign(owner);
+  if (!owner.empty()) { // Keep existing owner during registration update.
+    anchor->owner = owner;
+  }
   anchor->is_registered = true;
-  anchor->when_registered = MonoTime::Now(MonoTime::FINE);
+  anchor->when_registered = MonoTime::Now();
   AnchorMultiMap::value_type value(log_index, anchor);
   anchors_.insert(value);
 }
@@ -174,7 +177,7 @@ void MinLogIndexAnchorer::AnchorIfMinimum(int64_t log_index) {
     registry_->Register(minimum_log_index_, owner_, &anchor_);
   } else if (log_index < minimum_log_index_) {
     minimum_log_index_ = log_index;
-    CHECK_OK(registry_->UpdateRegistration(minimum_log_index_, owner_, &anchor_));
+    CHECK_OK(registry_->UpdateRegistration(minimum_log_index_, &anchor_));
   }
 }
 

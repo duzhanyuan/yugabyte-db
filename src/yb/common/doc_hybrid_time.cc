@@ -23,9 +23,9 @@
 using yb::util::VarInt;
 using yb::util::FastEncodeDescendingSignedVarInt;
 using yb::util::FastDecodeDescendingSignedVarInt;
-using yb::util::FormatBytesAsStr;
-using yb::util::FormatSliceAsStr;
-using yb::util::QuotesType;
+using yb::FormatBytesAsStr;
+using yb::FormatSliceAsStr;
+using yb::QuotesType;
 using yb::util::to_char_ptr;
 using yb::util::to_uchar_ptr;
 
@@ -34,9 +34,11 @@ using strings::SubstituteAndAppend;
 
 namespace yb {
 
-// It does not really matter what write id we use here. We determine DocHybridTime validity
-// based on the HybridTime validity.
-const DocHybridTime DocHybridTime::kInvalid = DocHybridTime(HybridTime::kInvalidHybridTime);
+// It does not really matter what write id we use here. We determine DocHybridTime validity based
+// on its HybridTime component's validity. However, given that HybridTime::kInvalid is close to the
+// highest possible value of the underlying in-memory representation of HybridTime, we use
+// kMaxWriteId for the write id portion of this constant for consistency.
+const DocHybridTime DocHybridTime::kInvalid = DocHybridTime(HybridTime::kInvalid, kMaxWriteId);
 
 const DocHybridTime DocHybridTime::kMin = DocHybridTime(HybridTime::kMin, 0);
 const DocHybridTime DocHybridTime::kMax = DocHybridTime(HybridTime::kMax, kMaxWriteId);
@@ -86,22 +88,17 @@ Status DocHybridTime::DecodeFrom(Slice *slice) {
   const size_t previous_size = slice->size();
   {
     // Currently we just ignore the generation number as it should always be 0.
-    int64_t ht_generation_number;
-    RETURN_NOT_OK(FastDecodeDescendingSignedVarInt(slice, &ht_generation_number));
+    RETURN_NOT_OK(FastDecodeDescendingSignedVarInt(slice));
+    int64_t decoded_micros =
+        kYugaByteMicrosecondEpoch + VERIFY_RESULT(FastDecodeDescendingSignedVarInt(slice));
 
-    int64_t decoded_micros = 0;
-    RETURN_NOT_OK(FastDecodeDescendingSignedVarInt(slice, &decoded_micros));
-    decoded_micros += kYugaByteMicrosecondEpoch;
-
-    int64_t decoded_logical = 0;
-    RETURN_NOT_OK(FastDecodeDescendingSignedVarInt(slice, &decoded_logical));
+    int64_t decoded_logical = VERIFY_RESULT(FastDecodeDescendingSignedVarInt(slice));
 
     hybrid_time_ = HybridTime::FromMicrosecondsAndLogicalValue(decoded_micros, decoded_logical);
   }
 
-  int64_t decoded_shifted_write_id = 0;
   const auto ptr_before_decoding_write_id = slice->data();
-  RETURN_NOT_OK(FastDecodeDescendingSignedVarInt(slice, &decoded_shifted_write_id));
+  int64_t decoded_shifted_write_id = VERIFY_RESULT(FastDecodeDescendingSignedVarInt(slice));
 
   if (decoded_shifted_write_id < 0) {
     return STATUS_SUBSTITUTE(
@@ -143,12 +140,19 @@ Status DocHybridTime::FullyDecodeFrom(const Slice& encoded) {
   return Status::OK();
 }
 
-Status DocHybridTime::DecodeFromEnd(const Slice& encoded_key_with_ht_at_end) {
+Result<DocHybridTime> DocHybridTime::DecodeFromEnd(Slice* encoded_key_with_ht_at_end) {
   int encoded_size = 0;
-  RETURN_NOT_OK(CheckAndGetEncodedSize(encoded_key_with_ht_at_end, &encoded_size));
-  Slice s(encoded_key_with_ht_at_end.data() + encoded_key_with_ht_at_end.size() - encoded_size,
-          encoded_size);
-  return FullyDecodeFrom(s);
+  RETURN_NOT_OK(CheckAndGetEncodedSize(*encoded_key_with_ht_at_end, &encoded_size));
+  Slice s(encoded_key_with_ht_at_end->end() - encoded_size, encoded_size);
+  DocHybridTime result;
+  RETURN_NOT_OK(result.FullyDecodeFrom(s));
+  encoded_key_with_ht_at_end->remove_suffix(encoded_size);
+  return result;
+}
+
+Status DocHybridTime::DecodeFromEnd(Slice encoded_key_with_ht_at_end) {
+  *this = VERIFY_RESULT(DecodeFromEnd(&encoded_key_with_ht_at_end));
+  return Status::OK();
 }
 
 string DocHybridTime::ToString() const {
@@ -157,11 +161,15 @@ string DocHybridTime::ToString() const {
   }
 
   string s = hybrid_time_.ToDebugString();
-  s.resize(s.length() - 1);
-  if (write_id_ == kMaxWriteId) {
-    s += ", w=Max)";
+  if (s[s.length() - 1] == '}') {
+    s.resize(s.length() - 2);
   } else {
-    SubstituteAndAppend(&s, ", w=$0)", write_id_);
+    s.insert(2, "{ ");
+  }
+  if (write_id_ == kMaxWriteId) {
+    s += " w: Max }";
+  } else {
+    SubstituteAndAppend(&s, " w: $0 }", write_id_);
   }
   return s;
 }

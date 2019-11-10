@@ -13,9 +13,14 @@
 package org.yb.cql;
 
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.fail;
 
+import org.yb.YBTestRunner;
+
+import org.junit.runner.RunWith;
+
+@RunWith(value=YBTestRunner.class)
 public class TestUseKeyspace extends BaseCQLTest {
 
   private void testCreateExistingKeyspace(String keyspace) throws Exception {
@@ -44,21 +49,9 @@ public class TestUseKeyspace extends BaseCQLTest {
     }
   }
 
-  private void testUseProhibitedKeyspace(String keyspace) throws Exception {
-    try {
-      useKeyspace(keyspace);
-      fail("USE \"" + keyspace + "\" did not fail");
-    } catch (com.datastax.driver.core.exceptions.ServerError e) {
-      LOG.info("Expected ServerError exception", e);
-    }
-  }
-
   @Test
   public void testUseKeyspace() throws Exception {
     LOG.info("Begin test testUseKeyspace()");
-
-    // Using of existing default keyspace is prohibited now.
-    testUseProhibitedKeyspace(DEFAULT_KEYSPACE);
 
     // Use existing system keyspace.
     testUseKeyspace("system", false);

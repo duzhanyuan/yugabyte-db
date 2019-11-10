@@ -22,7 +22,7 @@
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/primitive_value.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/rocksdb/util/string_util.h"
+#include "yb/util/string_util.h"
 
 namespace yb {
 namespace docdb {
@@ -40,13 +40,21 @@ class DocPath {
     AppendPrimitiveValues(&subkeys_, subkeys...);
   }
 
+  template<class... T>
+  DocPath(const Slice& encoded_doc_key, T... subkeys)
+      : encoded_doc_key_(encoded_doc_key) {
+    AppendPrimitiveValues(&subkeys_, subkeys...);
+  }
+
   DocPath(const KeyBytes& encoded_doc_key, const vector<PrimitiveValue>& subkeys)
       : encoded_doc_key_(encoded_doc_key),
         subkeys_(subkeys) {
   }
 
   const KeyBytes& encoded_doc_key() const { return encoded_doc_key_; }
+
   int num_subkeys() const { return subkeys_.size(); }
+
   const PrimitiveValue& subkey(int i) const {
     assert(0 <= i && i < num_subkeys());
     return subkeys_[i];

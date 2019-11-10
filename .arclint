@@ -1,5 +1,14 @@
 {
-  "exclude":"(\\.l$|Makefile$|src/yb/common/ql_type.h$|src/yb/ql/kwlist.h$)",
+  "exclude": [
+     "(\\.l$)",
+     "(Makefile$)",
+     "(src/yb/common/ql_type.h$)",
+     "(\\.sql$)",
+     "(\\.txt$)",
+     "(^src/postgres/.*$)",
+     "(^[.]gitmodules$)",
+     "(^managed/src/main/resources/v1.routes$)"
+  ],
   "linters": {
     "text": {
       "type": "text",
@@ -8,7 +17,12 @@
         "(^thirdparty/thirdparty_src_checksums[.]txt$)",
         "(^java/yb-client/src/test/java/org/yb/client/TestYBClient[.]java$)",
         "(^cmake_modules/cotire[.]cmake$)",
-        "(^README[.]md$)"
+        "(^cmake_modules/FindBoost[.]cmake$)",
+        "(^README[.]md$)",
+        "(^java/pom[.]xml$)",
+        "(^.*[.]patch$)",
+        "(java/yb-cdc/pom.xml)",
+        "(java/yb-cdc/README.md)"
       ]
     },
     "pycodestyle": {
@@ -17,9 +31,21 @@
       "exclude": "(^thirdparty/|^[.]ycm_extra_conf[.]py$)",
       "bin": "pycodestyle"
     },
-    "googleccplint": {
+    "googlecpplint": {
       "type": "googlecpplint",
-      "exclude": "(src/yb/ql/kwlist.h)",
+      "exclude": [
+        "(^src/yb/yql/cql/ql/kwlist[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_undef[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_cxx_decl[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_common[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_c_wrapper_common[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_c_wrapper_decl[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_c_wrapper_impl[.]h$)",
+        "(^src/yb/yql/pggate/if_macros_c_pg_wrapper_inl[.]h$)",
+        "(^src/yb/yql/pggate/pg_api_example_if[.]h$)",
+        "(^src/yb/yql/pggate/pg_txn_manager_if[.]h$)",
+        "(^src/yb/yql/pggate/pggate_if[.]h$)"
+      ],
       "include": [
         "(\\.cpp$)",
         "(\\.cc$)",

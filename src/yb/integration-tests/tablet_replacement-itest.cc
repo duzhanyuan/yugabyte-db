@@ -72,10 +72,10 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
   int num_tservers = 5;
   vector<string> master_flags;
   master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  master_flags.push_back("--replication_factor=5");
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, num_tservers));
 
   TestWorkload workload(cluster_.get());
-  workload.set_num_replicas(num_tservers);
   workload.Setup(); // Easy way to create a new tablet.
 
   const int kLeaderIndex = 0;
@@ -287,7 +287,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   ASSERT_OK(itest::WaitForServersToAgree(timeout, ts_map_, tablet_id, 1)); // Wait for NO_OP.
 
   // Write a single row.
-  ASSERT_OK(WriteSimpleTestRow(leader_ts, tablet_id, RowOperationsPB::INSERT, 0, 0, "", timeout));
+  ASSERT_OK(WriteSimpleTestRow(leader_ts, tablet_id, 0, 0, "", timeout));
 
   // Delay tablet applies in order to delay COMMIT messages to trigger KUDU-1233.
   // Then insert another row.
@@ -303,9 +303,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   rpc::RpcController rpc;
   rpc.set_timeout(timeout);
   req.set_tablet_id(tablet_id);
-  Schema schema = GetSimpleTestSchema();
-  ASSERT_OK(SchemaToPB(schema, req.mutable_schema()));
-  AddTestRowToPB(RowOperationsPB::INSERT, schema, 1, 1, "", req.mutable_row_operations());
+  AddTestRowInsert(1, 1, "", &req);
   leader_ts->tserver_proxy->WriteAsync(req, &resp, &rpc, [&latch]() { latch.CountDown(); });
 
   // Wait for the replicate to show up (this doesn't wait for COMMIT messages).

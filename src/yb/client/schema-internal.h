@@ -48,22 +48,15 @@ class YBColumnSpec::Data {
         has_type(false),
         has_order(false),
         sorting_type(ColumnSchema::SortingType::kNotSpecified),
-        has_encoding(false),
-        has_compression(false),
-        has_block_size(false),
         has_nullable(false),
         primary_key(false),
         hash_primary_key(false),
         static_column(false),
-        has_default(false),
-        default_val(NULL),
         is_counter(false),
-        remove_default(false),
         has_rename_to(false) {
   }
 
   ~Data() {
-    delete default_val;
   }
 
   const std::string name;
@@ -76,15 +69,6 @@ class YBColumnSpec::Data {
 
   ColumnSchema::SortingType sorting_type;
 
-  bool has_encoding;
-  EncodingType encoding;
-
-  bool has_compression;
-  CompressionType compression;
-
-  bool has_block_size;
-  int32_t block_size;
-
   bool has_nullable;
   bool nullable;
 
@@ -93,13 +77,7 @@ class YBColumnSpec::Data {
 
   bool static_column;
 
-  bool has_default;
-  YBValue* default_val; // Owned.
-
   bool is_counter;
-
-  // For ALTER
-  bool remove_default;
 
   // For ALTER
   bool has_rename_to;

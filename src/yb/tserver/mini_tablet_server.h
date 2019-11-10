@@ -36,6 +36,7 @@
 
 #include "yb/common/schema.h"
 #include "yb/gutil/macros.h"
+#include "yb/tablet/tablet.h"
 #include "yb/tserver/tablet_server_options.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status.h"
@@ -55,8 +56,12 @@ class TabletServer;
 // An in-process tablet server meant for use in test cases.
 class MiniTabletServer {
  public:
+  static Result<std::unique_ptr<MiniTabletServer>> CreateMiniTabletServer(const string& fs_root,
+                                                                          uint16_t rpc_port,
+                                                                          int index = 0);
+
   MiniTabletServer(const std::string& fs_root, uint16_t rpc_port,
-                   const TabletServerOptions& extra_opts = TabletServerOptions());
+                   const TabletServerOptions& extra_opts, int index = 0);
   ~MiniTabletServer();
 
   // Return the options which will be used to start the tablet server.
@@ -75,11 +80,17 @@ class MiniTabletServer {
   CHECKED_STATUS WaitStarted();
 
   void Shutdown();
-  void FlushTablets();
-  void CleanTabletLogs();
+  CHECKED_STATUS FlushTablets(
+      tablet::FlushMode mode = tablet::FlushMode::kSync,
+      tablet::FlushFlags flags = tablet::FlushFlags::kAll);
+  CHECKED_STATUS CompactTablets();
+  CHECKED_STATUS SwitchMemtables();
+  CHECKED_STATUS CleanTabletLogs();
 
-  // Restart a tablet server on the same RPC and webserver ports.
+  // Stop and start the tablet server on the same RPC and webserver ports. The tserver must be
+  // running.
   CHECKED_STATUS Restart();
+  CHECKED_STATUS RestartStoppedServer();
 
   // Add a new tablet to the test server, use the default consensus configuration.
   //
@@ -111,13 +122,16 @@ class MiniTabletServer {
 
   void FailHeartbeats();
 
+  void SetIsolated(bool isolated);
+
  private:
   bool started_;
-
   TabletServerOptions opts_;
+  int index_;
 
   gscoped_ptr<FsManager> fs_manager_;
   gscoped_ptr<TabletServer> server_;
+  std::unique_ptr<Tunnel> tunnel_;
 };
 
 } // namespace tserver

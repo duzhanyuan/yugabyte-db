@@ -62,7 +62,6 @@ YRPC_GENERATE(
 list(APPEND CONSENSUS_YRPC_SRCS opid_util.cc)
 set(CONSENSUS_YRPC_LIBS
   backup_proto
-  cfile_proto
   consensus_metadata_proto
   yrpc
   yb_common_proto
@@ -101,6 +100,7 @@ set(LOG_SRCS
   log_index.cc
   log_reader.cc
   log_metrics.cc
+  ${LOG_SRCS_EXTENSIONS}
 )
 
 add_library(log ${LOG_SRCS})
@@ -125,7 +125,8 @@ set(CONSENSUS_SRCS
   quorum_util.cc
   raft_consensus.cc
   replica_state.cc
-)
+  replicate_msgs_holder.cc
+  retryable_requests.cc)
 
 add_library(consensus ${CONSENSUS_SRCS})
 cotire(consensus)
@@ -137,10 +138,10 @@ target_link_libraries(consensus
   protobuf)
 
 set(YB_TEST_LINK_LIBS
-  log
   consensus
+  log
+  rpc_test_util
   tserver
-  cfile
   tablet
   yb_util
   ${YB_MIN_TEST_LIBS}
@@ -158,6 +159,7 @@ ADD_YB_TEST(mt-log-test)
 ADD_YB_TEST(quorum_util-test)
 ADD_YB_TEST(raft_consensus_quorum-test)
 ADD_YB_TEST(replica_state-test)
+ADD_YB_TEST(log_util-test)
 
 set_source_files_properties(raft_consensus-test.cc PROPERTIES COMPILE_FLAGS
   "-Wno-inconsistent-missing-override")

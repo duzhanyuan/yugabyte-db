@@ -29,7 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-// Tool to dump tablets, rowsets, and blocks
+// Tool to dump tablets
 
 #include "yb/tools/fs_tool.h"
 
@@ -69,10 +69,7 @@ using strings::Substitute;
 namespace {
 
 enum CommandType {
-  DUMP_TABLET_BLOCKS,
   DUMP_TABLET_DATA,
-  DUMP_ROWSET,
-  DUMP_CFILE_BLOCK,
   PRINT_TABLET_META,
   PRINT_UUID,
 };
@@ -89,12 +86,6 @@ struct CommandHandler {
 const vector<CommandHandler> kCommandHandlers = {
     CommandHandler(DUMP_TABLET_DATA, "dump_tablet_data",
                    "Dump a tablet's data (requires a tablet id)"),
-    CommandHandler(DUMP_TABLET_BLOCKS, "dump_tablet_blocks",
-                   "Dump a tablet's constituent blocks (requires a tablet id)"),
-    CommandHandler(DUMP_ROWSET, "dump_rowset",
-                   "Dump a rowset (requires a tablet id and an index)"),
-    CommandHandler(DUMP_CFILE_BLOCK, "dump_block",
-                   "Dump a cfile block (requires a block id)"),
     CommandHandler(PRINT_TABLET_META, "print_meta",
                    "Print a tablet metadata (requires a tablet id)"),
     CommandHandler(PRINT_UUID, "print_uuid",
@@ -156,7 +147,6 @@ static int FsDumpToolMain(int argc, char** argv) {
 
   switch (cmd) {
     case DUMP_TABLET_DATA:
-    case DUMP_TABLET_BLOCKS:
     {
       if (argc < 3) {
         Usage(argv[0],
@@ -165,38 +155,10 @@ static int FsDumpToolMain(int argc, char** argv) {
                          argv[0]));
         return 2;
       }
-      if (cmd == DUMP_TABLET_DATA) {
-        CHECK_OK(fs_tool.DumpTabletData(argv[2]));
-      } else if (cmd == DUMP_TABLET_BLOCKS) {
-        CHECK_OK(fs_tool.DumpTabletBlocks(argv[2], opts, 0));
-      }
+      CHECK_OK(fs_tool.DumpTabletData(argv[2]));
       break;
     }
 
-    case DUMP_ROWSET: {
-      if (argc < 4) {
-        Usage(argv[0],
-              Substitute("dump_rowset requires tablet id and rowset index: $0"
-                         "dump_rowset <tablet_id> <rowset_index>",
-                         argv[0]));
-        return 2;
-      }
-      uint32_t rowset_idx;
-      CHECK(safe_strtou32(argv[3], &rowset_idx))
-          << "Invalid index specified: " << argv[2];
-      CHECK_OK(fs_tool.DumpRowSet(argv[2], rowset_idx, opts, 0));
-      break;
-    }
-    case DUMP_CFILE_BLOCK: {
-      if (argc < 3) {
-        Usage(argv[0],
-              Substitute("dump_block requires a block id: $0"
-                         "dump_block <block_id>", argv[0]));
-        return 2;
-      }
-      CHECK_OK(fs_tool.DumpCFileBlock(argv[2], opts, 0));
-      break;
-    }
     case PRINT_TABLET_META: {
       if (argc < 3) {
         Usage(argv[0], Substitute("print_meta requires a tablet id: $0"

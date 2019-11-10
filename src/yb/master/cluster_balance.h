@@ -22,13 +22,19 @@
 #include <unordered_set>
 #include <vector>
 #include <atomic>
+#include <list>
+#include <boost/circular_buffer.hpp>
 
 #include "yb/master/catalog_manager.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/util/random.h"
 #include "yb/master/cluster_balance_util.h"
 
+DECLARE_int32(load_balancer_max_concurrent_tablet_remote_bootstraps);
+DECLARE_int32(load_balancer_max_over_replicated_tablets);
+DECLARE_int32(load_balancer_max_concurrent_adds);
 DECLARE_int32(load_balancer_max_concurrent_moves);
+DECLARE_int32(load_balancer_max_concurrent_removals);
 
 namespace yb {
 namespace master {
@@ -73,66 +79,25 @@ class ClusterLoadBalancer {
   // Executes one run of the load balancing algorithm. This currently does not persist any state,
   // so it needs to scan the in-memory tablet and TS data in the CatalogManager on every run and
   // create a new ClusterLoadState object.
-  void RunLoadBalancer();
+  virtual void RunLoadBalancer(Options* options = nullptr);
 
   // Sets whether to enable or disable the load balancer, on demand.
   void SetLoadBalancerEnabled(bool is_enabled) { is_enabled_ = is_enabled; }
+
+  CHECKED_STATUS IsIdle() const;
 
   //
   // Catalog manager indirection methods.
   //
  protected:
-  class Options {
-   public:
-    // If variance between load on TS goes past this number, we should try to balance.
-    double kMinLoadVarianceToBalance = 2.0;
-
-    // If variance between leader load on TS goes past this number, we should try to balance.
-    double kMinLeaderLoadVarianceToBalance = 2.0;
-
-    // Whether to limit the number of tablets being spun up on the cluster at any given time.
-    bool kAllowLimitStartingTablets = true;
-
-    // Max number of tablets being started across the cluster, if we enable limiting this.
-    int kMaxStartingTablets = 3;
-
-    // Whether to limit the number of tablets that have more peers than configured at any given
-    // time.
-    bool kAllowLimitOverReplicatedTablets = true;
-
-    // Max number of running tablet replicas that are over the configured limit.
-    int kMaxOverReplicatedTablets = 3;
-
-    // Max number of over-replicated tablet peer removals to do in any one run of the load balancer.
-    int kMaxConcurrentRemovals = FLAGS_load_balancer_max_concurrent_moves;
-
-    // Max number of tablet peer replicas to add in any one run of the load balancer.
-    int kMaxConcurrentAdds = FLAGS_load_balancer_max_concurrent_moves;
-
-    // Max number of tablet leaders on tablet servers to move in any one run of the load balancer.
-    int kMaxConcurrentLeaderMoves = FLAGS_load_balancer_max_concurrent_moves;
-
-    // TODO(bogdan): actually use these...
-    // TODO(bogdan): add state for leaders starting remote bootstraps, to limit on that end too.
-
-    // Max number of tablets being started for any one given TS.
-    int kMaxStartingTabletsPerTS = 1;
-
-    // Max number of tablets being bootstrapped from any one given TS.
-    int kMaxBootstrappingTabletsPerLeaderTS = 1;
-  };
-
-  // The knobs we use for tweaking the flow of the algorithm.
-  Options options_;
-
   //
   // Indirection methods to CatalogManager that we override in the subclasses (or testing).
   //
 
-  // Get the list of live TSDescriptors.
-  virtual void GetAllLiveDescriptors(TSDescriptorVector* ts_descs) const;
+  // Get the list of all live TSDescriptors which reported their tablets.
+  virtual void GetAllReportedDescriptors(TSDescriptorVector* ts_descs) const;
 
-  // Get access to the tablet map across the cluster.
+    // Get access to the tablet map across the cluster.
   virtual const TabletInfoMap& GetTabletMap() const;
 
   // Get access to the table map.
@@ -147,10 +112,14 @@ class ClusterLoadBalancer {
   // Get the blacklist information.
   virtual const BlacklistPB& GetServerBlacklist() const;
 
+  // Get the leader blacklist information.
+  virtual const BlacklistPB& GetLeaderBlacklist() const;
+
   // Should skip load-balancing of this table?
   virtual bool SkipLoadBalancing(const TableInfo& table) const;
 
-  // Increment the provided variables by the number of pending tasks that were found.
+  // Increment the provided variables by the number of pending tasks that were found. Do not call
+  // more than once for the same table because it also modifies the internal state.
   virtual void CountPendingTasks(const TableId& table_uuid,
                                  int* pending_add_replica_tasks,
                                  int* pending_remove_replica_tasks,
@@ -166,48 +135,52 @@ class ClusterLoadBalancer {
   // adding or removing the peer at ts_uuid, based on the is_add argument. Removing the peer
   // is optional. When neither adding nor removing peer, it means just moving a leader from one
   // tablet server to another. If new_leader_ts_uuid is empty, a server will be picked by random
-  // to be the new leader.
+  // to be the new leader. Also takes in the role of the tablet for the creation flow.
   virtual void SendReplicaChanges(
       scoped_refptr<TabletInfo> tablet, const TabletServerId& ts_uuid, const bool is_add,
       const bool should_remove_leader, const TabletServerId& new_leader_ts_uuid = "");
+
+  // Returns default member type for newly created replicas (PRE_VOTER).
+  virtual consensus::RaftPeerPB::MemberType GetDefaultMemberType();
 
   //
   // Higher level methods and members.
   //
 
   // Recreates the ClusterLoadState object.
-  void ResetState();
+  virtual void ResetState();
 
   // Goes over the tablet_map_ and the set of live TSDescriptors to compute the load distribution
-  // across the tablets for the given table. Returns false if we encounter transient errors that
-  // should stop the load balancing.
-  virtual bool AnalyzeTablets(const TableId& table_uuid);
+  // across the tablets for the given table. Returns an OK status if the method succeeded or an
+  // error if there are transient errors in updating the internal state.
+  virtual CHECKED_STATUS AnalyzeTablets(const TableId& table_uuid);
 
   // Processes any required replica additions, as part of moving load from a highly loaded TS to
   // one that is less loaded.
   //
   // Returns true if a move was actually made.
-  bool HandleAddReplicas(
+  Result<bool> HandleAddReplicas(
       TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts);
 
   // Processes any required replica removals, as part of having added an extra replica to a
   // tablet's set of peers, which caused its quorum to be larger than the configured number.
   //
   // Returns true if a move was actually made.
-  bool HandleRemoveReplicas(TabletId* out_tablet_id, TabletServerId* out_from_ts);
+  Result<bool> HandleRemoveReplicas(TabletId* out_tablet_id, TabletServerId* out_from_ts);
 
   // Methods for load preparation, called by ClusterLoadBalancer while analyzing tablets and
   // building the initial state.
 
   // Method called when initially analyzing tablets, to build up load and usage information.
-  // Returns false only if there are transient errors in updating the internal state.
-  bool UpdateTabletInfo(TabletInfo* tablet);
+  // Returns an OK status if the method succeeded or an error if there are transient errors in
+  // updating the internal state.
+  virtual CHECKED_STATUS UpdateTabletInfo(TabletInfo* tablet);
 
   // If a tablet is under-replicated, or has certain placements that have less than the minimum
   // required number of replicas, we need to add extra tablets to its peer set.
   //
   // Returns true if a move was actually made.
-  bool HandleAddIfMissingPlacement(TabletId* out_tablet_id, TabletServerId* out_to_ts);
+  Result<bool> HandleAddIfMissingPlacement(TabletId* out_tablet_id, TabletServerId* out_to_ts);
 
   // If we find a tablet with peers that violate the placement information, we want to move load
   // away from the invalid placement peers, to new peers that are valid. To ensure we do not
@@ -215,7 +188,7 @@ class ClusterLoadBalancer {
   // over-replicating the tablet temporarily.
   //
   // Returns true if a move was actually made.
-  bool HandleAddIfWrongPlacement(
+  Result<bool> HandleAddIfWrongPlacement(
       TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts);
 
   // If we find a tablet with peers that violate the placement information, we first over-replicate
@@ -223,12 +196,12 @@ class ClusterLoadBalancer {
   // on the remove path, here.
   //
   // Returns true if a move was actually made.
-  bool HandleRemoveIfWrongPlacement(TabletId* out_tablet_id, TabletServerId* out_from_ts);
+  Result<bool> HandleRemoveIfWrongPlacement(TabletId* out_tablet_id, TabletServerId* out_from_ts);
 
   // Processes any tablet leaders that are on a highly loaded tablet server and need to be moved.
   //
   // Returns true if a move was actually made.
-  virtual bool HandleLeaderMoves(
+  virtual Result<bool> HandleLeaderMoves(
       TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts);
 
   // Go through sorted_load_ and figure out which tablet to rebalance and from which TS that is
@@ -236,9 +209,10 @@ class ClusterLoadBalancer {
   //
   // Returns true if we could find a tablet to rebalance and sets the three output parameters.
   // Returns false otherwise.
-  bool GetLoadToMove(TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts);
+  Result<bool> GetLoadToMove(
+      TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts);
 
-  bool GetTabletToMove(
+  Result<bool> GetTabletToMove(
       const TabletServerId& from_ts, const TabletServerId& to_ts, TabletId* moving_tablet_id);
 
   // Go through sorted_leader_load_ and figure out which leader to rebalance and from which TS
@@ -246,25 +220,26 @@ class ClusterLoadBalancer {
   //
   // Returns true if we could find a leader to rebalance and sets the three output parameters.
   // Returns false otherwise.
-  bool GetLeaderToMove(TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts);
+  Result<bool> GetLeaderToMove(
+      TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts);
 
   // Issue the change config and modify the in-memory state for moving a replica from one tablet
   // server to another.
-  void MoveReplica(
+  CHECKED_STATUS MoveReplica(
       const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts);
 
   // Issue the change config and modify the in-memory state for adding a replica on the specified
   // tablet server.
-  void AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts);
+  CHECKED_STATUS AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts);
 
   // Issue the change config and modify the in-memory state for removing a replica on the specified
   // tablet server.
-  void RemoveReplica(
+  CHECKED_STATUS RemoveReplica(
       const TabletId& tablet_id, const TabletServerId& ts_uuid, const bool stepdown_if_leader);
 
   // Issue the change config and modify the in-memory state for moving a tablet leader on the
   // specified tablet server to the other specified tablet server.
-  void MoveLeader(
+  CHECKED_STATUS MoveLeader(
       const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts);
 
   // Methods called for returning tablet id sets, for figuring out tablets to move around.
@@ -277,7 +252,7 @@ class ClusterLoadBalancer {
 
   // Returns true when not choosing a leader as victim during normal load balance move operation.
   // Currently skips leader for RF=1 case only.
-  bool SkipLeaderAsVictim(const TabletId& tablet_id) const;
+  Result<bool> ShouldSkipLeaderAsVictim(const TabletId& tablet_id) const;
 
   //
   // Generic load information methods.
@@ -286,15 +261,18 @@ class ClusterLoadBalancer {
   // Get the total number of extra replicas.
   int get_total_over_replication() const;
 
+  int get_total_under_replication() const;
+
   // Convenience methods for getting totals of starting or running tablets.
   int get_total_starting_tablets() const;
   int get_total_running_tablets() const;
 
   int get_total_wrong_placement() const;
   int get_total_blacklisted_servers() const;
+  int get_total_leader_blacklisted_servers() const;
 
   // The state of the load in the cluster, as far as this run of the algorithm is concerned.
-  std::unique_ptr<YB_EDITION_NS_PREFIX ClusterLoadState> state_;
+  std::unique_ptr<ClusterLoadState> state_;
 
   // The catalog manager of the Master that actually has the Tablet and TS state. The object is not
   // managed by this class, but by the Master's unique_ptr.
@@ -305,16 +283,40 @@ class ClusterLoadBalancer {
  private:
   // Returns true if at least one member in the tablet's configuration is transitioning into a
   // VOTER, but it's not a VOTER yet.
-  bool ConfigMemberInTransitionMode(const TabletId& tablet_id) const;
+  Result<bool> IsConfigMemberInTransitionMode(const TabletId& tablet_id) const;
 
   // Dump the sorted load on tservers (it is usually per table).
   void DumpSortedLoad() const;
+
+  // Report unusual state at the beginning of an LB run which may prevent LB from making moves.
+  void ReportUnusualLoadBalancerState() const;
 
   // Random number generator for picking items at random from sets, using ReservoirSample.
   ThreadSafeRandom random_;
 
   // Controls whether to run the load balancing algorithm or not.
   std::atomic<bool> is_enabled_;
+
+  // Information representing activity of load balancer.
+  struct ActivityInfo {
+    uint32_t table_tasks = 0;
+    uint32_t tserver_tasks = 0;
+    uint32_t master_errors = 0;
+
+    bool IsIdle() const {
+      return table_tasks == 0 && tserver_tasks == 0 && master_errors == 0;
+    }
+  };
+
+  // Circular buffer of load balancer activity.
+  boost::circular_buffer<ActivityInfo> cbuf_activities_;
+
+  // Summary of circular buffer of load balancer activity.
+  int num_idle_runs_ = 0;
+  std::atomic<bool> is_idle_ {true};
+
+  // Record load balancer activity for tables and tservers.
+  void RecordActivity(uint32_t master_errors);
 
   DISALLOW_COPY_AND_ASSIGN(ClusterLoadBalancer);
 };

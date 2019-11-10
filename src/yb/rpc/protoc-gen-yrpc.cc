@@ -204,7 +204,7 @@ class MethodSubstitutions : public Substituter {
   // namespaces for method arguments.
   static std::string StripNamespaceIfPossible(const std::string& service_full_name,
                                               const std::string& arg_full_name) {
-    StringPiece service_package(service_full_name);
+    GStringPiece service_package(service_full_name);
     if (!service_package.contains(".")) {
       return arg_full_name;
     }
@@ -213,7 +213,7 @@ class MethodSubstitutions : public Substituter {
     service_package.remove_suffix(service_package.length() -
                                   service_package.find_last_of(".") - 1);
 
-    StringPiece argfqn(arg_full_name);
+    GStringPiece argfqn(arg_full_name);
     if (argfqn.starts_with(service_package)) {
       argfqn.remove_prefix(argfqn.find_last_of(".") + 1);
     }
@@ -348,7 +348,6 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "#include \"yb/rpc/rpc_fwd.h\"\n"
       "#include \"yb/rpc/rpc_header.pb.h\"\n"
       "#include \"yb/rpc/service_if.h\"\n"
-      "#include \"yb/rpc/yb_rpc.h\"\n"
       "\n"
       "namespace yb {\n"
       "class MetricEntity;\n"
@@ -428,7 +427,6 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         "  void InitMetrics(const scoped_refptr<MetricEntity>& ent);\n"
         "\n"
         "  ::yb::rpc::RpcMethodMetrics metrics_[kMethodCount];\n"
-        "\n"
         "};\n"
       );
 
@@ -453,6 +451,7 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "#include <glog/logging.h>\n"
       "\n"
       "#include \"yb/rpc/inbound_call.h\"\n"
+      "#include \"yb/rpc/local_call.h\"\n"
       "#include \"yb/rpc/remote_method.h\"\n"
       "#include \"yb/rpc/rpc_context.h\"\n"
       "#include \"yb/rpc/service_if.h\"\n"
@@ -585,6 +584,12 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "#include \"yb/util/status.h\"\n"
       "#include \"yb/util/net/net_fwd.h\"\n"
       "\n"
+      "namespace yb {\n"
+      "namespace rpc {\n"
+      "class Proxy;\n"
+      "}\n"
+      "}\n"
+      "\n"
       "$open_namespace$"
       "\n"
       "\n"
@@ -596,10 +601,12 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       subs->PushService(service);
 
       Print(printer, *subs,
-        "class $service_name$Proxy : public ::yb::rpc::Proxy {\n"
+        "class $service_name$Proxy {\n"
         " public:\n"
-        "  $service_name$Proxy(const std::shared_ptr< ::yb::rpc::Messenger>\n"
-        "                &messenger, const ::yb::Endpoint &endpoint);\n"
+        "  $service_name$Proxy(\n"
+        "      ::yb::rpc::ProxyCache* cache,\n"
+        "      const ::yb::HostPort &endpoint,\n"
+        "     const ::yb::rpc::Protocol* protocol = nullptr);\n"
         "  ~$service_name$Proxy();\n"
         "\n"
         );
@@ -623,6 +630,10 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       subs->Pop();
     }
     Print(printer, *subs,
+      "  ::yb::rpc::Proxy& proxy() { return *proxy_; }\n"
+      "\n"
+      "private:\n"
+      "  std::shared_ptr<::yb::rpc::Proxy> const proxy_;\n"
       "};\n"
       "\n"
       "$close_namespace$"
@@ -639,6 +650,7 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       "\n"
       "#include \"$path_no_extension$.proxy.h\"\n"
       "\n"
+      "#include \"yb/rpc/proxy.h\"\n"
       "#include \"yb/rpc/outbound_call.h\"\n"
       "#include \"yb/util/net/sockaddr.h\"\n"
       "\n"
@@ -652,9 +664,10 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
       subs->PushService(service);
       Print(printer, *subs,
         "$service_name$Proxy::$service_name$Proxy(\n"
-        "   const std::shared_ptr< ::yb::rpc::Messenger> &messenger,\n"
-        "   const ::yb::Endpoint &remote)\n"
-        "  : ::yb::rpc::Proxy(messenger, remote, \"$full_service_name$\") {\n"
+        "   ::yb::rpc::ProxyCache* cache,\n"
+        "   const ::yb::HostPort &remote,\n"
+        "   const ::yb::rpc::Protocol* protocol)\n"
+        "  : proxy_(cache->Get(remote, protocol)) {\n"
         "}\n"
         "\n"
         "$service_name$Proxy::~$service_name$Proxy() {\n"
@@ -667,13 +680,15 @@ class CodeGenerator : public ::google::protobuf::compiler::CodeGenerator {
         Print(printer, *subs,
         "::yb::Status $service_name$Proxy::$rpc_name$(const $request$ &req, $response$ *resp,\n"
         "                                     ::yb::rpc::RpcController *controller) {\n"
-        "  return SyncRequest(\"$rpc_name$\", req, resp, controller);\n"
+        "  static ::yb::rpc::RemoteMethod method(\"$full_service_name$\", \"$rpc_name$\");\n"
+        "  return proxy_->SyncRequest(&method, req, resp, controller);\n"
         "}\n"
         "\n"
         "void $service_name$Proxy::$rpc_name$Async(const $request$ &req,\n"
         "                     $response$ *resp, ::yb::rpc::RpcController *controller,\n"
         "                     ::yb::rpc::ResponseCallback callback) {\n"
-        "  AsyncRequest(\"$rpc_name$\", req, resp, controller, std::move(callback));\n"
+        "  static ::yb::rpc::RemoteMethod method(\"$full_service_name$\", \"$rpc_name$\");\n"
+        "  proxy_->AsyncRequest(&method, req, resp, controller, std::move(callback));\n"
         "}\n"
         "\n");
         subs->Pop();

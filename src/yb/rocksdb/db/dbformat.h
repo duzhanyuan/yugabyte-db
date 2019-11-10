@@ -21,8 +21,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_DB_DBFORMAT_H
-#define ROCKSDB_DB_DBFORMAT_H
+#ifndef YB_ROCKSDB_DB_DBFORMAT_H
+#define YB_ROCKSDB_DB_DBFORMAT_H
 
 #pragma once
 
@@ -156,6 +156,8 @@ class InternalKeyComparator : public Comparator {
   int Compare(const ParsedInternalKey& a, const ParsedInternalKey& b) const;
 };
 
+typedef std::shared_ptr<const InternalKeyComparator> InternalKeyComparatorPtr;
+
 // Modules in this directory should keep internal keys wrapped inside
 // the following class instead of plain strings so that we do not
 // incorrectly use string comparisons instead of an InternalKeyComparator.
@@ -218,6 +220,7 @@ class BoundaryValuesExtractor {
  public:
   virtual Status Decode(UserBoundaryTag tag, Slice data, UserBoundaryValuePtr* value) = 0;
   virtual Status Extract(Slice user_key, Slice value, UserBoundaryValues* values) = 0;
+  virtual UserFrontierPtr CreateFrontier() = 0;
  protected:
   ~BoundaryValuesExtractor() {}
 };
@@ -529,4 +532,4 @@ extern Status ReadRecordFromWriteBatch(Slice* input, char* tag,
                                        Slice* value, Slice* blob);
 }  // namespace rocksdb
 
-#endif // ROCKSDB_DB_DBFORMAT_H
+#endif // YB_ROCKSDB_DB_DBFORMAT_H
